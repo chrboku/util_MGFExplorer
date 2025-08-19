@@ -693,23 +693,45 @@ class SpectrumVisualization(ttk.Frame):
         if not selected_spectra:
             return
             
+        # Calculate global m/z limits for all selected spectra
+        global_mz_min = float('inf')
+        global_mz_max = float('-inf')
+        
+        for spectrum in selected_spectra:
+            if spectrum.ions.size > 0:
+                mz_values = spectrum.ions[:, 0]
+                global_mz_min = min(global_mz_min, mz_values.min())
+                global_mz_max = max(global_mz_max, mz_values.max())
+        
+        # Add some padding to the limits
+        if global_mz_min != float('inf') and global_mz_max != float('-inf'):
+            mz_range = global_mz_max - global_mz_min
+            padding = mz_range * 0.02  # 2% padding
+            global_mz_min -= padding
+            global_mz_max += padding
+        else:
+            # Fallback if no valid data
+            global_mz_min, global_mz_max = 0, 1000
+            
         # Create subplots
         n_spectra = len(selected_spectra)
         if n_spectra == 1:
             ax = self.figure.add_subplot(111)
-            self._plot_single_spectrum(ax, selected_spectra[0])
+            self._plot_single_spectrum(ax, selected_spectra[0], (global_mz_min, global_mz_max))
         else:
             for i, spectrum in enumerate(selected_spectra):
                 ax = self.figure.add_subplot(n_spectra, 1, i+1)
-                self._plot_single_spectrum(ax, spectrum)
+                self._plot_single_spectrum(ax, spectrum, (global_mz_min, global_mz_max))
                 
         self.figure.tight_layout()
         self.canvas.draw()
         
-    def _plot_single_spectrum(self, ax, spectrum: Spectrum):
+    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None):
         """Plot a single spectrum as a stick chart."""
         if spectrum.ions.size == 0:
             ax.text(0.5, 0.5, 'No ion data', ha='center', va='center', transform=ax.transAxes)
+            if mz_limits:
+                ax.set_xlim(mz_limits)
             return
             
         mz_values = spectrum.ions[:, 0]
@@ -723,8 +745,13 @@ class SpectrumVisualization(ttk.Frame):
         ax.grid(True, alpha=0.3)
         
         # Set limits
-        if len(mz_values) > 0:
+        if mz_limits:
+            ax.set_xlim(mz_limits)
+        elif len(mz_values) > 0:
             ax.set_xlim(mz_values.min() * 0.95, mz_values.max() * 1.05)
+            
+        # Set y limits
+        if len(intensity_values) > 0:
             ax.set_ylim(0, intensity_values.max() * 1.1)
 
 
