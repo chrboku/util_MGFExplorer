@@ -41,6 +41,29 @@ class MGFExplorerApp:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         
+        # Edit menu
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        edit_menu.add_command(label="Add New Key-Value Pair...", command=self._add_new_key_value)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase)
+        edit_menu.add_command(label="Convert Keys to lowercase", command=self._keys_to_lowercase)
+        
+        # View menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        
+        # Spectrum Name submenu
+        spectrum_name_menu = tk.Menu(view_menu, tearoff=0)
+        view_menu.add_cascade(label="Spectrum Name", menu=spectrum_name_menu)
+        
+        self.spectrum_name_var = tk.StringVar(value="Numbered")
+        spectrum_name_menu.add_radiobutton(label="Numbered", variable=self.spectrum_name_var, 
+                                         value="Numbered", command=self._update_spectrum_names)
+        
+        # Will be populated when data is loaded
+        self.spectrum_name_menu = spectrum_name_menu
+        
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -148,6 +171,7 @@ class MGFExplorerApp:
             
             # Update components
             self.spectrum_tree.load_data(self.parser)
+            self._update_spectrum_name_menu()
             self._set_components_enabled(True)
             
             # Update status
@@ -185,12 +209,99 @@ class MGFExplorerApp:
         # Refresh the spectrum tree to show updated grouping
         self.spectrum_tree.load_data(self.parser)
         
+        # Update spectrum name menu if needed
+        self._update_spectrum_name_menu()
+        
         # Get current selection and refresh other components
         selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
         if selected_ids:
             self.metadata_editor.load_data(self.parser, selected_ids)
             self.ion_table.load_data(self.parser, selected_ids)
             self.spectrum_viz.load_data(self.parser, selected_ids)
+            
+    def _add_new_key_value(self):
+        """Add a new key-value pair via the Edit menu."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+        from .gui_components import AddKeyValueDialog
+        dialog = AddKeyValueDialog(self.root, self.parser, selected_ids)
+        if dialog.result:
+            self._on_metadata_changed()
+            
+    def _keys_to_uppercase(self):
+        """Convert all key names to uppercase via the Edit menu."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        if not messagebox.askyesno("Convert Keys", "Convert all key names to UPPERCASE?"):
+            return
+            
+        # Get all current keys
+        all_keys = self.parser.get_all_metadata_keys()
+        
+        for old_key in all_keys:
+            new_key = old_key.upper()
+            if old_key != new_key:
+                self.parser.rename_key_in_all_spectra(old_key, new_key)
+                
+        self._on_metadata_changed()
+        
+    def _keys_to_lowercase(self):
+        """Convert all key names to lowercase via the Edit menu."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        if not messagebox.askyesno("Convert Keys", "Convert all key names to lowercase?"):
+            return
+            
+        # Get all current keys
+        all_keys = self.parser.get_all_metadata_keys()
+        
+        for old_key in all_keys:
+            new_key = old_key.lower()
+            if old_key != new_key:
+                self.parser.rename_key_in_all_spectra(old_key, new_key)
+                
+        self._on_metadata_changed()
+        
+    def _update_spectrum_name_menu(self):
+        """Update the spectrum name menu with available metadata fields."""
+        if not self.parser:
+            return
+            
+        # Clear existing field options (keep "Numbered")
+        menu = self.spectrum_name_menu
+        
+        # Remove all items except "Numbered"
+        last_index = menu.index('end')
+        if last_index is not None and last_index > 0:
+            menu.delete(1, last_index)
+            
+        # Add separator
+        menu.add_separator()
+        
+        # Add metadata fields as options
+        all_keys = self.parser.get_all_metadata_keys()
+        for key in all_keys:
+            menu.add_radiobutton(label=key, variable=self.spectrum_name_var, 
+                               value=key, command=self._update_spectrum_names)
+                               
+    def _update_spectrum_names(self):
+        """Update how spectrum names are displayed."""
+        if not self.parser:
+            return
+            
+        # Set the naming scheme in the spectrum tree
+        naming_scheme = self.spectrum_name_var.get()
+        self.spectrum_tree.set_naming_scheme(naming_scheme)
+        
+        # Refresh the tree to show updated names
+        self.spectrum_tree.load_data(self.parser)
             
     def show_about(self):
         """Show about dialog."""

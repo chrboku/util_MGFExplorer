@@ -20,6 +20,7 @@ class SpectrumTreeView(ttk.Frame):
         self.on_selection_changed = on_selection_changed
         self.parser: Optional[MGFParser] = None
         self.selected_grouping_tags: List[str] = []
+        self.naming_scheme: str = "Numbered"  # Default naming scheme
         
         self._create_widgets()
         
@@ -118,7 +119,8 @@ class SpectrumTreeView(ttk.Frame):
     def _populate_flat_list(self):
         """Populate tree with flat list of spectra."""
         for spectrum in self.parser.spectra:
-            item_id = self.tree.insert('', 'end', text=f'Spectrum {spectrum.spectrum_id}', 
+            display_name = self._get_spectrum_display_name(spectrum)
+            item_id = self.tree.insert('', 'end', text=display_name, 
                                      tags=('spectrum', spectrum.spectrum_id))
                                      
     def _populate_hierarchical_tree(self):
@@ -167,8 +169,9 @@ class SpectrumTreeView(ttk.Frame):
             
             # Add spectra in this group
             for spectrum in data['spectra']:
+                display_name = self._get_spectrum_display_name(spectrum)
                 spectrum_id = self.tree.insert(group_id, 'end', 
-                                             text=f'Spectrum {spectrum.spectrum_id}',
+                                             text=display_name,
                                              tags=('spectrum', spectrum.spectrum_id))
             
             # Recursively add children
@@ -236,6 +239,22 @@ class SpectrumTreeView(ttk.Frame):
                 selected_ids.extend(group_spectra)
                 
         return sorted(list(set(selected_ids)))
+        
+    def set_naming_scheme(self, scheme: str):
+        """Set the naming scheme for spectrum display."""
+        self.naming_scheme = scheme
+        
+    def _get_spectrum_display_name(self, spectrum) -> str:
+        """Get the display name for a spectrum based on the current naming scheme."""
+        if self.naming_scheme == "Numbered":
+            return f'Spectrum {spectrum.spectrum_id}'
+        else:
+            # Use the specified metadata field
+            value = spectrum.get_metadata_value(self.naming_scheme)
+            if value:
+                return f'{spectrum.spectrum_id}: {self.naming_scheme}={value}'
+            else:
+                return f'{spectrum.spectrum_id}: {self.naming_scheme}=<missing>'
 
 
 class MetadataEditor(ttk.Frame):
@@ -286,32 +305,14 @@ class MetadataEditor(ttk.Frame):
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
         
-        # Edit controls
-        edit_frame = ttk.Frame(self)
-        edit_frame.pack(fill='x', padx=5, pady=5)
+        # Instructions
+        instructions_frame = ttk.Frame(self)
+        instructions_frame.pack(fill='x', padx=5, pady=5)
         
-        ttk.Label(edit_frame, text="Key:").grid(row=0, column=0, sticky='w', padx=5)
-        self.key_var = tk.StringVar()
-        self.key_entry = ttk.Entry(edit_frame, textvariable=self.key_var, width=20)
-        self.key_entry.grid(row=0, column=1, padx=5)
+        instructions_text = "Double-click on Key or Value cells to edit. Press Enter to save, Escape to cancel."
+        ttk.Label(instructions_frame, text=instructions_text, font=('Arial', 9), foreground='gray').pack()
         
-        ttk.Label(edit_frame, text="Value:").grid(row=0, column=2, sticky='w', padx=5)
-        self.value_var = tk.StringVar()
-        self.value_entry = ttk.Entry(edit_frame, textvariable=self.value_var, width=30)
-        self.value_entry.grid(row=0, column=3, padx=5)
-        
-        ttk.Button(edit_frame, text="Update Value", command=self._update_value).grid(row=0, column=4, padx=5)
-        ttk.Button(edit_frame, text="Rename Key", command=self._rename_key).grid(row=0, column=5, padx=5)
-        
-        # Additional buttons row
-        button_frame = ttk.Frame(self)
-        button_frame.pack(fill='x', padx=5, pady=5)
-        
-        ttk.Button(button_frame, text="Add New Key-Value", command=self._add_new_key_value).pack(side='left', padx=5)
-        ttk.Button(button_frame, text="Keys to UPPERCASE", command=self._keys_to_uppercase).pack(side='left', padx=5)
-        ttk.Button(button_frame, text="Keys to lowercase", command=self._keys_to_lowercase).pack(side='left', padx=5)
-        
-        # Bind selection event
+        # Bind selection and editing events
         self.metadata_tree.bind('<<TreeviewSelect>>', self._on_metadata_selection)
         self.metadata_tree.bind('<Double-1>', self._on_double_click)
         self.metadata_tree.bind('<Button-1>', self._on_single_click)
@@ -355,13 +356,8 @@ class MetadataEditor(ttk.Frame):
             
     def _on_metadata_selection(self, event):
         """Handle metadata selection."""
-        selected_items = self.metadata_tree.selection()
-        if selected_items:
-            item = selected_items[0]
-            values = self.metadata_tree.item(item, 'values')
-            if values:
-                self.key_var.set(values[0])
-                self.value_var.set(values[1])
+        # This can be used for future functionality if needed
+        pass
                 
     def _on_single_click(self, event):
         """Handle single click to close any open editor."""
@@ -545,80 +541,6 @@ class MetadataEditor(ttk.Frame):
         self._populate_metadata()
         if self.on_metadata_changed:
             self.on_metadata_changed()
-            
-    def _add_new_key_value(self):
-        """Add a new key-value pair with a popup form."""
-        if not self.parser:
-            return
-            
-        dialog = AddKeyValueDialog(self, self.parser, self.selected_spectrum_ids)
-        if dialog.result:
-            self._refresh_after_change()
-            
-    def _keys_to_uppercase(self):
-        """Convert all key names to uppercase."""
-        if not self.parser:
-            return
-            
-        if not messagebox.askyesno("Convert Keys", "Convert all key names to UPPERCASE?"):
-            return
-            
-        # Get all current keys
-        all_keys = self.parser.get_all_metadata_keys()
-        
-        for old_key in all_keys:
-            new_key = old_key.upper()
-            if old_key != new_key:
-                self.parser.rename_key_in_all_spectra(old_key, new_key)
-                
-        self._refresh_after_change()
-        
-    def _keys_to_lowercase(self):
-        """Convert all key names to lowercase."""
-        if not self.parser:
-            return
-            
-        if not messagebox.askyesno("Convert Keys", "Convert all key names to lowercase?"):
-            return
-            
-        # Get all current keys
-        all_keys = self.parser.get_all_metadata_keys()
-        
-        for old_key in all_keys:
-            new_key = old_key.lower()
-            if old_key != new_key:
-                self.parser.rename_key_in_all_spectra(old_key, new_key)
-                
-        self._refresh_after_change()
-        
-    def _update_value(self):
-        """Update metadata value for selected spectra."""
-        key = self.key_var.get().strip()
-        value = self.value_var.get().strip()
-        
-        if not key or not self.parser or not self.selected_spectrum_ids:
-            return
-            
-        self.parser.update_key_value_in_selected_spectra(self.selected_spectrum_ids, key, value)
-        self._populate_metadata()
-        
-        if self.on_metadata_changed:
-            self.on_metadata_changed()
-            
-    def _rename_key(self):
-        """Rename a metadata key."""
-        old_key = self.key_var.get().strip()
-        
-        if not old_key:
-            return
-            
-        new_key = simpledialog.askstring("Rename Key", f"Enter new name for '{old_key}':")
-        if new_key and new_key != old_key:
-            self.parser.rename_key_in_all_spectra(old_key, new_key)
-            self._populate_metadata()
-            
-            if self.on_metadata_changed:
-                self.on_metadata_changed()
 
 
 class AddKeyValueDialog:
