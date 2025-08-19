@@ -48,6 +48,12 @@ class MGFExplorerApp:
         edit_menu.add_separator()
         edit_menu.add_command(label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase)
         edit_menu.add_command(label="Convert Keys to lowercase", command=self._keys_to_lowercase)
+        edit_menu.add_separator()
+        
+        # Regex Update submenu
+        regex_menu = tk.Menu(edit_menu, tearoff=0)
+        edit_menu.add_cascade(label="Regex Update", menu=regex_menu)
+        regex_menu.add_command(label="Open Regex Editor...", command=self._open_regex_editor)
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -302,6 +308,17 @@ class MGFExplorerApp:
         
         # Refresh the tree to show updated names
         self.spectrum_tree.load_data(self.parser)
+        
+    def _open_regex_editor(self):
+        """Open the regex editor dialog."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        from .gui_components import RegexEditorDialog
+        dialog = RegexEditorDialog(self.root, self.parser)
+        if dialog.changes_made:
+            self._on_metadata_changed()
             
     def show_about(self):
         """Show about dialog."""

@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from typing import List, Dict, Any, Optional
+import re
 from .mgf_parser import MGFParser, Spectrum
 
 
@@ -643,6 +644,290 @@ class AddKeyValueDialog:
     def _cancel(self):
         """Cancel the dialog."""
         self.result = False
+        self.dialog.destroy()
+
+
+class RegexEditorDialog:
+    """Dialog for regex-based metadata editing."""
+    
+    def __init__(self, parent, parser: MGFParser):
+        self.parent = parent
+        self.parser = parser
+        self.changes_made = False
+        self.current_key = None
+        self.value_data = {}  # {value: {'count': int, 'updated': str}}
+        
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Regex Metadata Editor")
+        self.dialog.geometry("900x600")
+        self.dialog.resizable(True, True)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # Center the dialog
+        self.dialog.geometry("+%d+%d" % (
+            parent.winfo_rootx() + 50,
+            parent.winfo_rooty() + 50
+        ))
+        
+        self._create_widgets()
+        self._populate_keys()
+        self.dialog.wait_window()
+        
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill='both', expand=True)
+        
+        # Top frame with three columns
+        top_frame = ttk.Frame(main_frame)
+        top_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        # Left column - Keys list
+        keys_frame = ttk.LabelFrame(top_frame, text="Metadata Keys", padding=5)
+        keys_frame.pack(side='left', fill='y', padx=(0, 5))
+        
+        # Keys listbox with scrollbar
+        keys_container = ttk.Frame(keys_frame)
+        keys_container.pack(fill='both', expand=True)
+        
+        self.keys_listbox = tk.Listbox(keys_container, width=20, height=20)
+        keys_scrollbar = ttk.Scrollbar(keys_container, orient='vertical', command=self.keys_listbox.yview)
+        self.keys_listbox.configure(yscrollcommand=keys_scrollbar.set)
+        
+        self.keys_listbox.pack(side='left', fill='both', expand=True)
+        keys_scrollbar.pack(side='right', fill='y')
+        
+        self.keys_listbox.bind('<<ListboxSelect>>', self._on_key_selection)
+        
+        # Middle column - Values table
+        values_frame = ttk.LabelFrame(top_frame, text="Values", padding=5)
+        values_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        # Values treeview
+        columns = ('Original Value', 'Count', 'Updated Value')
+        self.values_tree = ttk.Treeview(values_frame, columns=columns, show='headings', height=20)
+        
+        for col in columns:
+            self.values_tree.heading(col, text=col)
+            
+        # Set column widths
+        self.values_tree.column('Original Value', width=200)
+        self.values_tree.column('Count', width=80)
+        self.values_tree.column('Updated Value', width=200)
+        
+        # Scrollbars for values tree
+        values_v_scrollbar = ttk.Scrollbar(values_frame, orient='vertical', command=self.values_tree.yview)
+        values_h_scrollbar = ttk.Scrollbar(values_frame, orient='horizontal', command=self.values_tree.xview)
+        
+        self.values_tree.configure(yscrollcommand=values_v_scrollbar.set, xscrollcommand=values_h_scrollbar.set)
+        
+        self.values_tree.grid(row=0, column=0, sticky='nsew')
+        values_v_scrollbar.grid(row=0, column=1, sticky='ns')
+        values_h_scrollbar.grid(row=1, column=0, sticky='ew')
+        
+        values_frame.grid_rowconfigure(0, weight=1)
+        values_frame.grid_columnconfigure(0, weight=1)
+        
+        # Bottom frame - Regex editor
+        regex_frame = ttk.LabelFrame(main_frame, text="Regex Editor", padding=5)
+        regex_frame.pack(fill='x', pady=(0, 10))
+        
+        # Regex pattern input
+        pattern_frame = ttk.Frame(regex_frame)
+        pattern_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(pattern_frame, text="Search Pattern (regex):").pack(anchor='w')
+        self.pattern_var = tk.StringVar()
+        self.pattern_entry = ttk.Entry(pattern_frame, textvariable=self.pattern_var, width=80)
+        self.pattern_entry.pack(fill='x', pady=2)
+        
+        # Replacement input
+        replacement_frame = ttk.Frame(regex_frame)
+        replacement_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(replacement_frame, text="Replacement:").pack(anchor='w')
+        self.replacement_var = tk.StringVar()
+        self.replacement_entry = ttk.Entry(replacement_frame, textvariable=self.replacement_var, width=80)
+        self.replacement_entry.pack(fill='x', pady=2)
+        
+        # Regex options
+        options_frame = ttk.Frame(regex_frame)
+        options_frame.pack(fill='x', pady=5)
+        
+        self.ignore_case_var = tk.BooleanVar()
+        ttk.Checkbutton(options_frame, text="Ignore case", variable=self.ignore_case_var).pack(side='left', padx=(0, 10))
+        
+        self.multiline_var = tk.BooleanVar()
+        ttk.Checkbutton(options_frame, text="Multiline", variable=self.multiline_var).pack(side='left', padx=(0, 10))
+        
+        # Buttons for regex operations
+        regex_buttons_frame = ttk.Frame(regex_frame)
+        regex_buttons_frame.pack(fill='x', pady=5)
+        
+        ttk.Button(regex_buttons_frame, text="Preview", command=self._preview_regex).pack(side='left', padx=(0, 5))
+        ttk.Button(regex_buttons_frame, text="Apply", command=self._apply_regex).pack(side='left', padx=(0, 5))
+        ttk.Button(regex_buttons_frame, text="Reset", command=self._reset_values).pack(side='left', padx=(0, 5))
+        
+        # Examples
+        examples_frame = ttk.Frame(regex_frame)
+        examples_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(examples_frame, text="Examples:", font=('Arial', 9, 'bold')).pack(anchor='w')
+        examples_text = (
+            "• Remove prefix: ^prefix_ → (empty)\n"
+            "• Replace spaces: \\s+ → _\n"
+            "• Extract numbers: .*?([0-9]+).* → \\1\n"
+            "• Add suffix: (.*) → \\1_new"
+        )
+        ttk.Label(examples_frame, text=examples_text, font=('Arial', 8), foreground='gray').pack(anchor='w')
+        
+        # Bottom buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x')
+        
+        ttk.Button(button_frame, text="Close", command=self._close_dialog).pack(side='right', padx=5)
+        
+        # Bind Enter key for quick preview
+        self.pattern_entry.bind('<KeyRelease>', self._on_pattern_change)
+        self.replacement_entry.bind('<KeyRelease>', self._on_pattern_change)
+        
+    def _populate_keys(self):
+        """Populate the keys listbox."""
+        all_keys = self.parser.get_all_metadata_keys()
+        for key in all_keys:
+            self.keys_listbox.insert(tk.END, key)
+            
+    def _on_key_selection(self, event):
+        """Handle key selection."""
+        selection = self.keys_listbox.curselection()
+        if not selection:
+            return
+            
+        key = self.keys_listbox.get(selection[0])
+        self.current_key = key
+        self._load_values_for_key(key)
+        
+    def _load_values_for_key(self, key: str):
+        """Load and display values for the selected key."""
+        # Clear existing data
+        for item in self.values_tree.get_children():
+            self.values_tree.delete(item)
+            
+        self.value_data.clear()
+        
+        # Count unique values
+        value_counts = {}
+        for spectrum in self.parser.spectra:
+            value = spectrum.get_metadata_value(key)
+            if value is not None:
+                value_counts[value] = value_counts.get(value, 0) + 1
+                
+        # Store and display data
+        for value, count in sorted(value_counts.items()):
+            self.value_data[value] = {'count': count, 'updated': value}
+            self.values_tree.insert('', 'end', values=(value, count, value))
+            
+    def _on_pattern_change(self, event=None):
+        """Handle pattern or replacement changes - auto preview if both fields have content."""
+        if self.pattern_var.get().strip() and self.replacement_var.get().strip():
+            self._preview_regex()
+            
+    def _preview_regex(self):
+        """Preview the regex transformation."""
+        if not self.current_key or not self.value_data:
+            return
+            
+        pattern = self.pattern_var.get()
+        replacement = self.replacement_var.get()
+        
+        if not pattern:
+            messagebox.showwarning("Warning", "Please enter a search pattern.")
+            return
+            
+        try:
+            # Compile regex with options
+            flags = 0
+            if self.ignore_case_var.get():
+                flags |= re.IGNORECASE
+            if self.multiline_var.get():
+                flags |= re.MULTILINE
+                
+            compiled_pattern = re.compile(pattern, flags)
+            
+            # Update the tree with preview
+            for item in self.values_tree.get_children():
+                values = self.values_tree.item(item, 'values')
+                original_value = values[0]
+                
+                try:
+                    updated_value = compiled_pattern.sub(replacement, original_value)
+                    self.value_data[original_value]['updated'] = updated_value
+                    
+                    # Update tree display
+                    self.values_tree.item(item, values=(original_value, values[1], updated_value))
+                    
+                except Exception as e:
+                    # If replacement fails for this value, keep original
+                    self.value_data[original_value]['updated'] = original_value
+                    self.values_tree.item(item, values=(original_value, values[1], f"ERROR: {str(e)}"))
+                    
+        except re.error as e:
+            messagebox.showerror("Regex Error", f"Invalid regular expression: {str(e)}")
+            
+    def _apply_regex(self):
+        """Apply the regex transformation to all spectra."""
+        if not self.current_key or not self.value_data:
+            messagebox.showwarning("Warning", "Please select a key and preview changes first.")
+            return
+            
+        # Confirm before applying
+        num_affected = sum(data['count'] for data in self.value_data.values() 
+                          if data['updated'] != list(self.value_data.keys())[list(self.value_data.values()).index(data)])
+        
+        if num_affected == 0:
+            messagebox.showinfo("Info", "No changes to apply.")
+            return
+            
+        if not messagebox.askyesno("Confirm Changes", 
+                                  f"Apply regex transformation to {num_affected} values in key '{self.current_key}'?"):
+            return
+            
+        # Apply changes to all spectra
+        changes_made = False
+        for spectrum in self.parser.spectra:
+            current_value = spectrum.get_metadata_value(self.current_key)
+            if current_value in self.value_data:
+                new_value = self.value_data[current_value]['updated']
+                if new_value != current_value and not new_value.startswith("ERROR:"):
+                    spectrum.metadata[self.current_key] = new_value
+                    changes_made = True
+                    
+        if changes_made:
+            self.changes_made = True
+            messagebox.showinfo("Success", "Regex transformation applied successfully!")
+            
+            # Reload values to show the changes
+            self._load_values_for_key(self.current_key)
+            
+    def _reset_values(self):
+        """Reset all values to original."""
+        if not self.current_key:
+            return
+            
+        # Reset the updated values to original
+        for original_value in self.value_data:
+            self.value_data[original_value]['updated'] = original_value
+            
+        # Update tree display
+        for item in self.values_tree.get_children():
+            values = self.values_tree.item(item, 'values')
+            original_value = values[0]
+            count = values[1]
+            self.values_tree.item(item, values=(original_value, count, original_value))
+            
+    def _close_dialog(self):
+        """Close the dialog."""
         self.dialog.destroy()
 
 
