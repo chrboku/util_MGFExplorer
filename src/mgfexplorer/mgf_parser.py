@@ -155,3 +155,78 @@ class MGFParser:
         for spectrum in self.spectra:
             if key not in spectrum.metadata:
                 spectrum.add_metadata(key, default_value)
+                
+    def calculate_cosine_similarity(self, spectrum1: Spectrum, spectrum2: Spectrum, 
+                                  mz_tolerance: float = 0.1) -> float:
+        """
+        Calculate cosine similarity between two spectra.
+        
+        Args:
+            spectrum1: First spectrum
+            spectrum2: Second spectrum
+            mz_tolerance: m/z tolerance for peak matching
+            
+        Returns:
+            Cosine similarity score (0-1)
+        """
+        if spectrum1.ions.size == 0 or spectrum2.ions.size == 0:
+            return 0.0
+            
+        # Get m/z and intensity values
+        mz1, int1 = spectrum1.ions[:, 0], spectrum1.ions[:, 1]
+        mz2, int2 = spectrum2.ions[:, 0], spectrum2.ions[:, 1]
+        
+        # Normalize intensities to unit vectors
+        int1_norm = int1 / np.sqrt(np.sum(int1**2))
+        int2_norm = int2 / np.sqrt(np.sum(int2**2))
+        
+        # Find common peaks within tolerance
+        common_peaks1 = []
+        common_peaks2 = []
+        
+        for i, mz in enumerate(mz1):
+            # Find closest peak in spectrum2
+            diff = np.abs(mz2 - mz)
+            min_idx = np.argmin(diff)
+            
+            if diff[min_idx] <= mz_tolerance:
+                common_peaks1.append(int1_norm[i])
+                common_peaks2.append(int2_norm[min_idx])
+        
+        if len(common_peaks1) == 0:
+            return 0.0
+            
+        # Calculate cosine similarity for common peaks
+        dot_product = np.sum(np.array(common_peaks1) * np.array(common_peaks2))
+        return max(0.0, min(1.0, dot_product))  # Clamp to [0, 1]
+        
+    def calculate_similarity_matrix(self, spectrum_ids: List[int], 
+                                  mz_tolerance: float = 0.1) -> np.ndarray:
+        """
+        Calculate pairwise cosine similarity matrix for selected spectra.
+        
+        Args:
+            spectrum_ids: List of spectrum IDs to compare
+            mz_tolerance: m/z tolerance for peak matching
+            
+        Returns:
+            Symmetric similarity matrix
+        """
+        spectra = [s for s in self.spectra if s.spectrum_id in spectrum_ids]
+        n = len(spectra)
+        
+        if n < 2:
+            return np.array([[1.0]] if n == 1 else [])
+            
+        similarity_matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    similarity_matrix[i, j] = 1.0
+                elif i < j:  # Calculate only upper triangle
+                    sim = self.calculate_cosine_similarity(spectra[i], spectra[j], mz_tolerance)
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim  # Symmetric
+                    
+        return similarity_matrix

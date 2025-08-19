@@ -10,7 +10,8 @@ from .gui_components import (
     SpectrumTreeView, 
     MetadataEditor, 
     SpectrumVisualization, 
-    IonDataTable
+    IonDataTable,
+    CosineSimilarityVisualization
 )
 
 
@@ -48,6 +49,8 @@ class MGFExplorerApp:
         edit_menu.add_separator()
         edit_menu.add_command(label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase)
         edit_menu.add_command(label="Convert Keys to lowercase", command=self._keys_to_lowercase)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Delete Selected Spectra", command=self._delete_selected_spectra)
         edit_menu.add_separator()
         
         # Regex Update submenu
@@ -106,12 +109,16 @@ class MGFExplorerApp:
         right_paned.add(bottom_paned, weight=2)
         
         # Bottom left (ion data table)
-        table_frame = ttk.Frame(bottom_paned, width=400)
+        table_frame = ttk.Frame(bottom_paned, width=300)
         bottom_paned.add(table_frame, weight=1)
         
-        # Bottom right (spectrum visualization)
-        viz_frame = ttk.Frame(bottom_paned, width=600)
+        # Bottom center (spectrum visualization)
+        viz_frame = ttk.Frame(bottom_paned, width=500)
         bottom_paned.add(viz_frame, weight=2)
+        
+        # Bottom right (cosine similarity)
+        similarity_frame = ttk.Frame(bottom_paned, width=400)
+        bottom_paned.add(similarity_frame, weight=1)
         
         # Create components
         self.spectrum_tree = SpectrumTreeView(
@@ -131,6 +138,9 @@ class MGFExplorerApp:
         
         self.spectrum_viz = SpectrumVisualization(viz_frame)
         self.spectrum_viz.pack(fill='both', expand=True)
+        
+        self.similarity_viz = CosineSimilarityVisualization(similarity_frame)
+        self.similarity_viz.pack(fill='both', expand=True)
         
         # Status bar
         self.status_var = tk.StringVar()
@@ -198,12 +208,14 @@ class MGFExplorerApp:
             self.metadata_editor.load_data(self.parser, [])
             self.ion_table.load_data(self.parser, [])
             self.spectrum_viz.load_data(self.parser, [])
+            self.similarity_viz.load_data(self.parser, [])
             self.status_var.set(f"Ready - {len(self.parser.spectra)} spectra loaded")
         else:
             # Update displays with selected spectra
             self.metadata_editor.load_data(self.parser, selected_spectrum_ids)
             self.ion_table.load_data(self.parser, selected_spectrum_ids)
             self.spectrum_viz.load_data(self.parser, selected_spectrum_ids)
+            self.similarity_viz.load_data(self.parser, selected_spectrum_ids)
             
             if len(selected_spectrum_ids) == 1:
                 self.status_var.set(f"Selected spectrum {selected_spectrum_ids[0]}")
@@ -212,6 +224,13 @@ class MGFExplorerApp:
                 
     def _on_metadata_changed(self):
         """Handle metadata changes."""
+        # Check for pending selection from metadata editor
+        pending_selection = self.metadata_editor.get_pending_selection()
+        if pending_selection:
+            # Update the spectrum tree to select the specified spectra
+            self.spectrum_tree.select_spectra_by_ids(pending_selection)
+            return
+            
         # Refresh the spectrum tree to show updated grouping
         self.spectrum_tree.load_data(self.parser)
         
@@ -224,6 +243,7 @@ class MGFExplorerApp:
             self.metadata_editor.load_data(self.parser, selected_ids)
             self.ion_table.load_data(self.parser, selected_ids)
             self.spectrum_viz.load_data(self.parser, selected_ids)
+            self.similarity_viz.load_data(self.parser, selected_ids)
             
     def _add_new_key_value(self):
         """Add a new key-value pair via the Edit menu."""
@@ -319,6 +339,52 @@ class MGFExplorerApp:
         dialog = RegexEditorDialog(self.root, self.parser)
         if dialog.changes_made:
             self._on_metadata_changed()
+            
+    def _delete_selected_spectra(self):
+        """Delete the currently selected spectra."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+        if not selected_ids:
+            messagebox.showwarning("Warning", "No spectra selected.")
+            return
+            
+        # Confirmation dialog
+        num_selected = len(selected_ids)
+        total_spectra = len(self.parser.spectra)
+        
+        message = (f"Are you sure you want to delete {num_selected} selected spectra?\n\n"
+                  f"This will remove them permanently from the current session.\n"
+                  f"Remaining spectra: {total_spectra - num_selected}")
+        
+        if not messagebox.askyesno("Confirm Delete", message, icon='warning'):
+            return
+            
+        # Remove selected spectra
+        self.parser.spectra = [s for s in self.parser.spectra if s.spectrum_id not in selected_ids]
+        
+        # Update the status
+        remaining_count = len(self.parser.spectra)
+        self.status_var.set(f"Deleted {num_selected} spectra. {remaining_count} remaining.")
+        
+        # Refresh all displays
+        if remaining_count > 0:
+            self.spectrum_tree.load_data(self.parser)
+            self._update_spectrum_name_menu()
+            
+            # Clear selections since deleted spectra are no longer available
+            self.metadata_editor.load_data(self.parser, [])
+            self.ion_table.load_data(self.parser, [])
+            self.spectrum_viz.load_data(self.parser, [])
+        else:
+            # No spectra left - reset to initial state
+            self._set_components_enabled(False)
+            for component in [self.spectrum_tree, self.metadata_editor, self.ion_table, self.spectrum_viz]:
+                if hasattr(component, 'load_data'):
+                    component.load_data(self.parser, [])
+            self.root.title("MGF Explorer")
             
     def show_about(self):
         """Show about dialog."""

@@ -241,6 +241,31 @@ class SpectrumTreeView(ttk.Frame):
                 
         return sorted(list(set(selected_ids)))
         
+    def select_spectra_by_ids(self, spectrum_ids):
+        """Select spectra by their IDs."""
+        # Clear current selection
+        for item in self.tree.selection():
+            self.tree.selection_remove(item)
+        
+        # Convert to set for faster lookup
+        target_ids = set(spectrum_ids)
+        
+        # Select matching spectra
+        def select_in_tree(parent=''):
+            for item in self.tree.get_children(parent):
+                tags = self.tree.item(item, 'tags')
+                if tags and tags[0] == 'spectrum':
+                    spectrum_id = int(tags[1])
+                    if spectrum_id in target_ids:
+                        self.tree.selection_add(item)
+                        # Ensure the item is visible
+                        self.tree.see(item)
+                else:
+                    # Recursively check children
+                    select_in_tree(item)
+        
+        select_in_tree()
+        
     def set_naming_scheme(self, scheme: str):
         """Set the naming scheme for spectrum display."""
         self.naming_scheme = scheme
@@ -270,6 +295,7 @@ class MetadataEditor(ttk.Frame):
         self.edit_entry = None
         self.editing_item = None
         self.editing_column = None
+        self._pending_selection: Optional[List[int]] = None
         
         self._create_widgets()
         
@@ -317,6 +343,7 @@ class MetadataEditor(ttk.Frame):
         self.metadata_tree.bind('<<TreeviewSelect>>', self._on_metadata_selection)
         self.metadata_tree.bind('<Double-1>', self._on_double_click)
         self.metadata_tree.bind('<Button-1>', self._on_single_click)
+        self.metadata_tree.bind('<Button-3>', self._on_right_click)  # Right-click
         
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load metadata for selected spectra."""
@@ -363,6 +390,58 @@ class MetadataEditor(ttk.Frame):
     def _on_single_click(self, event):
         """Handle single click to close any open editor."""
         self._close_editor()
+        
+    def _on_right_click(self, event):
+        """Handle right-click to show context menu."""
+        # Identify the item and column
+        item = self.metadata_tree.identify('item', event.x, event.y)
+        column = self.metadata_tree.identify('column', event.x, event.y)
+        
+        if not item or column not in ('#1', '#2'):  # Only for Key or Value columns
+            return
+            
+        values = self.metadata_tree.item(item, 'values')
+        if not values:
+            return
+            
+        key = values[0]
+        value = values[1]
+        
+        # Create context menu
+        context_menu = tk.Menu(self, tearoff=0)
+        
+        if column == '#2' and value:  # Value column and not empty
+            context_menu.add_command(
+                label=f"Select all with '{key}' = '{value}'",
+                command=lambda: self._select_spectra_by_value(key, value)
+            )
+            
+        # Show menu if it has items
+        if context_menu.index('end') is not None:
+            try:
+                context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                context_menu.grab_release()
+                
+    def _select_spectra_by_value(self, key: str, value: str):
+        """Select all spectra that have the specified key-value pair."""
+        if not self.parser:
+            return
+            
+        # Find all spectra with this key-value pair
+        matching_spectrum_ids = []
+        for spectrum in self.parser.spectra:
+            if spectrum.get_metadata_value(key) == value:
+                matching_spectrum_ids.append(spectrum.spectrum_id)
+                
+        if matching_spectrum_ids:
+            # Trigger the selection callback to update the main application
+            if self.on_metadata_changed:
+                # Store the matching IDs for the parent to handle
+                self._pending_selection = matching_spectrum_ids
+                self.on_metadata_changed()
+        else:
+            messagebox.showinfo("No Matches", f"No spectra found with {key} = '{value}'")
                 
     def _on_double_click(self, event):
         """Handle double click to start editing."""
@@ -542,6 +621,14 @@ class MetadataEditor(ttk.Frame):
         self._populate_metadata()
         if self.on_metadata_changed:
             self.on_metadata_changed()
+            
+    def get_pending_selection(self) -> Optional[List[int]]:
+        """Get and clear any pending selection."""
+        if self._pending_selection:
+            selection = self._pending_selection
+            self._pending_selection = None
+            return selection
+        return None
 
 
 class AddKeyValueDialog:
@@ -1147,3 +1234,157 @@ class IonDataTable(ttk.Frame):
         if spectrum.ions.size > 0:
             for i, (mz, intensity) in enumerate(spectrum.ions):
                 tree.insert('', 'end', values=(i+1, f'{mz:.6f}', f'{intensity:.3f}'))
+
+
+class CosineSimilarityVisualization(ttk.Frame):
+    """Component for visualizing cosine similarity matrix and statistics."""
+    
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parser: Optional[MGFParser] = None
+        self.selected_spectrum_ids: List[int] = []
+        self.similarity_matrix: Optional[np.ndarray] = None
+        
+        self._create_widgets()
+        
+    def _create_widgets(self):
+        """Create the cosine similarity visualization widgets."""
+        # Header
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Label(header_frame, text="Cosine Similarity", font=('Arial', 12, 'bold')).pack()
+        
+        # Tolerance setting
+        tolerance_frame = ttk.Frame(header_frame)
+        tolerance_frame.pack(fill='x', pady=2)
+        
+        ttk.Label(tolerance_frame, text="m/z Tolerance:").pack(side='left')
+        self.tolerance_var = tk.DoubleVar(value=0.1)
+        tolerance_spinbox = ttk.Spinbox(tolerance_frame, from_=0.01, to=1.0, increment=0.01, 
+                                      width=8, textvariable=self.tolerance_var,
+                                      command=self._on_tolerance_changed)
+        tolerance_spinbox.pack(side='left', padx=5)
+        
+        # Update button
+        ttk.Button(tolerance_frame, text="Recalculate", 
+                  command=self._recalculate_similarity).pack(side='left', padx=5)
+        
+        # Main content area
+        content_frame = ttk.Frame(self)
+        content_frame.pack(fill='both', expand=True, padx=5, pady=5)
+        
+        # Matplotlib figure for heatmap
+        self.figure = Figure(figsize=(6, 4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, content_frame)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+        
+        # Statistics frame
+        stats_frame = ttk.LabelFrame(content_frame, text="Similarity Statistics", padding=5)
+        stats_frame.pack(fill='x', pady=5)
+        
+        self.stats_text = tk.Text(stats_frame, height=4, wrap='word', font=('Courier', 9))
+        self.stats_text.pack(fill='x')
+        
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
+        """Load and visualize cosine similarity for selected spectra."""
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids
+        self._calculate_and_display_similarity()
+        
+    def _on_tolerance_changed(self):
+        """Handle tolerance change."""
+        self._recalculate_similarity()
+        
+    def _recalculate_similarity(self):
+        """Recalculate similarity with current tolerance."""
+        if self.parser and self.selected_spectrum_ids:
+            self._calculate_and_display_similarity()
+        
+    def _calculate_and_display_similarity(self):
+        """Calculate and display the cosine similarity matrix and statistics."""
+        self.figure.clear()
+        self.stats_text.delete(1.0, tk.END)
+        
+        if not self.parser or len(self.selected_spectrum_ids) < 2:
+            ax = self.figure.add_subplot(111)
+            if len(self.selected_spectrum_ids) == 1:
+                ax.text(0.5, 0.5, 'Select 2+ spectra\nfor similarity comparison', 
+                       ha='center', va='center', transform=ax.transAxes)
+                self.stats_text.insert(tk.END, "Single spectrum selected.\nSimilarity: 1.0 (self-similarity)")
+            else:
+                ax.text(0.5, 0.5, 'No spectra selected', 
+                       ha='center', va='center', transform=ax.transAxes)
+                self.stats_text.insert(tk.END, "No spectra selected for comparison.")
+            self.canvas.draw()
+            return
+            
+        # Calculate similarity matrix
+        tolerance = self.tolerance_var.get()
+        self.similarity_matrix = self.parser.calculate_similarity_matrix(
+            self.selected_spectrum_ids, tolerance
+        )
+        
+        if self.similarity_matrix.size == 0:
+            return
+            
+        # Create heatmap
+        ax = self.figure.add_subplot(111)
+        im = ax.imshow(self.similarity_matrix, cmap='viridis', vmin=0, vmax=1, aspect='equal')
+        
+        # Add colorbar
+        cbar = self.figure.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label('Cosine Similarity', rotation=270, labelpad=15)
+        
+        # Set labels
+        spectrum_labels = [f'S{sid}' for sid in self.selected_spectrum_ids]
+        ax.set_xticks(range(len(spectrum_labels)))
+        ax.set_yticks(range(len(spectrum_labels)))
+        ax.set_xticklabels(spectrum_labels, rotation=45, ha='right')
+        ax.set_yticklabels(spectrum_labels)
+        
+        # Add text annotations for values
+        n = self.similarity_matrix.shape[0]
+        for i in range(n):
+            for j in range(n):
+                text = ax.text(j, i, f'{self.similarity_matrix[i, j]:.3f}',
+                             ha="center", va="center", color="white", fontsize=8)
+        
+        ax.set_title(f'Similarity Matrix (tolerance: {tolerance:.2f})')
+        
+        # Adjust layout
+        self.figure.tight_layout()
+        self.canvas.draw()
+        
+        # Calculate and display statistics
+        self._display_statistics()
+        
+    def _display_statistics(self):
+        """Display similarity statistics."""
+        if self.similarity_matrix is None or self.similarity_matrix.size == 0:
+            return
+            
+        # Get upper triangle (excluding diagonal) for statistics
+        n = self.similarity_matrix.shape[0]
+        if n < 2:
+            return
+            
+        # Extract unique pairwise similarities (upper triangle, no diagonal)
+        triu_indices = np.triu_indices(n, k=1)
+        similarities = self.similarity_matrix[triu_indices]
+        
+        if len(similarities) == 0:
+            return
+            
+        # Calculate percentiles
+        percentiles = [0, 10, 25, 50, 75, 90, 100]
+        values = np.percentile(similarities, percentiles)
+        
+        # Format statistics
+        stats_text = f"Pairwise Similarities (n={len(similarities)}):\n"
+        stats_text += f"Min:    {values[0]:.4f}   10%: {values[1]:.4f}   25%: {values[2]:.4f}\n"
+        stats_text += f"Median: {values[3]:.4f}   75%: {values[4]:.4f}   90%: {values[5]:.4f}\n"
+        stats_text += f"Max:    {values[6]:.4f}   Mean: {np.mean(similarities):.4f}"
+        
+        self.stats_text.delete(1.0, tk.END)
+        self.stats_text.insert(tk.END, stats_text)
