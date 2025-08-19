@@ -66,8 +66,7 @@ class MGFExplorerApp:
         
         # Regex Update submenu
         regex_menu = tk.Menu(edit_menu, tearoff=0)
-        edit_menu.add_cascade(label="Regex Update", menu=regex_menu)
-        regex_menu.add_command(label="Open Regex Editor...", command=self._open_regex_editor)
+        edit_menu.add_command(label="Regex Update", command=self._open_regex_editor)
         
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
