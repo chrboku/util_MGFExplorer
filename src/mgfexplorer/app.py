@@ -5,7 +5,8 @@ Main application window for the MGF Explorer.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
-from .mgf_parser import MGFParser
+import numpy as np
+from .mgf_parser import MGFParser, Spectrum
 from .gui_components import (
     SpectrumTreeView, 
     MetadataEditor, 
@@ -55,6 +56,8 @@ class MGFExplorerApp:
         edit_menu.add_command(label="Convert Keys to lowercase", command=self._keys_to_lowercase)
         edit_menu.add_separator()
         edit_menu.add_command(label="Delete Selected Spectra", command=self._delete_selected_spectra)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Calculate Average Spectrum per Group", command=self._calculate_average_spectra)
         edit_menu.add_separator()
         
         # Regex Update submenu
@@ -446,6 +449,396 @@ class MGFExplorerApp:
                 if hasattr(component, 'load_data'):
                     component.load_data(self.parser, [])
             self.root.title("MGF Explorer")
+            
+    def _calculate_average_spectra(self):
+        """Calculate average spectrum per group."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        # Check if grouping is applied
+        if not self.spectrum_tree.selected_grouping_tags:
+            messagebox.showwarning("Warning", "No grouping applied. Please set grouping tags first.")
+            return
+            
+        # Show parameter dialog
+        from .gui_components import AverageSpectrumDialog
+        dialog = AverageSpectrumDialog(self.root)
+        if not dialog.result:
+            return
+            
+        # Get parameters from dialog
+        binning_mz = dialog.result['binning_mz']
+        averaging_method = dialog.result['averaging_method']
+        new_key = dialog.result['new_key']
+        new_value = dialog.result['new_value']
+        
+        try:
+            # Get grouped spectra data
+            grouped_spectra = self._get_grouped_spectra_for_averaging()
+            
+            if not grouped_spectra:
+                messagebox.showwarning("Warning", "No groups found to average.")
+                return
+                
+            # Calculate average spectra
+            new_spectra = self._create_average_spectra(
+                grouped_spectra, binning_mz, averaging_method, new_key, new_value
+            )
+            
+            total_groups = len(grouped_spectra)
+            single_spectrum_groups = sum(1 for spectra_list in grouped_spectra.values() if len(spectra_list) == 1)
+            
+            if new_spectra:
+                # Add new spectra to parser
+                max_id = max([s.spectrum_id for s in self.parser.spectra])
+                for i, spectrum in enumerate(new_spectra):
+                    spectrum.spectrum_id = max_id + i + 1
+                    self.parser.spectra.append(spectrum)
+                
+                # Refresh displays
+                self._on_metadata_changed()
+                
+                message = f"Created {len(new_spectra)} average spectra from {total_groups} groups."
+                if single_spectrum_groups > 0:
+                    message += f"\nSkipped {single_spectrum_groups} groups with only one spectrum."
+                messagebox.showinfo("Success", message)
+            else:
+                if single_spectrum_groups == total_groups:
+                    messagebox.showinfo("No Averages Created", 
+                                      f"All {total_groups} groups contain only one spectrum each.\n"
+                                      "No average spectra were created.")
+                else:
+                    messagebox.showwarning("Warning", "No average spectra could be created.")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to calculate average spectra: {str(e)}")
+            
+    def _get_grouped_spectra_for_averaging(self):
+        """Get grouped spectra organized for averaging."""
+        grouped_spectra = {}
+        
+        # Build hierarchy similar to the tree view
+        hierarchy = {}
+        
+        for spectrum in self.parser.spectra:
+            # Get values for grouping tags
+            path = []
+            for tag in self.spectrum_tree.selected_grouping_tags:
+                value = spectrum.get_metadata_value(tag)
+                if value is None:
+                    value = "<missing>"
+                path.append(f"{tag}={value}")
+            
+            # Build nested dictionary
+            current = hierarchy
+            for level, path_part in enumerate(path):
+                if path_part not in current:
+                    current[path_part] = {'spectra': [], 'children': {}}
+                current = current[path_part]['children']
+                
+            # Add spectrum to the final level
+            final_level = hierarchy
+            for path_part in path[:-1]:
+                final_level = final_level[path_part]['children']
+            if path:
+                final_level[path[-1]]['spectra'].append(spectrum)
+            else:
+                # No valid grouping path, add to root
+                if '_ungrouped_' not in hierarchy:
+                    hierarchy['_ungrouped_'] = {'spectra': [], 'children': {}}
+                hierarchy['_ungrouped_']['spectra'].append(spectrum)
+        
+        # Extract groups that have spectra (leaf nodes)
+        self._extract_leaf_groups(hierarchy, grouped_spectra, [])
+        
+        return grouped_spectra
+        
+    def _extract_leaf_groups(self, hierarchy, grouped_spectra, path):
+        """Extract leaf groups that contain spectra."""
+        for key, data in hierarchy.items():
+            current_path = path + [key]
+            
+            # If this group has spectra and no children, it's a leaf group
+            if data['spectra'] and not data['children']:
+                group_key = " -> ".join(current_path)
+                grouped_spectra[group_key] = data['spectra']
+            
+            # If this group has children, recursively check them
+            if data['children']:
+                self._extract_leaf_groups(data['children'], grouped_spectra, current_path)
+                
+            # If this group has both spectra and children, the spectra at this level form a group
+            if data['spectra'] and data['children']:
+                group_key = " -> ".join(current_path) + " (direct)"
+                grouped_spectra[group_key] = data['spectra']
+    
+    def _create_average_spectra(self, grouped_spectra, binning_mz, averaging_method, new_key, new_value):
+        """Create average spectra for each group."""
+        new_spectra = []
+        skipped_groups = 0
+        
+        for group_name, spectra_list in grouped_spectra.items():
+            if len(spectra_list) < 2:
+                skipped_groups += 1
+                continue  # Skip groups with only one spectrum
+                
+            try:
+                average_spectrum = self._calculate_single_average_spectrum(
+                    spectra_list, binning_mz, averaging_method, new_key, new_value, group_name
+                )
+                if average_spectrum:
+                    new_spectra.append(average_spectrum)
+            except Exception as e:
+                print(f"Error creating average for group {group_name}: {e}")
+                continue
+        
+        if skipped_groups > 0:
+            print(f"Skipped {skipped_groups} groups with only one spectrum")
+                
+        return new_spectra
+    
+    def _calculate_single_average_spectrum(self, spectra_list, binning_mz, averaging_method, new_key, new_value, group_name):
+        """Calculate a single average spectrum from a list of spectra."""
+        if not spectra_list:
+            return None
+            
+        # Collect all ions from all spectra
+        all_ions = []
+        for spectrum in spectra_list:
+            if len(spectrum.ions) > 0:
+                all_ions.append(spectrum.ions)
+        
+        if not all_ions:
+            return None  # No ion data to average
+            
+        # Find common peaks across all spectra (for normalization)
+        common_peaks = self._find_common_peaks(all_ions, binning_mz)
+        
+        if len(common_peaks) == 0:
+            # Create empty spectrum if no common peaks
+            average_spectrum = Spectrum(0)  # ID will be set later
+            average_spectrum.set_ions([], [])
+        else:
+            # Calculate normalized ion data
+            normalized_ions = self._normalize_spectra_by_common_peaks(all_ions, common_peaks, binning_mz)
+            
+            # Bin and average the ions
+            averaged_ions = self._bin_and_average_ions(normalized_ions, binning_mz, averaging_method)
+            
+            # Create new spectrum
+            average_spectrum = Spectrum(0)  # ID will be set later
+            if len(averaged_ions) > 0:
+                mz_values = [ion[0] for ion in averaged_ions]
+                intensity_values = [ion[1] for ion in averaged_ions]
+                average_spectrum.set_ions(mz_values, intensity_values)
+        
+        # Calculate average metadata
+        self._calculate_average_metadata(average_spectrum, spectra_list, new_key, new_value, group_name)
+        
+        return average_spectrum
+    
+    def _find_common_peaks(self, all_ions, binning_mz):
+        """Find peaks that are present in all spectra within the binning tolerance."""
+        if not all_ions:
+            return []
+            
+        # Get all unique m/z values from the first spectrum as candidates
+        first_spectrum_mz = all_ions[0][:, 0]
+        common_peaks = []
+        
+        for mz in first_spectrum_mz:
+            is_common = True
+            for ions in all_ions[1:]:
+                # Check if this m/z is present in other spectra (within binning tolerance)
+                if not self._has_peak_in_range(ions[:, 0], mz, binning_mz):
+                    is_common = False
+                    break
+            
+            if is_common:
+                common_peaks.append(mz)
+                
+        return common_peaks
+    
+    def _has_peak_in_range(self, mz_values, target_mz, tolerance):
+        """Check if any peak exists within tolerance of target m/z."""
+        return np.any(np.abs(mz_values - target_mz) <= tolerance / 2)
+    
+    def _normalize_spectra_by_common_peaks(self, all_ions, common_peaks, binning_mz):
+        """Normalize spectra based on common peaks sum."""
+        normalized_ions = []
+        
+        for ions in all_ions:
+            if len(common_peaks) == 0:
+                # No common peaks, no normalization
+                normalized_ions.append(ions)
+                continue
+                
+            # Calculate sum of intensities for common peaks
+            common_intensity_sum = 0
+            for common_mz in common_peaks:
+                # Find the closest peak within binning tolerance
+                mz_diffs = np.abs(ions[:, 0] - common_mz)
+                closest_idx = np.argmin(mz_diffs)
+                if mz_diffs[closest_idx] <= binning_mz / 2:
+                    common_intensity_sum += ions[closest_idx, 1]
+            
+            if common_intensity_sum > 0:
+                # Normalize so common peaks sum to 1
+                normalization_factor = 1.0 / common_intensity_sum
+                normalized_spectrum = ions.copy()
+                normalized_spectrum[:, 1] *= normalization_factor
+                normalized_ions.append(normalized_spectrum)
+            else:
+                # No common peaks found, use original
+                normalized_ions.append(ions)
+                
+        return normalized_ions
+    
+    def _bin_and_average_ions(self, normalized_ions, binning_mz, averaging_method):
+        """Bin ions by m/z and calculate average intensities and m/z values."""
+        # Collect all m/z and intensity pairs from all spectra
+        all_peaks = []
+        for spectrum_idx, ions in enumerate(normalized_ions):
+            for mz, intensity in ions:
+                all_peaks.append((mz, intensity, spectrum_idx))
+        
+        if not all_peaks:
+            return []
+        
+        # Sort by m/z for efficient binning
+        all_peaks.sort(key=lambda x: x[0])
+        
+        # Group peaks that are within binning tolerance
+        averaged_ions = []
+        current_group = []
+        current_bin_center = None
+        
+        for mz, intensity, spectrum_idx in all_peaks:
+            if current_bin_center is None:
+                # Start new bin
+                current_bin_center = mz
+                current_group = [(mz, intensity, spectrum_idx)]
+            elif abs(mz - current_bin_center) <= binning_mz / 2:
+                # Add to current bin
+                current_group.append((mz, intensity, spectrum_idx))
+            else:
+                # Process current bin and start new one
+                if current_group:
+                    averaged_peak = self._process_peak_group(current_group, averaging_method)
+                    if averaged_peak:
+                        averaged_ions.append(averaged_peak)
+                
+                # Start new bin
+                current_bin_center = mz
+                current_group = [(mz, intensity, spectrum_idx)]
+        
+        # Process the last group
+        if current_group:
+            averaged_peak = self._process_peak_group(current_group, averaging_method)
+            if averaged_peak:
+                averaged_ions.append(averaged_peak)
+        
+        return averaged_ions
+    
+    def _process_peak_group(self, peak_group, averaging_method):
+        """Process a group of peaks that should be combined into one."""
+        if not peak_group:
+            return None
+            
+        # Extract m/z values and intensities, grouped by spectrum
+        spectrum_contributions = {}
+        
+        for mz, intensity, spectrum_idx in peak_group:
+            if spectrum_idx not in spectrum_contributions:
+                spectrum_contributions[spectrum_idx] = []
+            spectrum_contributions[spectrum_idx].append((mz, intensity))
+        
+        # For each spectrum, take the highest intensity peak if multiple peaks contribute
+        final_contributions = []
+        for spectrum_idx, peaks in spectrum_contributions.items():
+            if len(peaks) == 1:
+                final_contributions.append(peaks[0])
+            else:
+                # Multiple peaks from same spectrum - take the one with highest intensity
+                best_peak = max(peaks, key=lambda x: x[1])
+                final_contributions.append(best_peak)
+        
+        if not final_contributions:
+            return None
+        
+        # Calculate average m/z weighted by intensity
+        mz_values = [peak[0] for peak in final_contributions]
+        intensities = [peak[1] for peak in final_contributions]
+        
+        # Weighted average m/z (weighted by intensity)
+        total_intensity = sum(intensities)
+        if total_intensity > 0:
+            avg_mz = sum(mz * intensity for mz, intensity in final_contributions) / total_intensity
+        else:
+            avg_mz = sum(mz_values) / len(mz_values)  # Simple average if no intensity
+        
+        # Calculate average or median intensity
+        if averaging_method == "average":
+            avg_intensity = np.mean(intensities)
+        else:  # median
+            avg_intensity = np.median(intensities)
+        
+        return [avg_mz, avg_intensity]
+    
+    def _calculate_average_metadata(self, average_spectrum, spectra_list, new_key, new_value, group_name):
+        """Calculate average metadata for the new spectrum."""
+        # Add the new key-value pair
+        average_spectrum.add_metadata(new_key, new_value)
+        
+        # Calculate average PEPMASS if present
+        pepmass_values = []
+        for spectrum in spectra_list:
+            pepmass = spectrum.get_metadata_value("PEPMASS")
+            if pepmass:
+                try:
+                    # PEPMASS might have intensity as well, extract just the m/z
+                    pepmass_parts = pepmass.split()
+                    pepmass_mz = float(pepmass_parts[0])
+                    pepmass_values.append(pepmass_mz)
+                except (ValueError, IndexError):
+                    continue
+        
+        if pepmass_values:
+            avg_pepmass = np.mean(pepmass_values)
+            average_spectrum.add_metadata("PEPMASS", f"{avg_pepmass:.6f}")
+        
+        # Collect unique values from all other metadata keys
+        # TODO: This needs refinement - currently just concatenating unique values
+        all_keys = set()
+        for spectrum in spectra_list:
+            all_keys.update(spectrum.metadata.keys())
+        
+        all_keys.discard("PEPMASS")  # Already handled
+        all_keys.discard(new_key)    # Already set
+        
+        for key in all_keys:
+            unique_values = set()
+            for spectrum in spectra_list:
+                value = spectrum.get_metadata_value(key)
+                if value:
+                    unique_values.add(value)
+            
+            if unique_values:
+                if len(unique_values) == 1:
+                    # All spectra have the same value
+                    average_spectrum.add_metadata(key, list(unique_values)[0])
+                else:
+                    # Multiple values - concatenate them
+                    # TODO: This needs refinement for better handling of different metadata types
+                    combined_value = "|".join(sorted(unique_values))
+                    average_spectrum.add_metadata(key, combined_value)
+        
+        # Add metadata about the averaging
+        average_spectrum.add_metadata("AVERAGED_FROM_GROUP", group_name)
+        average_spectrum.add_metadata("AVERAGED_FROM_COUNT", str(len(spectra_list)))
+        spectrum_ids = [str(s.spectrum_id) for s in spectra_list]
+        average_spectrum.add_metadata("AVERAGED_FROM_IDS", ",".join(spectrum_ids))
             
     def show_about(self):
         """Show about dialog."""

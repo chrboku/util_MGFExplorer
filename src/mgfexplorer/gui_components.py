@@ -541,7 +541,8 @@ class MetadataEditor(ttk.Frame):
         instructions_frame = ttk.Frame(self)
         instructions_frame.pack(fill='x', padx=5, pady=5)
         
-        instructions_text = "Double-click on Key or Value cells to edit. Press Enter to save, Escape to cancel."
+        instructions_text = ("Double-click on Key or Value cells to edit. Press Enter to save, Escape to cancel.\n"
+                            "Right-click on Value cells to select all spectra with that value (including empty values).")
         ttk.Label(instructions_frame, text=instructions_text, font=('Arial', 9), foreground='gray').pack()
         
         # Bind selection and editing events
@@ -569,7 +570,7 @@ class MetadataEditor(ttk.Frame):
         all_keys = self.parser.get_all_metadata_keys()
         
         for key in all_keys:
-            # Get value from first selected spectrum
+            # Get value from first selected spectrum, treating None as empty string
             value = ""
             if self.selected_spectrum_ids:
                 first_spectrum = next(
@@ -577,11 +578,14 @@ class MetadataEditor(ttk.Frame):
                     None
                 )
                 if first_spectrum:
-                    value = first_spectrum.get_metadata_value(key) or ""
+                    raw_value = first_spectrum.get_metadata_value(key)
+                    value = raw_value if raw_value is not None else ""
                     
-            # Get unique values for this key
+            # Get unique values for this key (includes empty string for missing values)
             unique_values = self.parser.get_unique_values_for_key(key)
-            unique_str = "; ".join(unique_values[:5])  # Show first 5 unique values
+            
+            # Format unique values for display
+            unique_str = "; ".join([f'"{v}"' if v else "<empty>" for v in unique_values[:5]])
             if len(unique_values) > 5:
                 unique_str += f" ... ({len(unique_values)} total)"
                 
@@ -615,9 +619,11 @@ class MetadataEditor(ttk.Frame):
         # Create context menu
         context_menu = tk.Menu(self, tearoff=0)
         
-        if column == '#2' and value:  # Value column and not empty
+        # Always show selection option for value column, including empty values
+        if column == '#2':  # Value column
+            display_value = value if value else "<empty>"
             context_menu.add_command(
-                label=f"Select all with '{key}' = '{value}'",
+                label=f"Select all with '{key}' = '{display_value}'",
                 command=lambda: self._select_spectra_by_value(key, value)
             )
             
@@ -675,7 +681,13 @@ class MetadataEditor(ttk.Frame):
                     else:
                         return
                 
-                if spectrum.get_metadata_value(key) == value:
+                # Check if spectrum matches the search criteria
+                # Treat None (missing key) as empty string for comparison
+                spectrum_value = spectrum.get_metadata_value(key)
+                if spectrum_value is None:
+                    spectrum_value = ""
+                
+                if spectrum_value == value:
                     matching_spectrum_ids.append(spectrum.spectrum_id)
                 
                 # Update progress for large datasets
@@ -723,7 +735,8 @@ class MetadataEditor(ttk.Frame):
                     # Verify selection was applied (after a short delay)
                     self.after(500, lambda: self._verify_selection_applied(matching_spectrum_ids))
             else:
-                messagebox.showinfo("No Matches", f"No spectra found with {key} = '{value}'")
+                display_value = value if value else "<empty>"
+                messagebox.showinfo("No Matches", f"No spectra found with {key} = '{display_value}'")
                 
         except Exception as e:
             if progress_dialog:
@@ -943,10 +956,8 @@ class MetadataEditor(ttk.Frame):
         # Update value in all selected spectra
         for spectrum in self.parser.spectra:
             if spectrum.spectrum_id in self.selected_spectrum_ids:
-                if key in spectrum.metadata:
-                    spectrum.metadata[key] = new_value
-                else:
-                    spectrum.add_metadata(key, new_value)
+                # Always update the metadata - even if new_value is empty string
+                spectrum.metadata[key] = new_value
                     
         self._refresh_after_change()
         
@@ -1950,3 +1961,141 @@ class CosineSimilarityVisualization(ttk.Frame):
         
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(tk.END, stats_text)
+
+
+class AverageSpectrumDialog:
+    """Dialog for configuring spectrum averaging parameters."""
+    
+    def __init__(self, parent):
+        self.result = None
+        
+        # Create dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Calculate Average Spectrum per Group")
+        self.dialog.geometry("450x450")
+        self.dialog.resizable(True, True)
+        
+        # Make dialog modal
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # Center dialog on parent
+        self.dialog.geometry("+%d+%d" % (
+            parent.winfo_rootx() + 50,
+            parent.winfo_rooty() + 50
+        ))
+        
+        self._create_widgets()
+        
+        # Wait for dialog to close
+        self.dialog.wait_window()
+        
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill='both', expand=True)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="Average Spectrum Parameters", 
+                               font=('TkDefaultFont', 12, 'bold'))
+        title_label.pack(pady=(0, 20))
+        
+        # Parameters frame
+        params_frame = ttk.Frame(main_frame)
+        params_frame.pack(fill='x', pady=(0, 20))
+        
+        # Binning m/z
+        binning_frame = ttk.Frame(params_frame)
+        binning_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(binning_frame, text="Binning m/z tolerance:", width=20, anchor='w').pack(side='left')
+        self.binning_var = tk.StringVar(value="0.1")
+        binning_entry = ttk.Entry(binning_frame, textvariable=self.binning_var, width=12)
+        binning_entry.pack(side='right')
+        
+        # Averaging method
+        method_frame = ttk.Frame(params_frame)
+        method_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(method_frame, text="Averaging method:", width=20, anchor='w').pack(side='left')
+        self.method_var = tk.StringVar(value="average")
+        method_combo = ttk.Combobox(method_frame, textvariable=self.method_var,
+                                   values=["average", "median"], state="readonly", width=10)
+        method_combo.pack(side='right')
+        
+        # New key
+        key_frame = ttk.Frame(params_frame)
+        key_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(key_frame, text="New metadata key:", width=20, anchor='w').pack(side='left')
+        self.key_var = tk.StringVar(value="SPECTYPE")
+        key_entry = ttk.Entry(key_frame, textvariable=self.key_var, width=12)
+        key_entry.pack(side='right')
+        
+        # New value
+        value_frame = ttk.Frame(params_frame)
+        value_frame.pack(fill='x', pady=5)
+        
+        ttk.Label(value_frame, text="New metadata value:", width=20, anchor='w').pack(side='left')
+        self.value_var = tk.StringVar(value="Averaged")
+        value_entry = ttk.Entry(value_frame, textvariable=self.value_var, width=12)
+        value_entry.pack(side='right')
+        
+        # Info text
+        info_text = ("This will create average spectra for each group at the same level.\n"
+                    "Spectra will be normalized using common peaks and then averaged.\n"
+                    "Groups with only one spectrum will be skipped.\n\n"
+                    "Peak combining: Peaks with similar m/z values (within tolerance)\n"
+                    "will be combined into single peaks with weighted average m/z.")
+        info_label = ttk.Label(main_frame, text=info_text, wraplength=400, 
+                              justify='left', foreground='gray')
+        info_label.pack(pady=(0, 20))
+        
+        # Buttons - try a completely different approach with regular tkinter buttons
+        button_frame = tk.Frame(main_frame, height=60, bg='SystemButtonFace')
+        
+        # Use regular tk.Button instead of ttk.Button
+        cancel_btn = tk.Button(button_frame, text="Cancel", command=self._cancel,
+                              width=12, height=2, font=('TkDefaultFont', 9))
+        cancel_btn.pack(side='right', padx=10, pady=15)
+        
+        calculate_btn = tk.Button(button_frame, text="Calculate", command=self._ok,
+                                 width=12, height=2, font=('TkDefaultFont', 9))
+        calculate_btn.pack(side='right', padx=5, pady=15)
+        button_frame.pack(fill='x', pady=20)
+        button_frame.pack_propagate(False)
+        
+    def _ok(self):
+        """Handle OK button."""
+        try:
+            binning_mz = float(self.binning_var.get())
+            if binning_mz <= 0:
+                raise ValueError("Binning m/z must be positive")
+        except ValueError:
+            messagebox.showerror("Error", "Invalid binning m/z value")
+            return
+            
+        new_key = self.key_var.get().strip()
+        new_value = self.value_var.get().strip()
+        
+        if not new_key:
+            messagebox.showerror("Error", "New metadata key cannot be empty")
+            return
+            
+        if not new_value:
+            messagebox.showerror("Error", "New metadata value cannot be empty")
+            return
+            
+        self.result = {
+            'binning_mz': binning_mz,
+            'averaging_method': self.method_var.get(),
+            'new_key': new_key,
+            'new_value': new_value
+        }
+        
+        self.dialog.destroy()
+        
+    def _cancel(self):
+        """Handle Cancel button."""
+        self.result = None
+        self.dialog.destroy()

@@ -132,11 +132,20 @@ class MGFParser:
         return sorted(list(all_keys))
     
     def get_unique_values_for_key(self, key: str) -> List[str]:
-        """Get all unique values for a specific metadata key."""
+        """Get all unique values for a specific metadata key, including empty string for missing values."""
         values = set()
+        has_missing = False
+        
         for spectrum in self.spectra:
             if key in spectrum.metadata:
                 values.add(spectrum.metadata[key])
+            else:
+                has_missing = True
+                
+        # Include empty string if any spectrum is missing this key
+        if has_missing:
+            values.add("")
+            
         return sorted(list(values))
     
     def rename_key_in_all_spectra(self, old_key: str, new_key: str):
@@ -175,6 +184,16 @@ class MGFParser:
         # Get m/z and intensity values
         mz1, int1 = spectrum1.ions[:, 0], spectrum1.ions[:, 1]
         mz2, int2 = spectrum2.ions[:, 0], spectrum2.ions[:, 1]
+        
+        # Normalize intensities to maximum abundant peak to account for scaling differences
+        max_int1 = np.max(int1)
+        max_int2 = np.max(int2)
+        
+        if max_int1 == 0 or max_int2 == 0:
+            return 0.0
+            
+        int1 = int1 / max_int1
+        int2 = int2 / max_int2
         
         # Early exit if no overlap possible
         if mz1.max() + mz_tolerance < mz2.min() or mz2.max() + mz_tolerance < mz1.min():
