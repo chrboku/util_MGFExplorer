@@ -246,26 +246,66 @@ class SpectrumTreeView(ttk.Frame):
     def select_spectra_by_ids(self, spectrum_ids):
         """Select spectra by their IDs with performance optimizations."""
         if not spectrum_ids:
+            # Clear selection
+            for item in self.tree.selection():
+                self.tree.selection_remove(item)
             return
+            
+        # Cancel any ongoing async selection
+        if hasattr(self, '_async_selection_items'):
+            self._cleanup_async_selection()
             
         # For very large selections, show a progress indicator and use async selection
         if len(spectrum_ids) > 100:
+            print(f"Debug: Using async selection for {len(spectrum_ids)} spectra")
             self._select_spectra_async(spectrum_ids)
         else:
-            self._select_spectra_by_ids_standard(spectrum_ids)
+            print(f"Debug: Using standard selection for {len(spectrum_ids)} spectra")
+            found_items = self._select_spectra_by_ids_standard(spectrum_ids)
+            print(f"Debug: Standard selection found {len(found_items) if found_items else 0} items")
     
     def _select_spectra_async(self, spectrum_ids):
         """Asynchronously select large numbers of spectra."""
         # Show progress message
         self.after_idle(lambda: self._show_selection_progress(len(spectrum_ids)))
         
-        # Schedule the selection in chunks to keep UI responsive
+        # Schedule the selection to collect all items first, then select
         self._async_selection_ids = set(spectrum_ids)
         self._async_selection_items = []
-        self._async_selection_index = 0
         
-        # Start collecting items
-        self.after(10, self._collect_selection_items_async)
+        # Use a more robust approach: collect all items first
+        self.after(10, self._collect_all_spectrum_items_async)
+        
+    def _collect_all_spectrum_items_async(self):
+        """Collect all spectrum items from the tree structure."""
+        all_spectrum_items = []
+        
+        def collect_items(parent=''):
+            for item in self.tree.get_children(parent):
+                tags = self.tree.item(item, 'tags')
+                if tags and tags[0] == 'spectrum':
+                    spectrum_id = int(tags[1])
+                    if spectrum_id in self._async_selection_ids:
+                        all_spectrum_items.append(item)
+                elif tags and tags[0] == 'group':
+                    # Recursively check group children
+                    collect_items(item)
+                else:
+                    # Handle items without proper tags
+                    collect_items(item)
+        
+        # Clear current selection first
+        self.tree.selection_remove(*self.tree.selection())
+        
+        # Collect all matching items
+        collect_items()
+        
+        # Store the collected items
+        self._async_selection_items = all_spectrum_items
+        self._selection_chunk_index = 0
+        
+        # Start applying selection in chunks
+        self.after(10, self._apply_async_selection)
         
     def _show_selection_progress(self, count):
         """Show selection progress in the tree."""
@@ -276,39 +316,36 @@ class SpectrumTreeView(ttk.Frame):
         # For now, we'll just ensure the UI updates
         self.update_idletasks()
         
-    def _collect_selection_items_async(self, parent=''):
-        """Collect items to select asynchronously."""
-        # Process a chunk of items
-        items_processed = 0
-        max_items_per_chunk = 50
+    def _collect_all_spectrum_items_async(self):
+        """Collect all spectrum items from the tree structure."""
+        all_spectrum_items = []
         
-        children = list(self.tree.get_children(parent))
+        def collect_items(parent=''):
+            for item in self.tree.get_children(parent):
+                tags = self.tree.item(item, 'tags')
+                if tags and tags[0] == 'spectrum':
+                    spectrum_id = int(tags[1])
+                    if spectrum_id in self._async_selection_ids:
+                        all_spectrum_items.append(item)
+                elif tags and tags[0] == 'group':
+                    # Recursively check group children
+                    collect_items(item)
+                else:
+                    # Handle items without proper tags
+                    collect_items(item)
         
-        while (items_processed < max_items_per_chunk and 
-               self._async_selection_index < len(children)):
-            
-            item = children[self._async_selection_index]
-            self._async_selection_index += 1
-            items_processed += 1
-            
-            tags = self.tree.item(item, 'tags')
-            if tags and tags[0] == 'spectrum':
-                spectrum_id = int(tags[1])
-                if spectrum_id in self._async_selection_ids:
-                    self._async_selection_items.append(item)
-            else:
-                # For group items, we need to recursively check children
-                # Add children to the processing queue
-                group_children = self.tree.get_children(item)
-                children.extend(group_children)
+        # Clear current selection first
+        self.tree.selection_remove(*self.tree.selection())
         
-        # Check if we're done with this level
-        if self._async_selection_index >= len(children):
-            # Move to actual selection
-            self.after(10, self._apply_async_selection)
-        else:
-            # Continue processing
-            self.after(10, self._collect_selection_items_async)
+        # Collect all matching items
+        collect_items()
+        
+        # Store the collected items
+        self._async_selection_items = all_spectrum_items
+        self._selection_chunk_index = 0
+        
+        # Start applying selection in chunks
+        self.after(10, self._apply_async_selection)
     
     def _apply_async_selection(self):
         """Apply the collected selection asynchronously."""
@@ -345,14 +382,9 @@ class SpectrumTreeView(ttk.Frame):
     
     def _cleanup_async_selection(self):
         """Clean up async selection variables."""
-        if hasattr(self, '_async_selection_ids'):
-            delattr(self, '_async_selection_ids')
-        if hasattr(self, '_async_selection_items'):
-            delattr(self, '_async_selection_items')
-        if hasattr(self, '_async_selection_index'):
-            delattr(self, '_async_selection_index')
-        if hasattr(self, '_selection_chunk_index'):
-            delattr(self, '_selection_chunk_index')
+        for attr in ['_async_selection_ids', '_async_selection_items', '_selection_chunk_index']:
+            if hasattr(self, attr):
+                delattr(self, attr)
     
     def _select_spectra_by_ids_standard(self, spectrum_ids):
         """Standard selection method for moderate number of spectra."""
@@ -362,6 +394,7 @@ class SpectrumTreeView(ttk.Frame):
         
         # Convert to set for faster lookup
         target_ids = set(spectrum_ids)
+        found_items = []
         
         # Select matching spectra
         def select_in_tree(parent=''):
@@ -371,14 +404,26 @@ class SpectrumTreeView(ttk.Frame):
                     spectrum_id = int(tags[1])
                     if spectrum_id in target_ids:
                         self.tree.selection_add(item)
+                        found_items.append(item)
                         # Only ensure visibility for first few items to avoid performance issues
-                        if len(self.tree.selection()) <= 10:
+                        if len(found_items) <= 10:
                             self.tree.see(item)
+                elif tags and tags[0] == 'group':
+                    # Recursively check children of group items
+                    select_in_tree(item)
                 else:
-                    # Recursively check children
+                    # Handle items without proper tags - recursively check children anyway
                     select_in_tree(item)
         
         select_in_tree()
+        
+        # Debug information - can be removed later
+        if len(found_items) != len(spectrum_ids):
+            print(f"Selection mismatch: requested {len(spectrum_ids)}, found {len(found_items)}")
+            print(f"Tree has grouping: {bool(self.selected_grouping_tags)}")
+            print(f"Grouping tags: {self.selected_grouping_tags}")
+        
+        return found_items
         
     def _select_spectra_by_ids_batch(self, spectrum_ids):
         """Optimized selection method for large number of spectra."""
@@ -672,7 +717,11 @@ class MetadataEditor(ttk.Frame):
                 if self.on_metadata_changed:
                     # Store the matching IDs for the parent to handle
                     self._pending_selection = matching_spectrum_ids
+                    print(f"Debug: Setting pending selection of {len(matching_spectrum_ids)} spectra")
                     self.on_metadata_changed()
+                    
+                    # Verify selection was applied (after a short delay)
+                    self.after(500, lambda: self._verify_selection_applied(matching_spectrum_ids))
             else:
                 messagebox.showinfo("No Matches", f"No spectra found with {key} = '{value}'")
                 
@@ -680,6 +729,23 @@ class MetadataEditor(ttk.Frame):
             if progress_dialog:
                 progress_dialog.destroy()
             messagebox.showerror("Error", f"Error during search: {str(e)}")
+            
+    def _verify_selection_applied(self, expected_ids):
+        """Verify that the selection was properly applied (debug method)."""
+        # This method can be removed once the issue is resolved
+        try:
+            # Get the current selection from the parent's spectrum tree
+            if hasattr(self.parent, 'spectrum_tree'):
+                current_selection = self.parent.spectrum_tree.get_selected_spectrum_ids()
+                if set(current_selection) != set(expected_ids):
+                    print(f"Debug: Selection mismatch!")
+                    print(f"  Expected: {len(expected_ids)} spectra")
+                    print(f"  Got: {len(current_selection)} spectra")
+                    print(f"  Tree grouped: {bool(self.parent.spectrum_tree.selected_grouping_tags)}")
+                else:
+                    print(f"Debug: Selection verified correctly ({len(current_selection)} spectra)")
+        except Exception as e:
+            print(f"Debug: Could not verify selection: {e}")
             
     def _create_progress_dialog(self, title: str):
         """Create a simple progress dialog."""
