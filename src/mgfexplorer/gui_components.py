@@ -151,6 +151,10 @@ class MetadataEditor(ttk.Frame):
         self.on_metadata_changed = on_metadata_changed
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []
+        self.edit_var = tk.StringVar()
+        self.edit_entry = None
+        self.editing_item = None
+        self.editing_column = None
         
         self._create_widgets()
         
@@ -206,6 +210,8 @@ class MetadataEditor(ttk.Frame):
         
         # Bind selection event
         self.metadata_tree.bind('<<TreeviewSelect>>', self._on_metadata_selection)
+        self.metadata_tree.bind('<Double-1>', self._on_double_click)
+        self.metadata_tree.bind('<Button-1>', self._on_single_click)
         
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load metadata for selected spectra."""
@@ -253,6 +259,189 @@ class MetadataEditor(ttk.Frame):
             if values:
                 self.key_var.set(values[0])
                 self.value_var.set(values[1])
+                
+    def _on_single_click(self, event):
+        """Handle single click to close any open editor."""
+        self._close_editor()
+                
+    def _on_double_click(self, event):
+        """Handle double click to start editing."""
+        item = self.metadata_tree.identify('item', event.x, event.y)
+        column = self.metadata_tree.identify('column', event.x, event.y)
+        
+        if item and column in ('#1', '#2'):  # Key or Value columns
+            self._start_editing(item, column)
+            
+    def _start_editing(self, item, column):
+        """Start inline editing of a cell."""
+        # Close any existing editor
+        self._close_editor()
+        
+        # Get current value
+        values = self.metadata_tree.item(item, 'values')
+        if not values:
+            return
+            
+        current_value = values[0] if column == '#1' else values[1]
+        self.edit_var.set(current_value)
+        
+        # Get cell position
+        bbox = self.metadata_tree.bbox(item, column)
+        if not bbox:
+            return
+            
+        x, y, width, height = bbox
+        
+        # Create entry widget
+        self.edit_entry = ttk.Entry(self.metadata_tree, textvariable=self.edit_var)
+        self.edit_entry.place(x=x, y=y, width=width, height=height)
+        self.edit_entry.focus()
+        self.edit_entry.select_range(0, tk.END)
+        
+        # Store editing context
+        self.editing_item = item
+        self.editing_column = column
+        
+        # Bind events
+        self.edit_entry.bind('<Return>', self._finish_editing)
+        self.edit_entry.bind('<Escape>', self._cancel_editing)
+        self.edit_entry.bind('<FocusOut>', self._cancel_editing)
+        
+    def _close_editor(self):
+        """Close the inline editor."""
+        if self.edit_entry:
+            self.edit_entry.destroy()
+            self.edit_entry = None
+            self.editing_item = None
+            self.editing_column = None
+            
+    def _cancel_editing(self, event=None):
+        """Cancel editing without saving."""
+        self._close_editor()
+        
+    def _finish_editing(self, event=None):
+        """Finish editing and save changes."""
+        if not self.editing_item or not self.editing_column:
+            return
+            
+        new_value = self.edit_var.get().strip()
+        values = self.metadata_tree.item(self.editing_item, 'values')
+        
+        if not values:
+            self._close_editor()
+            return
+            
+        current_key = values[0]
+        current_value = values[1]
+        
+        if self.editing_column == '#1':  # Editing key
+            self._handle_key_edit(current_key, new_value)
+        else:  # Editing value
+            self._handle_value_edit(current_key, new_value)
+            
+        self._close_editor()
+        
+    def _handle_key_edit(self, old_key: str, new_key: str):
+        """Handle editing of a metadata key."""
+        if not new_key or old_key == new_key:
+            return
+            
+        if not self.parser:
+            return
+            
+        # Check if new key already exists in any spectrum
+        existing_spectra_with_new_key = []
+        for spectrum in self.parser.spectra:
+            if new_key in spectrum.metadata:
+                existing_spectra_with_new_key.append(spectrum.spectrum_id)
+                
+        # Ask user if they want to update for all spectra
+        message = f"Do you want to rename the key '{old_key}' to '{new_key}' for all loaded spectra?"
+        if not messagebox.askyesno("Rename Key", message):
+            return
+            
+        if existing_spectra_with_new_key:
+            # New key already exists in some spectra
+            conflict_message = (
+                f"The key '{new_key}' already exists in {len(existing_spectra_with_new_key)} spectra.\n\n"
+                f"What would you like to do?\n\n"
+                f"• Update: Only rename '{old_key}' to '{new_key}' in spectra that don't have '{new_key}'\n"
+                f"• Merge: Combine values ('{old_key}' values will overwrite '{new_key}' values)\n"
+                f"• Abort: Cancel the operation"
+            )
+            
+            result = messagebox.askyesnocancel(
+                "Key Conflict", 
+                conflict_message,
+                title="Choose Action"
+            )
+            
+            if result is None:  # Cancel
+                return
+            elif result:  # Yes - Update only
+                self._rename_key_selective(old_key, new_key, existing_spectra_with_new_key)
+            else:  # No - Merge
+                self._rename_key_merge(old_key, new_key)
+        else:
+            # No conflict, rename for all spectra
+            self._rename_key_all(old_key, new_key)
+            
+    def _rename_key_selective(self, old_key: str, new_key: str, exclude_spectrum_ids: List[int]):
+        """Rename key only in spectra that don't have the new key."""
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id not in exclude_spectrum_ids:
+                if old_key in spectrum.metadata:
+                    spectrum.rename_metadata_key(old_key, new_key)
+                    
+        # Add empty key for spectra that don't have the old key
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id not in exclude_spectrum_ids and new_key not in spectrum.metadata:
+                spectrum.add_metadata(new_key, "")
+                
+        self._refresh_after_change()
+        
+    def _rename_key_merge(self, old_key: str, new_key: str):
+        """Merge keys, with old_key values overwriting new_key values."""
+        for spectrum in self.parser.spectra:
+            if old_key in spectrum.metadata:
+                old_value = spectrum.metadata[old_key]
+                spectrum.metadata[new_key] = old_value
+                del spectrum.metadata[old_key]
+            elif new_key not in spectrum.metadata:
+                spectrum.add_metadata(new_key, "")
+                
+        self._refresh_after_change()
+        
+    def _rename_key_all(self, old_key: str, new_key: str):
+        """Rename key for all spectra."""
+        for spectrum in self.parser.spectra:
+            if old_key in spectrum.metadata:
+                spectrum.rename_metadata_key(old_key, new_key)
+            else:
+                spectrum.add_metadata(new_key, "")
+                
+        self._refresh_after_change()
+        
+    def _handle_value_edit(self, key: str, new_value: str):
+        """Handle editing of a metadata value."""
+        if not self.parser or not self.selected_spectrum_ids:
+            return
+            
+        # Update value in all selected spectra
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id in self.selected_spectrum_ids:
+                if key in spectrum.metadata:
+                    spectrum.metadata[key] = new_value
+                else:
+                    spectrum.add_metadata(key, new_value)
+                    
+        self._refresh_after_change()
+        
+    def _refresh_after_change(self):
+        """Refresh the view after metadata changes."""
+        self._populate_metadata()
+        if self.on_metadata_changed:
+            self.on_metadata_changed()
                 
     def _update_value(self):
         """Update metadata value for selected spectra."""

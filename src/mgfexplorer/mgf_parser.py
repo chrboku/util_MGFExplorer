@@ -38,9 +38,8 @@ class Spectrum:
         return self.metadata.get(key)
         
     def update_metadata(self, key: str, value: str):
-        """Update existing metadata value."""
-        if key in self.metadata:
-            self.metadata[key] = value
+        """Update existing metadata value or add new key-value pair."""
+        self.metadata[key] = value
             
     def rename_metadata_key(self, old_key: str, new_key: str):
         """Rename a metadata key."""
@@ -150,3 +149,9 @@ class MGFParser:
         for spectrum in self.spectra:
             if spectrum.spectrum_id in spectrum_ids:
                 spectrum.update_metadata(key, value)
+                
+    def add_missing_key_to_all_spectra(self, key: str, default_value: str = ""):
+        """Add a key with default value to all spectra that don't have it."""
+        for spectrum in self.spectra:
+            if key not in spectrum.metadata:
+                spectrum.add_metadata(key, default_value)
