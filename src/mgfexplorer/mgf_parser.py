@@ -349,3 +349,32 @@ class MGFParser:
                         f.write(f"{mz:.6f} {intensity:.6f}\n")
                 
                 f.write("END IONS\n\n")
+
+    def normalize_intensities(self, spectrum_ids: Optional[List[int]] = None):
+        """
+        Normalize intensities in spectra so that the most abundant peak has intensity 1.
+        
+        Args:
+            spectrum_ids: Optional list of spectrum IDs to normalize. If None, normalizes all spectra.
+        """
+        # Determine which spectra to normalize
+        if spectrum_ids is None:
+            spectra_to_normalize = self.spectra
+        else:
+            spectra_to_normalize = [s for s in self.spectra if s.spectrum_id in spectrum_ids]
+        
+        for spectrum in spectra_to_normalize:
+            if spectrum.ions.size > 0:
+                # Get current intensities
+                intensities = spectrum.ions[:, 1]
+                
+                # Find maximum intensity
+                max_intensity = np.max(intensities)
+                
+                # Only normalize if max intensity is not zero
+                if max_intensity > 0:
+                    # Scale intensities so max becomes 1
+                    normalized_intensities = intensities / max_intensity
+                    
+                    # Update the spectrum with normalized intensities
+                    spectrum.ions[:, 1] = normalized_intensities

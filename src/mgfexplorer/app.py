@@ -57,6 +57,8 @@ class MGFExplorerApp:
         edit_menu.add_command(label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase)
         edit_menu.add_command(label="Convert Keys to lowercase", command=self._keys_to_lowercase)
         edit_menu.add_separator()
+        edit_menu.add_command(label="Intensity Normalization", command=self._normalize_intensities)
+        edit_menu.add_separator()
         edit_menu.add_command(label="Delete Selected Spectra", command=self._delete_selected_spectra)
         edit_menu.add_separator()
         edit_menu.add_command(label="Calculate Average Spectrum per Group", command=self._calculate_average_spectra)
@@ -361,6 +363,41 @@ class MGFExplorerApp:
                 self.parser.rename_key_in_all_spectra(old_key, new_key)
                 
         self._on_metadata_changed()
+        
+    def _normalize_intensities(self):
+        """Normalize intensities so that the most abundant peak in each spectrum has intensity 1."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning("Warning", "No data loaded. Please open an MGF file first.")
+            return
+            
+        # Ask for confirmation
+        if not messagebox.askyesno(
+            "Intensity Normalization", 
+            "Normalize intensities in all spectra so that the most abundant peak has intensity 1?\n\n"
+            "This will modify the intensity values and cannot be undone."
+        ):
+            return
+            
+        try:
+            self.status_var.set("Normalizing intensities...")
+            self.root.update()
+            
+            # Normalize all spectra
+            self.parser.normalize_intensities()
+            
+            # Update visualization and data
+            self._on_metadata_changed()
+            
+            self.status_var.set(f"Normalized intensities in {len(self.parser.spectra)} spectra")
+            
+            messagebox.showinfo(
+                "Normalization Complete", 
+                f"Successfully normalized intensities in {len(self.parser.spectra)} spectra."
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Normalization Error", f"Failed to normalize intensities:\n{str(e)}")
+            self.status_var.set("Normalization failed")
         
     def _update_spectrum_name_menu(self):
         """Update the spectrum name menu with available metadata fields."""
@@ -890,6 +927,8 @@ class MGFExplorerApp:
             "• Parse and display MS/MS spectra\n"
             "• Group spectra by metadata fields\n"
             "• Edit metadata values\n"
+            "• Normalize intensities in spectra\n"
+            "• Export spectra to MGF files\n"
             "• Visualize spectra as stick charts\n"
             "• View ion data in tables"
         )
