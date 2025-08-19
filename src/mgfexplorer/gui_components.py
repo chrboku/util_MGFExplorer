@@ -978,6 +978,15 @@ class SpectrumVisualization(ttk.Frame):
         if not selected_spectra:
             return
             
+        # Performance check: limit to first 5 spectra if more than 10 are selected
+        original_count = len(selected_spectra)
+        if original_count > 10:
+            selected_spectra = selected_spectra[:5]
+            # Add a warning text to the plot
+            performance_warning = f"Performance limit: Showing first 5 of {original_count} selected spectra"
+        else:
+            performance_warning = None
+            
         # Calculate global m/z limits for all selected spectra
         global_mz_min = float('inf')
         global_mz_max = float('-inf')
@@ -1002,16 +1011,27 @@ class SpectrumVisualization(ttk.Frame):
         n_spectra = len(selected_spectra)
         if n_spectra == 1:
             ax = self.figure.add_subplot(111)
-            self._plot_single_spectrum(ax, selected_spectra[0], (global_mz_min, global_mz_max))
+            self._plot_single_spectrum(ax, selected_spectra[0], (global_mz_min, global_mz_max), is_last=True)
         else:
             for i, spectrum in enumerate(selected_spectra):
+                is_last = (i == n_spectra - 1)
                 ax = self.figure.add_subplot(n_spectra, 1, i+1)
-                self._plot_single_spectrum(ax, spectrum, (global_mz_min, global_mz_max))
+                self._plot_single_spectrum(ax, spectrum, (global_mz_min, global_mz_max), is_last=is_last)
                 
-        self.figure.tight_layout()
+        # Add performance warning if applicable
+        if performance_warning:
+            self.figure.suptitle(performance_warning, fontsize=10, color='red', y=0.98)
+                
+        # Minimize space between subplots
+        self.figure.tight_layout(pad=0.5, h_pad=0.2)
+        # Adjust layout to make room for the warning if present
+        if performance_warning:
+            self.figure.subplots_adjust(top=0.94, hspace=0.1)
+        else:
+            self.figure.subplots_adjust(hspace=0.1)
         self.canvas.draw()
         
-    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None):
+    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None, is_last=False):
         """Plot a single spectrum as a stick chart."""
         if spectrum.ions.size == 0:
             ax.text(0.5, 0.5, 'No ion data', ha='center', va='center', transform=ax.transAxes)
@@ -1024,9 +1044,20 @@ class SpectrumVisualization(ttk.Frame):
         
         # Create stick plot
         ax.vlines(mz_values, 0, intensity_values, colors='blue', linewidth=1.5)
-        ax.set_xlabel('m/z')
+        
+        # Only show x-axis label and ticks on the last spectrum
+        if is_last:
+            ax.set_xlabel('m/z')
+        else:
+            ax.set_xticklabels([])
+            ax.tick_params(axis='x', which='both', bottom=False)
+            
         ax.set_ylabel('Intensity')
-        ax.set_title(f'Spectrum {spectrum.spectrum_id}')
+        
+        # Remove title - spectrum ID will be shown in y-axis label instead
+        spectrum_label = f'Spectrum {spectrum.spectrum_id}'
+        ax.set_ylabel(f'{spectrum_label}\nIntensity', fontsize=9)
+        
         ax.grid(True, alpha=0.3)
         
         # Set limits
