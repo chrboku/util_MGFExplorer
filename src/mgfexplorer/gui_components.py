@@ -13,24 +13,38 @@ from .mgf_parser import MGFParser, Spectrum
 
 
 class SpectrumTreeView(ttk.Frame):
-    """Tree view component for displaying spectra list and grouping options."""
+    """Tree view component for displaying spectra list with tag-based grouping."""
     
     def __init__(self, parent, on_selection_changed=None):
         super().__init__(parent)
         self.on_selection_changed = on_selection_changed
         self.parser: Optional[MGFParser] = None
-        self.selected_grouping_keys: List[str] = []
+        self.selected_grouping_tags: List[str] = []
         
         self._create_widgets()
         
     def _create_widgets(self):
         """Create the tree view widgets."""
-        # Grouping frame
-        group_frame = ttk.LabelFrame(self, text="Grouping Options", padding=5)
-        group_frame.pack(fill='x', padx=5, pady=5)
+        # Tag selection frame
+        tag_frame = ttk.LabelFrame(self, text="Grouping Tags", padding=5)
+        tag_frame.pack(fill='x', padx=5, pady=5)
         
-        self.grouping_vars = {}
-        self.grouping_frame = group_frame
+        # Instructions
+        ttk.Label(tag_frame, text="Enter metadata keys for grouping (comma-separated):").pack(anchor='w')
+        
+        # Tag entry with autocomplete-like functionality
+        self.tag_var = tk.StringVar()
+        self.tag_entry = ttk.Entry(tag_frame, textvariable=self.tag_var, width=40)
+        self.tag_entry.pack(fill='x', pady=5)
+        self.tag_entry.bind('<KeyRelease>', self._on_tag_entry_change)
+        self.tag_entry.bind('<Return>', self._apply_grouping)
+        
+        # Available tags display
+        self.tags_label = ttk.Label(tag_frame, text="Available keys: ", wraplength=250)
+        self.tags_label.pack(anchor='w', pady=2)
+        
+        # Apply button
+        ttk.Button(tag_frame, text="Apply Grouping", command=self._apply_grouping).pack(pady=5)
         
         # Tree view frame
         tree_frame = ttk.LabelFrame(self, text="Spectra", padding=5)
@@ -53,43 +67,37 @@ class SpectrumTreeView(ttk.Frame):
     def load_data(self, parser: MGFParser):
         """Load spectra data into the tree view."""
         self.parser = parser
-        self._update_grouping_options()
+        self._update_available_tags()
         self._populate_tree()
         
-    def _update_grouping_options(self):
-        """Update the grouping checkboxes based on available metadata keys."""
-        # Clear existing checkboxes
-        for widget in self.grouping_frame.winfo_children():
-            widget.destroy()
-            
-        self.grouping_vars.clear()
-        
+    def _update_available_tags(self):
+        """Update the display of available metadata keys."""
         if not self.parser:
+            self.tags_label.config(text="Available keys: ")
             return
             
-        # Create checkboxes for each metadata key
         all_keys = self.parser.get_all_metadata_keys()
+        keys_text = ", ".join(all_keys) if all_keys else "None"
+        self.tags_label.config(text=f"Available keys: {keys_text}")
         
-        for i, key in enumerate(all_keys):
-            var = tk.BooleanVar()
-            cb = ttk.Checkbutton(
-                self.grouping_frame, 
-                text=key, 
-                variable=var,
-                command=self._on_grouping_changed
-            )
-            cb.grid(row=i//3, column=i%3, sticky='w', padx=5, pady=2)
-            self.grouping_vars[key] = var
+    def _on_tag_entry_change(self, event=None):
+        """Handle changes in the tag entry field."""
+        # Could add autocomplete functionality here in the future
+        pass
+        
+    def _apply_grouping(self, event=None):
+        """Apply the grouping based on entered tags."""
+        tag_text = self.tag_var.get().strip()
+        if tag_text:
+            # Parse comma-separated tags
+            self.selected_grouping_tags = [tag.strip() for tag in tag_text.split(',') if tag.strip()]
+        else:
+            self.selected_grouping_tags = []
             
-    def _on_grouping_changed(self):
-        """Handle grouping option changes."""
-        self.selected_grouping_keys = [
-            key for key, var in self.grouping_vars.items() if var.get()
-        ]
         self._populate_tree()
         
     def _populate_tree(self):
-        """Populate the tree view with spectra."""
+        """Populate the tree view with spectra using hierarchical grouping."""
         # Clear existing items
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -97,26 +105,80 @@ class SpectrumTreeView(ttk.Frame):
         if not self.parser:
             return
             
-        # Configure columns
-        columns = ['ID'] + self.selected_grouping_keys
-        self.tree['columns'] = columns
-        self.tree['show'] = 'tree headings'
+        # Configure tree display
+        self.tree['show'] = 'tree'
         
-        # Configure column headings
-        self.tree.heading('#0', text='Spectrum')
-        for col in columns:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=100)
+        if not self.selected_grouping_tags:
+            # No grouping - show flat list
+            self._populate_flat_list()
+        else:
+            # Hierarchical grouping
+            self._populate_hierarchical_tree()
             
-        # Add spectra to tree
+    def _populate_flat_list(self):
+        """Populate tree with flat list of spectra."""
         for spectrum in self.parser.spectra:
-            values = [spectrum.spectrum_id]
-            for key in self.selected_grouping_keys:
-                values.append(spectrum.get_metadata_value(key) or '')
-                
-            self.tree.insert('', 'end', text=f'Spectrum {spectrum.spectrum_id}', 
-                           values=values, tags=(spectrum.spectrum_id,))
+            item_id = self.tree.insert('', 'end', text=f'Spectrum {spectrum.spectrum_id}', 
+                                     tags=('spectrum', spectrum.spectrum_id))
+                                     
+    def _populate_hierarchical_tree(self):
+        """Populate tree with hierarchical grouping."""
+        # Build hierarchy
+        hierarchy = {}
+        
+        for spectrum in self.parser.spectra:
+            # Get values for grouping tags
+            path = []
+            for tag in self.selected_grouping_tags:
+                value = spectrum.get_metadata_value(tag)
+                if value is None:
+                    value = "<missing>"
+                path.append(f"{tag}={value}")
             
+            # Build nested dictionary
+            current = hierarchy
+            for level, path_part in enumerate(path):
+                if path_part not in current:
+                    current[path_part] = {'spectra': [], 'children': {}}
+                current = current[path_part]['children']
+                
+            # Add spectrum to the final level
+            final_level = hierarchy
+            for path_part in path[:-1]:
+                final_level = final_level[path_part]['children']
+            if path:
+                final_level[path[-1]]['spectra'].append(spectrum)
+            else:
+                # No valid grouping path, add to root
+                if '_ungrouped_' not in hierarchy:
+                    hierarchy['_ungrouped_'] = {'spectra': [], 'children': {}}
+                hierarchy['_ungrouped_']['spectra'].append(spectrum)
+        
+        # Populate tree from hierarchy
+        self._add_hierarchy_to_tree('', hierarchy, 0)
+        
+    def _add_hierarchy_to_tree(self, parent_id: str, hierarchy: dict, level: int):
+        """Recursively add hierarchy to tree."""
+        for key, data in hierarchy.items():
+            # Create group node
+            display_text = key if key != '_ungrouped_' else 'Ungrouped'
+            group_id = self.tree.insert(parent_id, 'end', text=display_text, 
+                                       tags=('group', level))
+            
+            # Add spectra in this group
+            for spectrum in data['spectra']:
+                spectrum_id = self.tree.insert(group_id, 'end', 
+                                             text=f'Spectrum {spectrum.spectrum_id}',
+                                             tags=('spectrum', spectrum.spectrum_id))
+            
+            # Recursively add children
+            if data['children']:
+                self._add_hierarchy_to_tree(group_id, data['children'], level + 1)
+                
+            # Expand group if it has items
+            if data['spectra'] or data['children']:
+                self.tree.item(group_id, open=True)
+                
     def _on_tree_selection(self, event):
         """Handle tree selection changes."""
         selected_items = self.tree.selection()
@@ -124,12 +186,39 @@ class SpectrumTreeView(ttk.Frame):
         
         for item in selected_items:
             tags = self.tree.item(item, 'tags')
-            if tags:
-                selected_spectrum_ids.append(int(tags[0]))
+            if not tags:
+                continue
+                
+            if tags[0] == 'spectrum':
+                # Direct spectrum selection
+                selected_spectrum_ids.append(int(tags[1]))
+            elif tags[0] == 'group':
+                # Group selection - get all spectra in group and children
+                group_spectra = self._get_spectra_in_group(item)
+                selected_spectrum_ids.extend(group_spectra)
+                
+        # Remove duplicates and sort
+        selected_spectrum_ids = sorted(list(set(selected_spectrum_ids)))
                 
         if self.on_selection_changed:
             self.on_selection_changed(selected_spectrum_ids)
             
+    def _get_spectra_in_group(self, group_item):
+        """Get all spectrum IDs in a group and its children."""
+        spectrum_ids = []
+        
+        def collect_spectra(item):
+            for child in self.tree.get_children(item):
+                tags = self.tree.item(child, 'tags')
+                if tags and tags[0] == 'spectrum':
+                    spectrum_ids.append(int(tags[1]))
+                else:
+                    # Recursive for nested groups
+                    collect_spectra(child)
+                    
+        collect_spectra(group_item)
+        return spectrum_ids
+        
     def get_selected_spectrum_ids(self) -> List[int]:
         """Get currently selected spectrum IDs."""
         selected_items = self.tree.selection()
@@ -137,10 +226,16 @@ class SpectrumTreeView(ttk.Frame):
         
         for item in selected_items:
             tags = self.tree.item(item, 'tags')
-            if tags:
-                selected_ids.append(int(tags[0]))
+            if not tags:
+                continue
                 
-        return selected_ids
+            if tags[0] == 'spectrum':
+                selected_ids.append(int(tags[1]))
+            elif tags[0] == 'group':
+                group_spectra = self._get_spectra_in_group(item)
+                selected_ids.extend(group_spectra)
+                
+        return sorted(list(set(selected_ids)))
 
 
 class MetadataEditor(ttk.Frame):
@@ -207,6 +302,14 @@ class MetadataEditor(ttk.Frame):
         
         ttk.Button(edit_frame, text="Update Value", command=self._update_value).grid(row=0, column=4, padx=5)
         ttk.Button(edit_frame, text="Rename Key", command=self._rename_key).grid(row=0, column=5, padx=5)
+        
+        # Additional buttons row
+        button_frame = ttk.Frame(self)
+        button_frame.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Button(button_frame, text="Add New Key-Value", command=self._add_new_key_value).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Keys to UPPERCASE", command=self._keys_to_uppercase).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Keys to lowercase", command=self._keys_to_lowercase).pack(side='left', padx=5)
         
         # Bind selection event
         self.metadata_tree.bind('<<TreeviewSelect>>', self._on_metadata_selection)
@@ -442,7 +545,52 @@ class MetadataEditor(ttk.Frame):
         self._populate_metadata()
         if self.on_metadata_changed:
             self.on_metadata_changed()
+            
+    def _add_new_key_value(self):
+        """Add a new key-value pair with a popup form."""
+        if not self.parser:
+            return
+            
+        dialog = AddKeyValueDialog(self, self.parser, self.selected_spectrum_ids)
+        if dialog.result:
+            self._refresh_after_change()
+            
+    def _keys_to_uppercase(self):
+        """Convert all key names to uppercase."""
+        if not self.parser:
+            return
+            
+        if not messagebox.askyesno("Convert Keys", "Convert all key names to UPPERCASE?"):
+            return
+            
+        # Get all current keys
+        all_keys = self.parser.get_all_metadata_keys()
+        
+        for old_key in all_keys:
+            new_key = old_key.upper()
+            if old_key != new_key:
+                self.parser.rename_key_in_all_spectra(old_key, new_key)
                 
+        self._refresh_after_change()
+        
+    def _keys_to_lowercase(self):
+        """Convert all key names to lowercase."""
+        if not self.parser:
+            return
+            
+        if not messagebox.askyesno("Convert Keys", "Convert all key names to lowercase?"):
+            return
+            
+        # Get all current keys
+        all_keys = self.parser.get_all_metadata_keys()
+        
+        for old_key in all_keys:
+            new_key = old_key.lower()
+            if old_key != new_key:
+                self.parser.rename_key_in_all_spectra(old_key, new_key)
+                
+        self._refresh_after_change()
+        
     def _update_value(self):
         """Update metadata value for selected spectra."""
         key = self.key_var.get().strip()
@@ -464,13 +612,116 @@ class MetadataEditor(ttk.Frame):
         if not old_key:
             return
             
-        new_key = tk.simpledialog.askstring("Rename Key", f"Enter new name for '{old_key}':")
+        new_key = simpledialog.askstring("Rename Key", f"Enter new name for '{old_key}':")
         if new_key and new_key != old_key:
             self.parser.rename_key_in_all_spectra(old_key, new_key)
             self._populate_metadata()
             
             if self.on_metadata_changed:
                 self.on_metadata_changed()
+
+
+class AddKeyValueDialog:
+    """Dialog for adding new key-value pairs."""
+    
+    def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List[int]):
+        self.parent = parent
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids
+        self.result = None
+        
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Add New Key-Value Pair")
+        self.dialog.geometry("400x200")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        
+        # Center the dialog
+        self.dialog.geometry("+%d+%d" % (
+            parent.winfo_rootx() + 50,
+            parent.winfo_rooty() + 50
+        ))
+        
+        self._create_widgets()
+        self.dialog.wait_window()
+        
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill='both', expand=True)
+        
+        # Key input
+        ttk.Label(main_frame, text="Key Name:").grid(row=0, column=0, sticky='w', pady=5)
+        self.key_var = tk.StringVar()
+        key_entry = ttk.Entry(main_frame, textvariable=self.key_var, width=30)
+        key_entry.grid(row=0, column=1, padx=(10, 0), pady=5)
+        key_entry.focus()
+        
+        # Value input
+        ttk.Label(main_frame, text="Value:").grid(row=1, column=0, sticky='w', pady=5)
+        self.value_var = tk.StringVar()
+        value_entry = ttk.Entry(main_frame, textvariable=self.value_var, width=30)
+        value_entry.grid(row=1, column=1, padx=(10, 0), pady=5)
+        
+        # Scope selection
+        ttk.Label(main_frame, text="Apply to:").grid(row=2, column=0, sticky='w', pady=5)
+        self.scope_var = tk.StringVar(value="selected")
+        scope_frame = ttk.Frame(main_frame)
+        scope_frame.grid(row=2, column=1, padx=(10, 0), pady=5, sticky='w')
+        
+        selected_text = f"Selected spectra ({len(self.selected_spectrum_ids)})" if self.selected_spectrum_ids else "Selected spectra (none)"
+        ttk.Radiobutton(scope_frame, text=selected_text, variable=self.scope_var, value="selected").pack(anchor='w')
+        ttk.Radiobutton(scope_frame, text=f"All loaded spectra ({len(self.parser.spectra)})", variable=self.scope_var, value="all").pack(anchor='w')
+        
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        
+        ttk.Button(button_frame, text="Add", command=self._add_key_value).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(side='left', padx=5)
+        
+        # Bind Enter key
+        self.dialog.bind('<Return>', lambda e: self._add_key_value())
+        self.dialog.bind('<Escape>', lambda e: self._cancel())
+        
+    def _add_key_value(self):
+        """Add the new key-value pair."""
+        key = self.key_var.get().strip()
+        value = self.value_var.get().strip()
+        scope = self.scope_var.get()
+        
+        if not key:
+            messagebox.showerror("Error", "Key name cannot be empty")
+            return
+            
+        # Check if key already exists
+        existing_keys = self.parser.get_all_metadata_keys()
+        if key in existing_keys:
+            if not messagebox.askyesno("Key Exists", f"Key '{key}' already exists. Do you want to update its value?"):
+                return
+                
+        # Apply to selected scope
+        if scope == "selected":
+            if not self.selected_spectrum_ids:
+                messagebox.showwarning("Warning", "No spectra selected")
+                return
+            target_ids = self.selected_spectrum_ids
+        else:
+            target_ids = [s.spectrum_id for s in self.parser.spectra]
+            
+        # Add/update the key-value pair
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id in target_ids:
+                spectrum.metadata[key] = value
+                
+        self.result = True
+        self.dialog.destroy()
+        
+    def _cancel(self):
+        """Cancel the dialog."""
+        self.result = False
+        self.dialog.destroy()
 
 
 class SpectrumVisualization(ttk.Frame):
