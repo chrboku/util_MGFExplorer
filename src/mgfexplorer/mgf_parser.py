@@ -176,28 +176,54 @@ class MGFParser:
         mz1, int1 = spectrum1.ions[:, 0], spectrum1.ions[:, 1]
         mz2, int2 = spectrum2.ions[:, 0], spectrum2.ions[:, 1]
         
-        # Normalize intensities to unit vectors
-        int1_norm = int1 / np.sqrt(np.sum(int1**2))
-        int2_norm = int2 / np.sqrt(np.sum(int2**2))
+        # Early exit if no overlap possible
+        if mz1.max() + mz_tolerance < mz2.min() or mz2.max() + mz_tolerance < mz1.min():
+            return 0.0
         
-        # Find common peaks within tolerance
-        common_peaks1 = []
-        common_peaks2 = []
-        
-        for i, mz in enumerate(mz1):
-            # Find closest peak in spectrum2
-            diff = np.abs(mz2 - mz)
-            min_idx = np.argmin(diff)
+        # Sort spectra by m/z for efficient matching (if not already sorted)
+        if not np.all(mz1[:-1] <= mz1[1:]):
+            sort_idx1 = np.argsort(mz1)
+            mz1, int1 = mz1[sort_idx1], int1[sort_idx1]
             
-            if diff[min_idx] <= mz_tolerance:
-                common_peaks1.append(int1_norm[i])
-                common_peaks2.append(int2_norm[min_idx])
+        if not np.all(mz2[:-1] <= mz2[1:]):
+            sort_idx2 = np.argsort(mz2)
+            mz2, int2 = mz2[sort_idx2], int2[sort_idx2]
         
-        if len(common_peaks1) == 0:
+        # Pre-normalize intensities to unit vectors
+        norm1 = np.sqrt(np.sum(int1**2))
+        norm2 = np.sqrt(np.sum(int2**2))
+        
+        if norm1 == 0 or norm2 == 0:
             return 0.0
             
-        # Calculate cosine similarity for common peaks
-        dot_product = np.sum(np.array(common_peaks1) * np.array(common_peaks2))
+        int1_norm = int1 / norm1
+        int2_norm = int2 / norm2
+        
+        # Use vectorized approach for peak matching
+        # For each peak in spectrum1, find the closest peak in spectrum2 within tolerance
+        dot_product = 0.0
+        
+        # Use searchsorted for efficient range finding
+        j_start = 0
+        for i, mz in enumerate(mz1):
+            # Find the range of peaks in spectrum2 that could match
+            left_bound = mz - mz_tolerance
+            right_bound = mz + mz_tolerance
+            
+            # Use searchsorted to find the range efficiently
+            left_idx = np.searchsorted(mz2[j_start:], left_bound, side='left') + j_start
+            right_idx = np.searchsorted(mz2[j_start:], right_bound, side='right') + j_start
+            
+            if left_idx < right_idx and left_idx < len(mz2):
+                # Find the closest peak within the range
+                candidates = mz2[left_idx:right_idx]
+                if len(candidates) > 0:
+                    closest_idx = left_idx + np.argmin(np.abs(candidates - mz))
+                    dot_product += int1_norm[i] * int2_norm[closest_idx]
+                    
+                    # Optimization: update j_start to avoid re-searching earlier peaks
+                    j_start = max(j_start, left_idx)
+        
         return max(0.0, min(1.0, dot_product))  # Clamp to [0, 1]
         
     def calculate_similarity_matrix(self, spectrum_ids: List[int], 
@@ -220,13 +246,58 @@ class MGFParser:
             
         similarity_matrix = np.zeros((n, n))
         
+        # Fill diagonal with 1.0
         for i in range(n):
-            for j in range(n):
-                if i == j:
-                    similarity_matrix[i, j] = 1.0
-                elif i < j:  # Calculate only upper triangle
-                    sim = self.calculate_cosine_similarity(spectra[i], spectra[j], mz_tolerance)
-                    similarity_matrix[i, j] = sim
-                    similarity_matrix[j, i] = sim  # Symmetric
+            similarity_matrix[i, i] = 1.0
+            
+        # Calculate upper triangle only (since matrix is symmetric)
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = self.calculate_cosine_similarity(spectra[i], spectra[j], mz_tolerance)
+                similarity_matrix[i, j] = sim
+                similarity_matrix[j, i] = sim  # Symmetric
+                    
+        return similarity_matrix
+        
+    def calculate_similarity_matrix_batch(self, spectrum_ids: List[int], 
+                                        mz_tolerance: float = 0.1,
+                                        progress_callback=None) -> np.ndarray:
+        """
+        Calculate pairwise cosine similarity matrix with progress reporting.
+        
+        Args:
+            spectrum_ids: List of spectrum IDs to compare
+            mz_tolerance: m/z tolerance for peak matching
+            progress_callback: Optional callback function for progress updates
+            
+        Returns:
+            Symmetric similarity matrix
+        """
+        spectra = [s for s in self.spectra if s.spectrum_id in spectrum_ids]
+        n = len(spectra)
+        
+        if n < 2:
+            return np.array([[1.0]] if n == 1 else [])
+            
+        similarity_matrix = np.zeros((n, n))
+        total_comparisons = n * (n - 1) // 2
+        completed = 0
+        
+        # Fill diagonal with 1.0
+        for i in range(n):
+            similarity_matrix[i, i] = 1.0
+            
+        # Calculate upper triangle only
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = self.calculate_cosine_similarity(spectra[i], spectra[j], mz_tolerance)
+                similarity_matrix[i, j] = sim
+                similarity_matrix[j, i] = sim  # Symmetric
+                
+                completed += 1
+                
+                # Report progress
+                if progress_callback and completed % max(1, total_comparisons // 50) == 0:
+                    progress_callback(completed, total_comparisons)
                     
         return similarity_matrix

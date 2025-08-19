@@ -10,6 +10,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from typing import List, Dict, Any, Optional
 import re
+import threading
+import time
 from .mgf_parser import MGFParser, Spectrum
 
 
@@ -242,7 +244,118 @@ class SpectrumTreeView(ttk.Frame):
         return sorted(list(set(selected_ids)))
         
     def select_spectra_by_ids(self, spectrum_ids):
-        """Select spectra by their IDs."""
+        """Select spectra by their IDs with performance optimizations."""
+        if not spectrum_ids:
+            return
+            
+        # For very large selections, show a progress indicator and use async selection
+        if len(spectrum_ids) > 100:
+            self._select_spectra_async(spectrum_ids)
+        else:
+            self._select_spectra_by_ids_standard(spectrum_ids)
+    
+    def _select_spectra_async(self, spectrum_ids):
+        """Asynchronously select large numbers of spectra."""
+        # Show progress message
+        self.after_idle(lambda: self._show_selection_progress(len(spectrum_ids)))
+        
+        # Schedule the selection in chunks to keep UI responsive
+        self._async_selection_ids = set(spectrum_ids)
+        self._async_selection_items = []
+        self._async_selection_index = 0
+        
+        # Start collecting items
+        self.after(10, self._collect_selection_items_async)
+        
+    def _show_selection_progress(self, count):
+        """Show selection progress in the tree."""
+        # Temporarily clear selection and show message
+        self.tree.selection_remove(*self.tree.selection())
+        
+        # You could add a temporary item here showing progress
+        # For now, we'll just ensure the UI updates
+        self.update_idletasks()
+        
+    def _collect_selection_items_async(self, parent=''):
+        """Collect items to select asynchronously."""
+        # Process a chunk of items
+        items_processed = 0
+        max_items_per_chunk = 50
+        
+        children = list(self.tree.get_children(parent))
+        
+        while (items_processed < max_items_per_chunk and 
+               self._async_selection_index < len(children)):
+            
+            item = children[self._async_selection_index]
+            self._async_selection_index += 1
+            items_processed += 1
+            
+            tags = self.tree.item(item, 'tags')
+            if tags and tags[0] == 'spectrum':
+                spectrum_id = int(tags[1])
+                if spectrum_id in self._async_selection_ids:
+                    self._async_selection_items.append(item)
+            else:
+                # For group items, we need to recursively check children
+                # Add children to the processing queue
+                group_children = self.tree.get_children(item)
+                children.extend(group_children)
+        
+        # Check if we're done with this level
+        if self._async_selection_index >= len(children):
+            # Move to actual selection
+            self.after(10, self._apply_async_selection)
+        else:
+            # Continue processing
+            self.after(10, self._collect_selection_items_async)
+    
+    def _apply_async_selection(self):
+        """Apply the collected selection asynchronously."""
+        if not hasattr(self, '_async_selection_items'):
+            return
+            
+        # Apply selection in chunks
+        chunk_size = 50
+        items = self._async_selection_items
+        
+        if not hasattr(self, '_selection_chunk_index'):
+            self._selection_chunk_index = 0
+            
+        # Process a chunk
+        start_idx = self._selection_chunk_index
+        end_idx = min(start_idx + chunk_size, len(items))
+        
+        for item in items[start_idx:end_idx]:
+            self.tree.selection_add(item)
+            
+        self._selection_chunk_index = end_idx
+        
+        # Check if we're done
+        if end_idx >= len(items):
+            # Selection complete
+            self._cleanup_async_selection()
+            
+            # Make first item visible
+            if items:
+                self.tree.see(items[0])
+        else:
+            # Continue with next chunk
+            self.after(10, self._apply_async_selection)
+    
+    def _cleanup_async_selection(self):
+        """Clean up async selection variables."""
+        if hasattr(self, '_async_selection_ids'):
+            delattr(self, '_async_selection_ids')
+        if hasattr(self, '_async_selection_items'):
+            delattr(self, '_async_selection_items')
+        if hasattr(self, '_async_selection_index'):
+            delattr(self, '_async_selection_index')
+        if hasattr(self, '_selection_chunk_index'):
+            delattr(self, '_selection_chunk_index')
+    
+    def _select_spectra_by_ids_standard(self, spectrum_ids):
+        """Standard selection method for moderate number of spectra."""
         # Clear current selection
         for item in self.tree.selection():
             self.tree.selection_remove(item)
@@ -258,13 +371,60 @@ class SpectrumTreeView(ttk.Frame):
                     spectrum_id = int(tags[1])
                     if spectrum_id in target_ids:
                         self.tree.selection_add(item)
-                        # Ensure the item is visible
-                        self.tree.see(item)
+                        # Only ensure visibility for first few items to avoid performance issues
+                        if len(self.tree.selection()) <= 10:
+                            self.tree.see(item)
                 else:
                     # Recursively check children
                     select_in_tree(item)
         
         select_in_tree()
+        
+    def _select_spectra_by_ids_batch(self, spectrum_ids):
+        """Optimized selection method for large number of spectra."""
+        # Clear current selection
+        self.tree.selection_remove(*self.tree.selection())
+        
+        # Convert to set for faster lookup
+        target_ids = set(spectrum_ids)
+        items_to_select = []
+        
+        # Collect all items to select first
+        def collect_items(parent=''):
+            for item in self.tree.get_children(parent):
+                tags = self.tree.item(item, 'tags')
+                if tags and tags[0] == 'spectrum':
+                    spectrum_id = int(tags[1])
+                    if spectrum_id in target_ids:
+                        items_to_select.append(item)
+                else:
+                    # Recursively check children
+                    collect_items(item)
+        
+        collect_items()
+        
+        # Batch select items to reduce UI updates
+        if items_to_select:
+            # Disable updates during batch operation
+            self.tree.configure(state='disabled')
+            try:
+                # Select in chunks to avoid overwhelming the UI
+                chunk_size = 100
+                for i in range(0, len(items_to_select), chunk_size):
+                    chunk = items_to_select[i:i + chunk_size]
+                    for item in chunk:
+                        self.tree.selection_add(item)
+                    
+                    # Update UI periodically
+                    if i % (chunk_size * 5) == 0:
+                        self.update_idletasks()
+                        
+                # Make the first selected item visible
+                if items_to_select:
+                    self.tree.see(items_to_select[0])
+                    
+            finally:
+                self.tree.configure(state='normal')
         
     def set_naming_scheme(self, scheme: str):
         """Set the naming scheme for spectrum display."""
@@ -428,20 +588,128 @@ class MetadataEditor(ttk.Frame):
         if not self.parser:
             return
             
-        # Find all spectra with this key-value pair
-        matching_spectrum_ids = []
-        for spectrum in self.parser.spectra:
-            if spectrum.get_metadata_value(key) == value:
-                matching_spectrum_ids.append(spectrum.spectrum_id)
-                
-        if matching_spectrum_ids:
-            # Trigger the selection callback to update the main application
-            if self.on_metadata_changed:
-                # Store the matching IDs for the parent to handle
-                self._pending_selection = matching_spectrum_ids
-                self.on_metadata_changed()
+        total_spectra = len(self.parser.spectra)
+        
+        # For very large datasets, warn user and ask for confirmation
+        if total_spectra > 5000:
+            result = messagebox.askyesno(
+                "Large Dataset Warning",
+                f"This dataset contains {total_spectra} spectra.\n"
+                f"Searching and selecting by value may take time and impact performance.\n\n"
+                f"Do you want to proceed?"
+            )
+            if not result:
+                return
+        
+        # Show progress for large datasets
+        if total_spectra > 1000:
+            progress_dialog = self._create_progress_dialog("Searching spectra...")
+            self.update_idletasks()
         else:
-            messagebox.showinfo("No Matches", f"No spectra found with {key} = '{value}'")
+            progress_dialog = None
+            
+        try:
+            # Find all spectra with this key-value pair
+            matching_spectrum_ids = []
+            start_time = time.time()
+            
+            for i, spectrum in enumerate(self.parser.spectra):
+                # Check for timeout (max 30 seconds)
+                if time.time() - start_time > 30:
+                    if progress_dialog:
+                        progress_dialog.destroy()
+                    messagebox.showwarning(
+                        "Search Timeout",
+                        f"Search timed out after checking {i} spectra.\n"
+                        f"Found {len(matching_spectrum_ids)} matches so far.\n"
+                        f"Consider using a smaller dataset or more specific search criteria."
+                    )
+                    if matching_spectrum_ids:
+                        # Proceed with partial results
+                        break
+                    else:
+                        return
+                
+                if spectrum.get_metadata_value(key) == value:
+                    matching_spectrum_ids.append(spectrum.spectrum_id)
+                
+                # Update progress for large datasets
+                if progress_dialog and i % 100 == 0:
+                    progress = (i / total_spectra) * 100
+                    progress_dialog.update_progress(
+                        progress, 
+                        f"Checked {i}/{total_spectra} spectra\nFound {len(matching_spectrum_ids)} matches"
+                    )
+                    
+            if progress_dialog:
+                progress_dialog.destroy()
+                
+            if matching_spectrum_ids:
+                # Check if selection is very large
+                if len(matching_spectrum_ids) > 1000:
+                    result = messagebox.askyesno(
+                        "Very Large Selection", 
+                        f"Found {len(matching_spectrum_ids)} matching spectra.\n\n"
+                        f"Selecting this many spectra will significantly impact performance:\n"
+                        f"• Similarity calculations will be disabled\n"
+                        f"• Only subset will be shown in detailed views\n"
+                        f"• UI may become slow\n\n"
+                        f"Do you want to proceed?"
+                    )
+                    if not result:
+                        return
+                elif len(matching_spectrum_ids) > 500:
+                    result = messagebox.askyesno(
+                        "Large Selection", 
+                        f"Found {len(matching_spectrum_ids)} matching spectra.\n"
+                        f"Selecting this many spectra may impact performance.\n\n"
+                        f"Do you want to proceed?"
+                    )
+                    if not result:
+                        return
+                
+                # Trigger the selection callback to update the main application
+                if self.on_metadata_changed:
+                    # Store the matching IDs for the parent to handle
+                    self._pending_selection = matching_spectrum_ids
+                    self.on_metadata_changed()
+            else:
+                messagebox.showinfo("No Matches", f"No spectra found with {key} = '{value}'")
+                
+        except Exception as e:
+            if progress_dialog:
+                progress_dialog.destroy()
+            messagebox.showerror("Error", f"Error during search: {str(e)}")
+            
+    def _create_progress_dialog(self, title: str):
+        """Create a simple progress dialog."""
+        dialog = tk.Toplevel(self)
+        dialog.title(title)
+        dialog.geometry("300x100")
+        dialog.transient(self)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (300 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (100 // 2)
+        dialog.geometry(f"300x100+{x}+{y}")
+        
+        # Progress label
+        dialog.progress_label = ttk.Label(dialog, text="Searching...")
+        dialog.progress_label.pack(pady=10)
+        
+        # Progress bar
+        dialog.progress_bar = ttk.Progressbar(dialog, length=250, mode='determinate')
+        dialog.progress_bar.pack(pady=10)
+        
+        def update_progress(percent, text=""):
+            dialog.progress_bar['value'] = percent
+            dialog.progress_label.config(text=text)
+            dialog.update_idletasks()
+            
+        dialog.update_progress = update_progress
+        return dialog
                 
     def _on_double_click(self, event):
         """Handle double click to start editing."""
@@ -1244,6 +1512,12 @@ class CosineSimilarityVisualization(ttk.Frame):
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []
         self.similarity_matrix: Optional[np.ndarray] = None
+        self.calculation_thread: Optional[threading.Thread] = None
+        self.cancel_calculation = False
+        
+        # Performance limits
+        self.MAX_SPECTRA_AUTO = 20  # Auto-calculate up to this many spectra (reduced)
+        self.MAX_SPECTRA_MANUAL = 100  # Allow manual calculation up to this many (reduced)
         
         self._create_widgets()
         
@@ -1255,20 +1529,32 @@ class CosineSimilarityVisualization(ttk.Frame):
         
         ttk.Label(header_frame, text="Cosine Similarity", font=('Arial', 12, 'bold')).pack()
         
-        # Tolerance setting
-        tolerance_frame = ttk.Frame(header_frame)
-        tolerance_frame.pack(fill='x', pady=2)
+        # Control frame
+        control_frame = ttk.Frame(header_frame)
+        control_frame.pack(fill='x', pady=2)
         
-        ttk.Label(tolerance_frame, text="m/z Tolerance:").pack(side='left')
+        # Tolerance setting
+        ttk.Label(control_frame, text="m/z Tolerance:").pack(side='left')
         self.tolerance_var = tk.DoubleVar(value=0.1)
-        tolerance_spinbox = ttk.Spinbox(tolerance_frame, from_=0.01, to=1.0, increment=0.01, 
+        tolerance_spinbox = ttk.Spinbox(control_frame, from_=0.01, to=1.0, increment=0.01, 
                                       width=8, textvariable=self.tolerance_var,
                                       command=self._on_tolerance_changed)
         tolerance_spinbox.pack(side='left', padx=5)
         
-        # Update button
-        ttk.Button(tolerance_frame, text="Recalculate", 
-                  command=self._recalculate_similarity).pack(side='left', padx=5)
+        # Calculate button
+        self.calc_button = ttk.Button(control_frame, text="Calculate", 
+                                    command=self._recalculate_similarity)
+        self.calc_button.pack(side='left', padx=5)
+        
+        # Cancel button
+        self.cancel_button = ttk.Button(control_frame, text="Cancel", 
+                                      command=self._cancel_calculation, state='disabled')
+        self.cancel_button.pack(side='left', padx=2)
+        
+        # Progress bar
+        self.progress_var = tk.StringVar()
+        self.progress_label = ttk.Label(control_frame, textvariable=self.progress_var)
+        self.progress_label.pack(side='left', padx=10)
         
         # Main content area
         content_frame = ttk.Frame(self)
@@ -1288,21 +1574,114 @@ class CosineSimilarityVisualization(ttk.Frame):
         
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load and visualize cosine similarity for selected spectra."""
+        # Cancel any ongoing calculation
+        self._cancel_calculation()
+        
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
-        self._calculate_and_display_similarity()
+        
+        # Check if we should auto-calculate or require manual trigger
+        if len(selected_spectrum_ids) <= self.MAX_SPECTRA_AUTO:
+            self._calculate_and_display_similarity()
+        else:
+            self._show_performance_warning()
+        
+    def _show_performance_warning(self):
+        """Show performance warning for large selections."""
+        self.figure.clear()
+        self.stats_text.delete(1.0, tk.END)
+        
+        n_selected = len(self.selected_spectrum_ids)
+        ax = self.figure.add_subplot(111)
+        
+        if n_selected > self.MAX_SPECTRA_MANUAL:
+            warning_text = (f'Too many spectra selected ({n_selected}).\n'
+                          f'Maximum supported: {self.MAX_SPECTRA_MANUAL}\n\n'
+                          f'Please select fewer spectra for\n'
+                          f'similarity analysis.')
+            self.calc_button.config(state='disabled')
+        else:
+            warning_text = (f'Large selection ({n_selected} spectra).\n'
+                          f'Similarity calculation may take time.\n\n'
+                          f'Click "Calculate" to proceed.')
+            self.calc_button.config(state='normal')
+            
+        ax.text(0.5, 0.5, warning_text, ha='center', va='center', 
+               transform=ax.transAxes, fontsize=11, color='orange')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        
+        # Show computation complexity estimate
+        n_comparisons = n_selected * (n_selected - 1) // 2
+        stats_text = (f"Selected: {n_selected} spectra\n"
+                     f"Pairwise comparisons needed: {n_comparisons:,}\n"
+                     f"Estimated time: {self._estimate_calculation_time(n_selected)}")
+        self.stats_text.insert(tk.END, stats_text)
+        
+        self.progress_var.set("")
+        self.canvas.draw()
+        
+    def _estimate_calculation_time(self, n_spectra: int) -> str:
+        """Estimate calculation time based on number of spectra."""
+        n_comparisons = n_spectra * (n_spectra - 1) // 2
+        
+        # Rough estimates based on typical performance
+        if n_comparisons < 100:
+            return "< 1 second"
+        elif n_comparisons < 1000:
+            return "1-5 seconds"
+        elif n_comparisons < 5000:
+            return "5-30 seconds"
+        elif n_comparisons < 20000:
+            return "30 seconds - 2 minutes"
+        else:
+            return "> 2 minutes"
         
     def _on_tolerance_changed(self):
         """Handle tolerance change."""
-        self._recalculate_similarity()
+        # Only auto-recalculate for small selections
+        if len(self.selected_spectrum_ids) <= self.MAX_SPECTRA_AUTO:
+            self._recalculate_similarity()
         
     def _recalculate_similarity(self):
         """Recalculate similarity with current tolerance."""
-        if self.parser and self.selected_spectrum_ids:
-            self._calculate_and_display_similarity()
+        if not self.parser or not self.selected_spectrum_ids:
+            return
+            
+        if len(self.selected_spectrum_ids) > self.MAX_SPECTRA_MANUAL:
+            messagebox.showwarning("Too Many Spectra", 
+                                 f"Cannot calculate similarity for {len(self.selected_spectrum_ids)} spectra.\n"
+                                 f"Maximum supported: {self.MAX_SPECTRA_MANUAL}")
+            return
+            
+        self._calculate_and_display_similarity()
+        
+    def _cancel_calculation(self):
+        """Cancel ongoing calculation."""
+        if self.calculation_thread and self.calculation_thread.is_alive():
+            self.cancel_calculation = True
+            # Wait a bit for thread to finish
+            self.after(100, self._check_cancellation)
+            
+    def _check_cancellation(self):
+        """Check if calculation thread has finished after cancellation."""
+        if self.calculation_thread and self.calculation_thread.is_alive():
+            # Still running, check again later
+            self.after(100, self._check_cancellation)
+        else:
+            # Thread finished
+            self._reset_ui_after_calculation()
+            
+    def _reset_ui_after_calculation(self):
+        """Reset UI state after calculation completes or is cancelled."""
+        self.cancel_calculation = False
+        self.calc_button.config(state='normal')
+        self.cancel_button.config(state='disabled')
+        self.progress_var.set("")
         
     def _calculate_and_display_similarity(self):
         """Calculate and display the cosine similarity matrix and statistics."""
+        # Clear display first
         self.figure.clear()
         self.stats_text.delete(1.0, tk.END)
         
@@ -1319,16 +1698,131 @@ class CosineSimilarityVisualization(ttk.Frame):
             self.canvas.draw()
             return
             
-        # Calculate similarity matrix
-        tolerance = self.tolerance_var.get()
-        self.similarity_matrix = self.parser.calculate_similarity_matrix(
-            self.selected_spectrum_ids, tolerance
-        )
+        # For large calculations, use threading
+        if len(self.selected_spectrum_ids) > 10:
+            self._start_threaded_calculation()
+        else:
+            self._calculate_similarity_direct()
+            
+    def _start_threaded_calculation(self):
+        """Start similarity calculation in a separate thread."""
+        # Update UI for calculation in progress
+        self.calc_button.config(state='disabled')
+        self.cancel_button.config(state='normal')
+        self.progress_var.set("Calculating...")
         
-        if self.similarity_matrix.size == 0:
+        # Show placeholder while calculating
+        ax = self.figure.add_subplot(111)
+        ax.text(0.5, 0.5, 'Calculating similarity matrix...\nPlease wait', 
+               ha='center', va='center', transform=ax.transAxes, fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw()
+        
+        # Start calculation thread
+        self.cancel_calculation = False
+        self.calculation_thread = threading.Thread(
+            target=self._calculate_similarity_threaded,
+            daemon=True
+        )
+        self.calculation_thread.start()
+        
+        # Start monitoring the calculation
+        self._check_calculation_progress()
+        
+    def _calculate_similarity_threaded(self):
+        """Calculate similarity matrix in a separate thread with progress updates."""
+        try:
+            tolerance = self.tolerance_var.get()
+            n_spectra = len(self.selected_spectrum_ids)
+            
+            # Get spectra objects
+            spectra = [s for s in self.parser.spectra if s.spectrum_id in self.selected_spectrum_ids]
+            
+            if n_spectra < 2:
+                self.similarity_matrix = np.array([[1.0]] if n_spectra == 1 else [])
+                return
+                
+            similarity_matrix = np.zeros((n_spectra, n_spectra))
+            total_calculations = n_spectra * (n_spectra - 1) // 2
+            completed = 0
+            
+            # Fill diagonal with 1.0
+            for i in range(n_spectra):
+                similarity_matrix[i, i] = 1.0
+                
+            # Calculate upper triangle only
+            for i in range(n_spectra):
+                if self.cancel_calculation:
+                    return
+                    
+                for j in range(i + 1, n_spectra):
+                    if self.cancel_calculation:
+                        return
+                        
+                    # Calculate similarity
+                    sim = self.parser.calculate_cosine_similarity(
+                        spectra[i], spectra[j], tolerance
+                    )
+                    similarity_matrix[i, j] = sim
+                    similarity_matrix[j, i] = sim  # Symmetric
+                    
+                    completed += 1
+                    
+                    # Update progress periodically
+                    if completed % max(1, total_calculations // 20) == 0:
+                        progress_pct = (completed / total_calculations) * 100
+                        self.after_idle(lambda p=progress_pct: 
+                                      self.progress_var.set(f"Calculating... {p:.0f}%"))
+                        
+            if not self.cancel_calculation:
+                self.similarity_matrix = similarity_matrix
+                # Schedule UI update on main thread
+                self.after_idle(self._display_similarity_results)
+                
+        except Exception as e:
+            # Handle errors
+            self.after_idle(lambda: self._show_calculation_error(str(e)))
+            
+    def _calculate_similarity_direct(self):
+        """Calculate similarity matrix directly (for small datasets)."""
+        try:
+            tolerance = self.tolerance_var.get()
+            self.similarity_matrix = self.parser.calculate_similarity_matrix(
+                self.selected_spectrum_ids, tolerance
+            )
+            self._display_similarity_results()
+        except Exception as e:
+            self._show_calculation_error(str(e))
+            
+    def _show_calculation_error(self, error_msg: str):
+        """Show calculation error in the display."""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.text(0.5, 0.5, f'Calculation Error:\n{error_msg}', 
+               ha='center', va='center', transform=ax.transAxes, 
+               fontsize=10, color='red')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw()
+        self._reset_ui_after_calculation()
+        
+    def _check_calculation_progress(self):
+        """Check if threaded calculation is complete."""
+        if self.calculation_thread and self.calculation_thread.is_alive():
+            # Still calculating, check again later
+            self.after(100, self._check_calculation_progress)
+        else:
+            # Calculation finished
+            self._reset_ui_after_calculation()
+            
+    def _display_similarity_results(self):
+        """Display the calculated similarity matrix and statistics."""
+        if self.similarity_matrix is None or self.similarity_matrix.size == 0:
             return
             
         # Create heatmap
+        self.figure.clear()
         ax = self.figure.add_subplot(111)
         im = ax.imshow(self.similarity_matrix, cmap='viridis', vmin=0, vmax=1, aspect='equal')
         
@@ -1343,13 +1837,15 @@ class CosineSimilarityVisualization(ttk.Frame):
         ax.set_xticklabels(spectrum_labels, rotation=45, ha='right')
         ax.set_yticklabels(spectrum_labels)
         
-        # Add text annotations for values
+        # Add text annotations for values (only for smaller matrices)
         n = self.similarity_matrix.shape[0]
-        for i in range(n):
-            for j in range(n):
-                text = ax.text(j, i, f'{self.similarity_matrix[i, j]:.3f}',
-                             ha="center", va="center", color="white", fontsize=8)
+        if n <= 20:  # Only show values for matrices up to 20x20
+            for i in range(n):
+                for j in range(n):
+                    text = ax.text(j, i, f'{self.similarity_matrix[i, j]:.3f}',
+                                 ha="center", va="center", color="white", fontsize=8)
         
+        tolerance = self.tolerance_var.get()
         ax.set_title(f'Similarity Matrix (tolerance: {tolerance:.2f})')
         
         # Adjust layout

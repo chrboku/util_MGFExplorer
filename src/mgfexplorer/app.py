@@ -27,6 +27,10 @@ class MGFExplorerApp:
         self.parser = MGFParser()
         self.current_file = None
         
+        # Selection debouncing
+        self.selection_update_job = None
+        self.SELECTION_DELAY_MS = 300  # Wait 300ms before updating heavy components
+        
         self._create_widgets()
         self._create_menu()
         
@@ -202,25 +206,82 @@ class MGFExplorerApp:
             self.status_var.set("Error loading file")
             
     def _on_spectrum_selection_changed(self, selected_spectrum_ids):
-        """Handle spectrum selection changes."""
+        """Handle spectrum selection changes with debouncing for performance."""
+        # Cancel any pending update
+        if self.selection_update_job:
+            self.root.after_cancel(self.selection_update_job)
+        
+        # Update status immediately for responsiveness
+        if not selected_spectrum_ids:
+            self.status_var.set(f"Ready - {len(self.parser.spectra)} spectra loaded")
+        else:
+            if len(selected_spectrum_ids) == 1:
+                self.status_var.set(f"Selected spectrum {selected_spectrum_ids[0]}")
+            else:
+                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra")
+        
+        # Schedule the heavy update with debouncing
+        self.selection_update_job = self.root.after(
+            self.SELECTION_DELAY_MS, 
+            lambda: self._update_components_with_selection(selected_spectrum_ids)
+        )
+    
+    def _update_components_with_selection(self, selected_spectrum_ids):
+        """Update all components with the selected spectra."""
+        self.selection_update_job = None
+        
         if not selected_spectrum_ids:
             # Clear all displays
             self.metadata_editor.load_data(self.parser, [])
             self.ion_table.load_data(self.parser, [])
             self.spectrum_viz.load_data(self.parser, [])
             self.similarity_viz.load_data(self.parser, [])
-            self.status_var.set(f"Ready - {len(self.parser.spectra)} spectra loaded")
         else:
             # Update displays with selected spectra
+            # Always update metadata editor (it's lightweight)
             self.metadata_editor.load_data(self.parser, selected_spectrum_ids)
-            self.ion_table.load_data(self.parser, selected_spectrum_ids)
-            self.spectrum_viz.load_data(self.parser, selected_spectrum_ids)
-            self.similarity_viz.load_data(self.parser, selected_spectrum_ids)
             
-            if len(selected_spectrum_ids) == 1:
-                self.status_var.set(f"Selected spectrum {selected_spectrum_ids[0]}")
+            # For very large selections, disable expensive operations
+            if len(selected_spectrum_ids) > 1000:
+                # Only show metadata for very large selections
+                self.ion_table.load_data(self.parser, [])
+                self.spectrum_viz.load_data(self.parser, [])
+                self.similarity_viz.load_data(self.parser, [])
+                
+                # Update status with performance warning
+                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra "
+                                  f"(detailed views disabled for performance)")
+                                  
+            elif len(selected_spectrum_ids) > 100:
+                # For large selections, limit what we show in detailed views
+                limited_ids = selected_spectrum_ids[:10]
+                self.ion_table.load_data(self.parser, limited_ids)
+                self.spectrum_viz.load_data(self.parser, limited_ids)
+                
+                # Disable similarity calculation for large selections
+                self.similarity_viz.load_data(self.parser, [])
+                
+                # Update status to reflect the limitation
+                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra "
+                                  f"(showing details for first 10, similarity disabled)")
+                                  
+            elif len(selected_spectrum_ids) > 10:
+                # Only show first 10 spectra in detailed views
+                limited_ids = selected_spectrum_ids[:10]
+                self.ion_table.load_data(self.parser, limited_ids)
+                self.spectrum_viz.load_data(self.parser, limited_ids)
+                
+                # Load similarity data (this will handle its own performance limits)
+                self.similarity_viz.load_data(self.parser, selected_spectrum_ids)
+                
+                # Update status to reflect the limitation
+                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra "
+                                  f"(showing details for first 10)")
             else:
-                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra")
+                # Small selection - show everything
+                self.ion_table.load_data(self.parser, selected_spectrum_ids)
+                self.spectrum_viz.load_data(self.parser, selected_spectrum_ids)
+                self.similarity_viz.load_data(self.parser, selected_spectrum_ids)
                 
     def _on_metadata_changed(self):
         """Handle metadata changes."""
