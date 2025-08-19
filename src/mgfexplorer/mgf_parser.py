@@ -320,3 +320,32 @@ class MGFParser:
                     progress_callback(completed, total_comparisons)
                     
         return similarity_matrix
+
+    def export_to_mgf(self, file_path: str, spectrum_ids: Optional[List[int]] = None):
+        """
+        Export spectra to an MGF file.
+        
+        Args:
+            file_path: Path to the output MGF file
+            spectrum_ids: Optional list of spectrum IDs to export. If None, exports all spectra.
+        """
+        # Determine which spectra to export
+        if spectrum_ids is None:
+            spectra_to_export = self.spectra
+        else:
+            spectra_to_export = [s for s in self.spectra if s.spectrum_id in spectrum_ids]
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for spectrum in spectra_to_export:
+                f.write("BEGIN IONS\n")
+                
+                # Write metadata
+                for key, value in spectrum.metadata.items():
+                    f.write(f"{key}={value}\n")
+                
+                # Write ion data
+                if spectrum.ions.size > 0:
+                    for mz, intensity in spectrum.ions:
+                        f.write(f"{mz:.6f} {intensity:.6f}\n")
+                
+                f.write("END IONS\n\n")

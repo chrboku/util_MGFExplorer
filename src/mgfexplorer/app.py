@@ -45,6 +45,8 @@ class MGFExplorerApp:
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open MGF File...", command=self.open_file, accelerator="Ctrl+O")
         file_menu.add_separator()
+        file_menu.add_command(label="Export All Spectra...", command=self.export_all_spectra, accelerator="Ctrl+E")
+        file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         
         # Edit menu
@@ -87,6 +89,7 @@ class MGFExplorerApp:
         
         # Bind keyboard shortcuts
         self.root.bind('<Control-o>', lambda e: self.open_file())
+        self.root.bind('<Control-e>', lambda e: self.export_all_spectra())
         
     def _create_widgets(self):
         """Create the main application widgets."""
@@ -839,6 +842,43 @@ class MGFExplorerApp:
         average_spectrum.add_metadata("AVERAGED_FROM_COUNT", str(len(spectra_list)))
         spectrum_ids = [str(s.spectrum_id) for s in spectra_list]
         average_spectrum.add_metadata("AVERAGED_FROM_IDS", ",".join(spectrum_ids))
+    
+    def export_all_spectra(self):
+        """Export all spectra to a new MGF file."""
+        if not self.parser.spectra:
+            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            return
+            
+        file_path = filedialog.asksaveasfilename(
+            title="Export All Spectra to MGF File",
+            defaultextension=".mgf",
+            filetypes=[
+                ("MGF files", "*.mgf"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            self.status_var.set("Exporting spectra...")
+            self.root.update()
+            
+            # Export all spectra
+            self.parser.export_to_mgf(file_path)
+            
+            # Update status
+            self.status_var.set(f"Exported {len(self.parser.spectra)} spectra to {os.path.basename(file_path)}")
+            
+            messagebox.showinfo(
+                "Export Complete", 
+                f"Successfully exported {len(self.parser.spectra)} spectra to:\n{file_path}"
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export spectra:\n{str(e)}")
+            self.status_var.set("Export failed")
             
     def show_about(self):
         """Show about dialog."""
