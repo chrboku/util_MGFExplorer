@@ -34,6 +34,8 @@ class SpectrumTreeView(ttk.Frame):
         self.parser: Optional[MGFParser] = None
         self.selected_grouping_tags: List[str] = []
         self.naming_scheme: str = "Numbered"  # Default naming scheme
+        self.filter_text: str = ""  # Current filter text
+        self.filter_job: Optional[str] = None  # Job ID for delayed filtering
 
         self._create_widgets()
 
@@ -60,6 +62,18 @@ class SpectrumTreeView(ttk.Frame):
         # Track previous text for deletion detection
         self.previous_text = ""
 
+        # Filter frame
+        filter_frame = ttk.LabelFrame(self, text="Filter", padding=5)
+        filter_frame.pack(fill="x", padx=5, pady=5)
+
+        # Filter entry with responsive filtering
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(
+            filter_frame, textvariable=self.filter_var, width=40
+        )
+        self.filter_entry.pack(fill="x", pady=5)
+        self.filter_entry.bind("<KeyRelease>", self._on_filter_entry_change)
+
         # Tree view frame
         tree_frame = ttk.LabelFrame(self, text="Spectra", padding=5)
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
@@ -85,6 +99,12 @@ class SpectrumTreeView(ttk.Frame):
         self.parser = parser
         # Initialize previous text tracking
         self.previous_text = self.tag_var.get()
+        # Reset filter when loading new data
+        self.filter_var.set("")
+        self.filter_text = ""
+        if self.filter_job:
+            self.after_cancel(self.filter_job)
+            self.filter_job = None
         self._populate_tree()
 
     def _show_context_menu(self, event):
@@ -149,6 +169,33 @@ class SpectrumTreeView(ttk.Frame):
 
         # Update previous text for next comparison
         self.previous_text = current_text
+
+    def _on_filter_entry_change(self, event=None):
+        """Handle changes in the filter entry field with delayed filtering."""
+        # Cancel any pending filter job
+        if self.filter_job:
+            self.after_cancel(self.filter_job)
+
+        # Schedule a new filter job after 2 seconds (2000ms)
+        self.filter_job = self.after(2000, self._apply_filter)
+
+    def _apply_filter(self):
+        """Apply the current filter to the tree view."""
+        self.filter_job = None
+        self.filter_text = self.filter_var.get().strip().lower()
+        self._populate_tree()
+
+    def _spectrum_matches_filter(self, spectrum):
+        """Check if a spectrum matches the current filter."""
+        if not self.filter_text:
+            return True
+
+        # Search in all metadata values
+        for key, value in spectrum.metadata.items():
+            if value and self.filter_text in str(value).lower():
+                return True
+
+        return False
 
     def _clean_spacing(self, text):
         """Clean up spacing in the text - ensure single space after commas."""
@@ -310,6 +357,10 @@ class SpectrumTreeView(ttk.Frame):
     def _populate_flat_list(self):
         """Populate tree with flat list of spectra."""
         for spectrum in self.parser.spectra:
+            # Apply filter if specified
+            if not self._spectrum_matches_filter(spectrum):
+                continue
+
             display_name = self._get_spectrum_display_name(spectrum)
             item_id = self.tree.insert(
                 "", "end", text=display_name, tags=("spectrum", spectrum.spectrum_id)
@@ -321,6 +372,10 @@ class SpectrumTreeView(ttk.Frame):
         hierarchy = {}
 
         for spectrum in self.parser.spectra:
+            # Apply filter if specified
+            if not self._spectrum_matches_filter(spectrum):
+                continue
+
             # Get values for grouping tags
             path = []
             for tag in self.selected_grouping_tags:
@@ -679,7 +734,7 @@ class SpectrumTreeView(ttk.Frame):
     def _get_spectrum_display_name(self, spectrum) -> str:
         """Get the display name for a spectrum based on the current naming scheme."""
         if self.naming_scheme == "Numbered":
-            return f"Spectrum {spectrum.spectrum_id}"
+            return f"S {spectrum.spectrum_id}"
         else:
             # Use the specified metadata field
             value = spectrum.get_metadata_value(self.naming_scheme)
@@ -936,6 +991,13 @@ class MetadataEditor(ttk.Frame):
         # Get all metadata keys
         all_keys = self.parser.get_all_metadata_keys()
 
+        # Get selected spectra objects
+        selected_spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+
         for key in all_keys:
             # Get value from first selected spectrum, treating None as empty string
             value = ""
@@ -952,17 +1014,43 @@ class MetadataEditor(ttk.Frame):
                     raw_value = first_spectrum.get_metadata_value(key)
                     value = raw_value if raw_value is not None else ""
 
-            # Get unique values for this key (includes empty string for missing values)
-            unique_values = self.parser.get_unique_values_for_key(key)
-
-            # Format unique values for display
-            unique_str = "; ".join(
-                [f'"{v}"' if v else "<empty>" for v in unique_values[:5]]
+            # Get unique values for this key from only the selected spectra
+            unique_values = self._get_unique_values_for_selected_spectra(
+                key, selected_spectra
             )
-            if len(unique_values) > 5:
-                unique_str += f" ... ({len(unique_values)} total)"
+
+            # Only show unique values if there are multiple different values
+            if len(unique_values) > 1:
+                # Format unique values for display
+                unique_str = "; ".join(
+                    [f'"{v}"' if v else "<empty>" for v in unique_values[:5]]
+                )
+                if len(unique_values) > 5:
+                    unique_str += f" ... ({len(unique_values)} total)"
+            else:
+                # Only one unique value, don't show the unique values column
+                unique_str = ""
 
             self.metadata_tree.insert("", "end", values=(key, value, unique_str))
+
+    def _get_unique_values_for_selected_spectra(
+        self, key: str, selected_spectra: List[Spectrum]
+    ) -> List[str]:
+        """Get unique values for a key from only the selected spectra."""
+        values = set()
+        has_missing = False
+
+        for spectrum in selected_spectra:
+            if key in spectrum.metadata:
+                values.add(spectrum.metadata[key])
+            else:
+                has_missing = True
+
+        # Include empty string if any selected spectrum is missing this key
+        if has_missing:
+            values.add("")
+
+        return sorted(list(values))
 
     def _on_metadata_selection(self, event):
         """Handle metadata selection."""
@@ -1962,7 +2050,7 @@ class SpectrumVisualization(ttk.Frame):
         ax.set_ylabel("Intensity")
 
         # Remove title - spectrum ID will be shown in y-axis label instead
-        spectrum_label = f"Spectrum {spectrum.spectrum_id}"
+        spectrum_label = f"S {spectrum.spectrum_id}"
         ax.set_ylabel(f"{spectrum_label}\nIntensity", fontsize=9)
 
         ax.grid(True, alpha=0.3)
@@ -2029,7 +2117,7 @@ class IonDataTable(ttk.Frame):
         """Create a table tab for a single spectrum."""
         # Create frame for this spectrum
         frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text=f"Spectrum {spectrum.spectrum_id}")
+        self.notebook.add(frame, text=f"S {spectrum.spectrum_id}")
 
         # Create treeview
         columns = ("Index", "m/z", "Intensity")
