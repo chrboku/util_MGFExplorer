@@ -15,12 +15,25 @@ from .gui_components import (
     CosineSimilarityVisualization,
 )
 
+# Try to import tkinterdnd2 for drag and drop support
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+
+    DRAG_DROP_AVAILABLE = True
+except ImportError:
+    DRAG_DROP_AVAILABLE = False
+
 
 class MGFExplorerApp:
     """Main application class for the MGF Explorer."""
 
     def __init__(self):
-        self.root = tk.Tk()
+        # Initialize with drag and drop support if available
+        if DRAG_DROP_AVAILABLE:
+            self.root = TkinterDnD.Tk()
+        else:
+            self.root = tk.Tk()
+
         self.root.title("MGF Explorer")
         self.root.geometry("1400x900")
         self.root.minsize(1000, 700)
@@ -34,6 +47,7 @@ class MGFExplorerApp:
 
         self._create_widgets()
         self._create_menu()
+        self._setup_drag_drop()
 
     def _create_menu(self):
         """Create the application menu."""
@@ -114,6 +128,113 @@ class MGFExplorerApp:
         # Bind keyboard shortcuts
         self.root.bind("<Control-o>", lambda e: self.open_file())
         self.root.bind("<Control-e>", lambda e: self.export_all_spectra())
+
+    def _setup_drag_drop(self):
+        """Set up drag and drop functionality for MGF files."""
+        if not DRAG_DROP_AVAILABLE:
+            # Add a note about drag and drop not being available
+            print(
+                "Note: Drag and drop support not available. Install tkinterdnd2 for this feature."
+            )
+            return
+
+        # Enable drag and drop for files
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind("<<Drop>>", self._on_file_drop)
+
+        # Optional: Add visual feedback during drag
+        self.root.dnd_bind("<<DragEnter>>", self._on_drag_enter)
+        self.root.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+
+    def _on_drag_enter(self, event):
+        """Handle drag enter event."""
+        self.status_var.set("Drop MGF file to open...")
+
+    def _on_drag_leave(self, event):
+        """Handle drag leave event."""
+        self._restore_status()
+
+    def _on_file_drop(self, event):
+        """Handle file drop event."""
+        try:
+            # Get the dropped files
+            files = event.data.split()
+
+            if not files:
+                return
+
+            # Use the first file if multiple files are dropped
+            file_path = files[0].strip("{}")  # Remove any braces that might be present
+
+            # Process the dropped file
+            self._process_dropped_file(file_path)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+            self._restore_status()
+
+    def _process_dropped_file(self, file_path):
+        """Process a file that was dropped onto the window."""
+        try:
+            # Check if it's an MGF file
+            if not file_path.lower().endswith(".mgf"):
+                messagebox.showwarning(
+                    "Invalid File Type", "Please drop an MGF file (.mgf extension)."
+                )
+                return
+
+            # Check if file exists
+            if not os.path.exists(file_path):
+                messagebox.showerror(
+                    "File Not Found", f"The file does not exist:\n{file_path}"
+                )
+                return
+
+            # Load the file
+            self._load_mgf_file(file_path)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+
+    def _restore_status(self):
+        """Restore the status bar to its normal state."""
+        if self.current_file:
+            filename = os.path.basename(self.current_file)
+            spectrum_count = len(self.parser.spectra) if self.parser else 0
+            self.status_var.set(f"Loaded {spectrum_count} spectra from {filename}")
+        else:
+            self.status_var.set("Ready - Open an MGF file to get started")
+
+    def _load_mgf_file(self, file_path):
+        """Load an MGF file (common logic for both open dialog and drag-drop)."""
+        try:
+            self.status_var.set("Loading file...")
+            self.root.update()
+
+            # Parse the file
+            spectra = self.parser.parse_file(file_path)
+
+            if not spectra:
+                messagebox.showwarning("Warning", "No spectra found in the file.")
+                return
+
+            self.current_file = file_path
+
+            # Update components
+            self.spectrum_tree.load_data(self.parser)
+            self._update_spectrum_name_menu()
+            self._set_components_enabled(True)
+
+            # Update status
+            filename = os.path.basename(file_path)
+            self.status_var.set(f"Loaded {len(spectra)} spectra from {filename}")
+
+            # Update window title
+            self.root.title(f"MGF Explorer - {filename}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load file: {str(e)}")
+            self.status_var.set("Error loading file")
 
     def _create_widgets(self):
         """Create the main application widgets."""
@@ -201,34 +322,7 @@ class MGFExplorerApp:
         if not file_path:
             return
 
-        try:
-            self.status_var.set("Loading file...")
-            self.root.update()
-
-            # Parse the file
-            spectra = self.parser.parse_file(file_path)
-
-            if not spectra:
-                messagebox.showwarning("Warning", "No spectra found in the file.")
-                return
-
-            self.current_file = file_path
-
-            # Update components
-            self.spectrum_tree.load_data(self.parser)
-            self._update_spectrum_name_menu()
-            self._set_components_enabled(True)
-
-            # Update status
-            filename = os.path.basename(file_path)
-            self.status_var.set(f"Loaded {len(spectra)} spectra from {filename}")
-
-            # Update window title
-            self.root.title(f"MGF Explorer - {filename}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load file: {str(e)}")
-            self.status_var.set("Error loading file")
+        self._load_mgf_file(file_path)
 
     def _on_spectrum_selection_changed(self, selected_spectrum_ids):
         """Handle spectrum selection changes with debouncing for performance."""
@@ -1015,6 +1109,12 @@ class MGFExplorerApp:
 
     def show_about(self):
         """Show about dialog."""
+        drag_drop_status = (
+            "• Drag and drop MGF files to open\n"
+            if DRAG_DROP_AVAILABLE
+            else "• Use File > Open to load MGF files\n"
+        )
+
         messagebox.showinfo(
             "About MGF Explorer",
             "MGF Explorer v1.0\n\n"
@@ -1026,7 +1126,9 @@ class MGFExplorerApp:
             "• Normalize intensities in spectra\n"
             "• Export spectra to MGF files\n"
             "• Visualize spectra as stick charts\n"
-            "• View ion data in tables",
+            "• View ion data in tables\n"
+            "• Display SMILES molecular structures\n"
+            f"{drag_drop_status}",
         )
 
     def run(self):

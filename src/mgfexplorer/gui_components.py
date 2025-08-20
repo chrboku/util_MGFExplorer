@@ -14,6 +14,16 @@ import threading
 import time
 from .mgf_parser import MGFParser, Spectrum
 
+# RDKit imports for SMILES plotting
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Draw
+    from rdkit.Chem.Draw import rdMolDraw2D
+
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
+
 
 class SpectrumTreeView(ttk.Frame):
     """Tree view component for displaying spectra list with tag-based grouping."""
@@ -705,26 +715,34 @@ class MetadataEditor(ttk.Frame):
             header_frame, text="Metadata Editor", font=("Arial", 12, "bold")
         ).pack()
 
-        # Metadata table
-        table_frame = ttk.LabelFrame(self, text="Metadata", padding=5)
-        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        # Main content area with horizontal split
+        content_frame = ttk.Frame(self)
+        content_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Create horizontal paned window
+        paned_window = ttk.PanedWindow(content_frame, orient="horizontal")
+        paned_window.pack(fill="both", expand=True)
+
+        # Left side: Metadata table
+        metadata_frame = ttk.LabelFrame(paned_window, text="Metadata", padding=5)
+        paned_window.add(metadata_frame, weight=4)
 
         # Create treeview for metadata
         columns = ("Key", "Value", "Unique Values")
         self.metadata_tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", height=10
+            metadata_frame, columns=columns, show="headings", height=10
         )
 
         for col in columns:
             self.metadata_tree.heading(col, text=col)
             self.metadata_tree.column(col, width=150)
 
-        # Scrollbars
+        # Scrollbars for metadata table
         v_scrollbar = ttk.Scrollbar(
-            table_frame, orient="vertical", command=self.metadata_tree.yview
+            metadata_frame, orient="vertical", command=self.metadata_tree.yview
         )
         h_scrollbar = ttk.Scrollbar(
-            table_frame, orient="horizontal", command=self.metadata_tree.xview
+            metadata_frame, orient="horizontal", command=self.metadata_tree.xview
         )
 
         self.metadata_tree.configure(
@@ -735,8 +753,15 @@ class MetadataEditor(ttk.Frame):
         v_scrollbar.grid(row=0, column=1, sticky="ns")
         h_scrollbar.grid(row=1, column=0, sticky="ew")
 
-        table_frame.grid_rowconfigure(0, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
+        metadata_frame.grid_rowconfigure(0, weight=1)
+        metadata_frame.grid_columnconfigure(0, weight=1)
+
+        # Right side: SMILES structure plot
+        smiles_frame = ttk.LabelFrame(paned_window, text="SMILES Structure", padding=5)
+        paned_window.add(smiles_frame, weight=1)
+
+        # Create SMILES plot area
+        self._create_smiles_plot(smiles_frame)
 
         # Instructions
         instructions_frame = ttk.Frame(self)
@@ -744,7 +769,8 @@ class MetadataEditor(ttk.Frame):
 
         instructions_text = (
             "Double-click on Key or Value cells to edit. Press Enter to save, Escape to cancel.\n"
-            "Right-click on Value cells to select all spectra with that value (including empty values)."
+            "Right-click on Value cells to select all spectra with that value (including empty values).\n"
+            "SMILES structures are displayed when available and consistent across selected spectra."
         )
         ttk.Label(
             instructions_frame,
@@ -759,11 +785,144 @@ class MetadataEditor(ttk.Frame):
         self.metadata_tree.bind("<Button-1>", self._on_single_click)
         self.metadata_tree.bind("<Button-3>", self._on_right_click)  # Right-click
 
+    def _create_smiles_plot(self, parent_frame):
+        """Create the SMILES structure plot area."""
+        # Create matplotlib figure for SMILES display
+        self.smiles_fig = Figure(figsize=(4, 4), dpi=100)
+        self.smiles_canvas = FigureCanvasTkAgg(self.smiles_fig, parent_frame)
+        self.smiles_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Initially show empty plot with message
+        self._show_smiles_message("No SMILES data available")
+
+    def _show_smiles_message(self, message):
+        """Show a text message in the SMILES plot area."""
+        self.smiles_fig.clear()
+        ax = self.smiles_fig.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            fontsize=10,
+            wrap=True,
+            transform=ax.transAxes,
+        )
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        self.smiles_canvas.draw()
+
+    def _get_smiles_from_spectra(self, spectrum_ids):
+        """Extract SMILES codes from selected spectra."""
+        if not self.parser or not spectrum_ids:
+            return None, "No spectra selected"
+
+        # Common SMILES key names to check
+        smiles_keys = ["smiles", "SMILES", "Smiles", "smiles_code", "SMILES_CODE"]
+
+        smiles_values = []
+        found_key = None
+
+        for spectrum_id in spectrum_ids:
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
+            )
+            if not spectrum:
+                continue
+
+            # Find SMILES key in metadata
+            spectrum_smiles = None
+            for key in smiles_keys:
+                value = spectrum.get_metadata_value(key)
+                if value and value.strip():
+                    spectrum_smiles = value.strip()
+                    found_key = key
+                    break
+
+            if spectrum_smiles:
+                smiles_values.append(spectrum_smiles)
+            else:
+                smiles_values.append(None)
+
+        if not any(smiles_values):
+            return None, "No SMILES data found in selected spectra"
+
+        # Check if all non-None SMILES are the same
+        non_none_smiles = [s for s in smiles_values if s is not None]
+        if len(set(non_none_smiles)) > 1:
+            return None, f"Different SMILES codes found:\n" + "\n".join(
+                set(non_none_smiles)
+            ) + ("\n..." if len(set(non_none_smiles)) > 3 else "")
+
+        return non_none_smiles[0], None
+
+    def _plot_smiles(self, smiles_code):
+        """Plot a SMILES structure using RDKit."""
+        if not RDKIT_AVAILABLE:
+            self._show_smiles_message("RDKit not available for SMILES plotting")
+            return
+
+        try:
+            # Parse SMILES
+            mol = Chem.MolFromSmiles(smiles_code)
+            if mol is None:
+                self._show_smiles_message(f"Invalid SMILES code:\n{smiles_code}")
+                return
+
+            # Generate 2D coordinates
+            from rdkit.Chem import rdDepictor
+
+            rdDepictor.Compute2DCoords(mol)
+
+            # Create drawer
+            drawer = rdMolDraw2D.MolDraw2DCairo(400, 400)
+            drawer.DrawMolecule(mol)
+            drawer.FinishDrawing()
+
+            # Get image data
+            img_data = drawer.GetDrawingText()
+
+            # Convert to matplotlib image
+            from PIL import Image
+            import io
+
+            img = Image.open(io.BytesIO(img_data))
+
+            # Clear figure and display image
+            self.smiles_fig.clear()
+            ax = self.smiles_fig.add_subplot(111)
+            ax.imshow(img)
+            ax.axis("off")
+            ax.set_title(
+                f"SMILES: {smiles_code[:30]}{'...' if len(smiles_code) > 30 else ''}",
+                fontsize=8,
+                pad=10,
+            )
+
+            self.smiles_canvas.draw()
+
+        except Exception as e:
+            self._show_smiles_message(f"Error plotting SMILES:\n{str(e)}")
+
+    def _update_smiles_plot(self):
+        """Update the SMILES plot based on current selection."""
+        smiles_code, error_msg = self._get_smiles_from_spectra(
+            self.selected_spectrum_ids
+        )
+
+        if error_msg:
+            self._show_smiles_message(error_msg)
+        elif smiles_code:
+            self._plot_smiles(smiles_code)
+
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load metadata for selected spectra."""
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
         self._populate_metadata()
+        self._update_smiles_plot()
 
     def _populate_metadata(self):
         """Populate the metadata table."""

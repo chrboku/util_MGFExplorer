@@ -1,12 +1,15 @@
 [project]
 name = "util-mgfexplorer"
-version = "0.14.1"
+version = "0.15.0"
 description = "A GUI tool for exploring and editing MGF (Mascot Generic Format) files"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.0.0",
     "matplotlib>=3.5.0",
+    "rdkit>=2025.3.5",
+    "pillow>=8.0.0",
+    "tkinterdnd2>=0.3.0",
 ]
 
 [project.scripts]
