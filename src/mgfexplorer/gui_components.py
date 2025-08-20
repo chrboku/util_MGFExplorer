@@ -33,22 +33,20 @@ class SpectrumTreeView(ttk.Frame):
         tag_frame = ttk.LabelFrame(self, text="Grouping Tags", padding=5)
         tag_frame.pack(fill='x', padx=5, pady=5)
         
-        # Instructions
-        ttk.Label(tag_frame, text="Enter metadata keys for grouping (comma-separated):").pack(anchor='w')
-        
-        # Tag entry with autocomplete-like functionality
+        # Tag entry with right-click context menu
         self.tag_var = tk.StringVar()
         self.tag_entry = ttk.Entry(tag_frame, textvariable=self.tag_var, width=40)
         self.tag_entry.pack(fill='x', pady=5)
         self.tag_entry.bind('<KeyRelease>', self._on_tag_entry_change)
-        self.tag_entry.bind('<Return>', self._apply_grouping)
+        self.tag_entry.bind('<Button-3>', self._show_context_menu)  # Right-click
+        self.tag_entry.bind('<Key>', self._on_key_press)  # For intelligent deletion
+        self.tag_entry.bind('<Double-Button-1>', self._on_double_click_entry)  # Double-click to select field
         
-        # Available tags display
-        self.tags_label = ttk.Label(tag_frame, text="Available keys: ", wraplength=250)
-        self.tags_label.pack(anchor='w', pady=2)
+        # Create context menu for metadata fields
+        self.context_menu = tk.Menu(self, tearoff=0)
         
-        # Apply button
-        ttk.Button(tag_frame, text="Apply Grouping", command=self._apply_grouping).pack(pady=5)
+        # Track previous text for deletion detection
+        self.previous_text = ""
         
         # Tree view frame
         tree_frame = ttk.LabelFrame(self, text="Spectra", padding=5)
@@ -71,26 +69,192 @@ class SpectrumTreeView(ttk.Frame):
     def load_data(self, parser: MGFParser):
         """Load spectra data into the tree view."""
         self.parser = parser
-        self._update_available_tags()
+        # Initialize previous text tracking
+        self.previous_text = self.tag_var.get()
         self._populate_tree()
         
-    def _update_available_tags(self):
-        """Update the display of available metadata keys."""
+    def _show_context_menu(self, event):
+        """Show context menu with available metadata fields."""
         if not self.parser:
-            self.tags_label.config(text="Available keys: ")
             return
             
+        # Clear existing menu items
+        self.context_menu.delete(0, 'end')
+        
+        # Get all available metadata keys
         all_keys = self.parser.get_all_metadata_keys()
-        keys_text = ", ".join(all_keys) if all_keys else "None"
-        self.tags_label.config(text=f"Available keys: {keys_text}")
+        
+        if not all_keys:
+            self.context_menu.add_command(label="No metadata fields available", state='disabled')
+        else:
+            # Add each key as a menu item
+            for key in sorted(all_keys):
+                self.context_menu.add_command(
+                    label=key, 
+                    command=lambda k=key: self._add_tag_from_menu(k)
+                )
+        
+        # Show the menu at the cursor position
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+    
+    def _add_tag_from_menu(self, tag):
+        """Add a tag from the context menu to the text field."""
+        current_text = self.tag_var.get().strip()
+        
+        if current_text:
+            # Add comma separator if there's existing text
+            new_text = f"{current_text}, {tag}"
+        else:
+            new_text = tag
+            
+        self.tag_var.set(new_text)
+        
+        # Apply grouping automatically
+        self._apply_grouping_auto()
         
     def _on_tag_entry_change(self, event=None):
-        """Handle changes in the tag entry field."""
-        # Could add autocomplete functionality here in the future
-        pass
+        """Handle changes in the tag entry field with automatic grouping and cleanup."""
+        current_text = self.tag_var.get()
         
-    def _apply_grouping(self, event=None):
-        """Apply the grouping based on entered tags."""
+        # Clean up spacing: remove multiple spaces after commas
+        cleaned_text = self._clean_spacing(current_text)
+        if cleaned_text != current_text:
+            cursor_pos = self.tag_entry.index(tk.INSERT)
+            self.tag_var.set(cleaned_text)
+            # Try to maintain cursor position, but adjust if needed
+            new_cursor_pos = min(cursor_pos, len(cleaned_text))
+            self.tag_entry.icursor(new_cursor_pos)
+            current_text = cleaned_text
+        
+        # Apply grouping automatically when text changes
+        self._apply_grouping_auto()
+        
+        # Update previous text for next comparison
+        self.previous_text = current_text
+    
+    def _clean_spacing(self, text):
+        """Clean up spacing in the text - ensure single space after commas."""
+        import re
+        # Replace comma followed by multiple spaces with comma followed by single space
+        cleaned = re.sub(r',\s+', ', ', text)
+        # Remove leading/trailing spaces from the entire string
+        cleaned = cleaned.strip()
+        return cleaned
+    
+    def _on_key_press(self, event):
+        """Handle key presses for intelligent field deletion."""
+        if event.keysym in ('BackSpace', 'Delete'):
+            return self._handle_intelligent_field_deletion(event)
+        return None
+    
+    def _handle_intelligent_field_deletion(self, event):
+        """Handle backspace/delete to remove entire fields when cursor is in a field name."""
+        current_text = self.tag_var.get()
+        cursor_pos = self.tag_entry.index(tk.INSERT)
+        
+        # Find which field the cursor is currently in
+        field_info = self._get_field_at_cursor(current_text, cursor_pos)
+        
+        if field_info is None:
+            # Cursor not in a field, allow normal behavior
+            return None
+        
+        field_index, field_start, field_end, field_text = field_info
+        
+        # Check if cursor is in the field name (not in separator)
+        if field_start <= cursor_pos <= field_end and field_text.strip():
+            # Cursor is in a field name, remove the entire field
+            self._remove_field_at_index(field_index)
+            return "break"  # Prevent default behavior
+        
+        # Allow normal behavior for separators or empty areas
+        return None
+    
+    def _get_field_at_cursor(self, text, cursor_pos):
+        """Get information about the field at cursor position."""
+        if not text:
+            return None
+        
+        # Split by commas but keep track of positions
+        fields = []
+        current_pos = 0
+        parts = text.split(',')
+        
+        for i, part in enumerate(parts):
+            field_start = current_pos
+            field_end = current_pos + len(part)
+            field_text = part.strip()
+            
+            fields.append((i, field_start, field_end, field_text))
+            current_pos = field_end + 1  # +1 for comma
+        
+        # Find which field contains the cursor
+        for field_index, field_start, field_end, field_text in fields:
+            if field_start <= cursor_pos <= field_end:
+                return (field_index, field_start, field_end, field_text)
+        
+        return None
+    
+    def _remove_field_at_index(self, field_index):
+        """Remove a field at the specified index and update the text."""
+        current_text = self.tag_var.get()
+        parts = [part.strip() for part in current_text.split(',')]
+        
+        if 0 <= field_index < len(parts):
+            # Remove the field
+            parts.pop(field_index)
+            
+            # Rebuild text
+            new_text = ', '.join(parts)
+            self.tag_var.set(new_text)
+            
+            # Position cursor appropriately
+            if parts:
+                if field_index == 0:
+                    # Removed first field, position at start
+                    self.tag_entry.icursor(0)
+                elif field_index >= len(parts):
+                    # Removed last field, position at end
+                    self.tag_entry.icursor(len(new_text))
+                else:
+                    # Position at start of next field
+                    pos = len(', '.join(parts[:field_index])) + (2 if field_index > 0 else 0)
+                    self.tag_entry.icursor(min(pos, len(new_text)))
+            else:
+                # No fields left, position at start
+                self.tag_entry.icursor(0)
+            
+            # Apply grouping with updated text
+            self._apply_grouping_auto()
+    
+    def _on_double_click_entry(self, event):
+        """Handle double-click to select entire field."""
+        cursor_pos = self.tag_entry.index(tk.INSERT)
+        current_text = self.tag_var.get()
+        
+        # Use the same field detection logic
+        field_info = self._get_field_at_cursor(current_text, cursor_pos)
+        
+        if field_info:
+            field_index, field_start, field_end, field_text = field_info
+            
+            # Skip leading whitespace
+            while field_start < field_end and current_text[field_start] == ' ':
+                field_start += 1
+            # Skip trailing whitespace
+            while field_end > field_start and current_text[field_end - 1] == ' ':
+                field_end -= 1
+            
+            # Select the field text
+            if field_start < field_end:
+                self.tag_entry.selection_range(field_start, field_end)
+                self.tag_entry.icursor(field_end)
+        
+    def _apply_grouping_auto(self):
+        """Apply grouping automatically without user action."""
         tag_text = self.tag_var.get().strip()
         if tag_text:
             # Parse comma-separated tags
@@ -99,6 +263,10 @@ class SpectrumTreeView(ttk.Frame):
             self.selected_grouping_tags = []
             
         self._populate_tree()
+        
+    def _apply_grouping(self, event=None):
+        """Apply the grouping based on entered tags (legacy method)."""
+        self._apply_grouping_auto()
         
     def _populate_tree(self):
         """Populate the tree view with spectra using hierarchical grouping."""
