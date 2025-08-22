@@ -13,6 +13,7 @@ from .gui_components import (
     SpectrumVisualization,
     IonDataTable,
     CosineSimilarityVisualization,
+    FileLoadingDialog,
 )
 
 # Try to import tkinterdnd2 for drag and drop support
@@ -40,6 +41,7 @@ class MGFExplorerApp:
 
         self.parser = MGFParser()
         self.current_file = None
+        self.used_prefixes = set()  # Track used prefixes to prevent conflicts
 
         # Selection debouncing
         self.selection_update_job = None
@@ -58,7 +60,11 @@ class MGFExplorerApp:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(
-            label="Open MGF File...", command=self.open_file, accelerator="Ctrl+O"
+            label="Load MGF File(s)...", command=self.open_files, accelerator="Ctrl+O"
+        )
+        file_menu.add_separator()
+        file_menu.add_command(
+            label="Clear All Data", command=self.clear_data, accelerator="Ctrl+N"
         )
         file_menu.add_separator()
         file_menu.add_command(
@@ -126,7 +132,8 @@ class MGFExplorerApp:
         help_menu.add_command(label="About", command=self.show_about)
 
         # Bind keyboard shortcuts
-        self.root.bind("<Control-o>", lambda e: self.open_file())
+        self.root.bind("<Control-o>", lambda e: self.open_files())
+        self.root.bind("<Control-n>", lambda e: self.clear_data())
         self.root.bind("<Control-e>", lambda e: self.export_all_spectra())
 
     def _setup_drag_drop(self):
@@ -206,18 +213,40 @@ class MGFExplorerApp:
             self.status_var.set("Ready - Open an MGF file to get started")
 
     def _load_mgf_file(self, file_path):
-        """Load an MGF file (common logic for both open dialog and drag-drop)."""
+        """Load an MGF file and append to existing data."""
         try:
+            # Show file loading options dialog
+            dialog = FileLoadingDialog(self.root, self.used_prefixes)
+
+            if dialog.result is None:
+                # User cancelled
+                return
+
+            loading_options = dialog.result
+
             self.status_var.set("Loading file...")
             self.root.update()
 
-            # Parse the file
-            spectra = self.parser.parse_file(file_path)
+            # Check if we have existing data to append to
+            is_first_file = len(self.parser.spectra) == 0
+
+            if is_first_file:
+                # First file - use parse_file which clears existing data
+                spectra = self.parser.parse_file(file_path)
+            else:
+                # Additional file - use parse_and_append_file to add to existing data
+                # Calculate ID offset to avoid conflicts
+                id_offset = self._calculate_id_offset()
+                spectra = self.parser.parse_and_append_file(file_path, id_offset)
 
             if not spectra:
                 messagebox.showwarning("Warning", "No spectra found in the file.")
                 return
 
+            # Apply loading options to newly loaded spectra only
+            self._apply_loading_options(spectra, loading_options)
+
+            # Update current file reference (keep track of the most recent file)
             self.current_file = file_path
 
             # Update components
@@ -227,14 +256,76 @@ class MGFExplorerApp:
 
             # Update status
             filename = os.path.basename(file_path)
-            self.status_var.set(f"Loaded {len(spectra)} spectra from {filename}")
+            total_count = len(self.parser.spectra)
+            new_count = len(spectra)
 
-            # Update window title
-            self.root.title(f"MGF Explorer - {filename}")
+            if is_first_file:
+                self.status_var.set(f"Loaded {new_count} spectra from {filename}")
+                self.root.title(f"MGF Explorer - {filename}")
+            else:
+                self.status_var.set(
+                    f"Added {new_count} spectra from {filename}. Total: {total_count} spectra"
+                )
+                # Update title to show multiple files
+                self.root.title(
+                    f"MGF Explorer - {total_count} spectra from multiple files"
+                )
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {str(e)}")
             self.status_var.set("Error loading file")
+
+    def _calculate_id_offset(self):
+        """Calculate ID offset for appending new spectra to avoid conflicts."""
+        if not self.parser.spectra:
+            return 0
+
+        try:
+            # Try to get the maximum numeric ID, fall back to length if IDs are strings
+            numeric_ids = [
+                s.spectrum_id
+                for s in self.parser.spectra
+                if isinstance(s.spectrum_id, int)
+            ]
+            if numeric_ids:
+                return max(numeric_ids)
+            else:
+                # All IDs are strings, use length as offset
+                return len(self.parser.spectra)
+        except (ValueError, TypeError):
+            # Fallback to using length
+            return len(self.parser.spectra)
+
+    def _apply_loading_options(self, spectra, options):
+        """Apply loading options to the loaded spectra."""
+        database_identifier = options.get("database_identifier")
+        prefix = options.get("prefix")
+
+        # Apply database identifier to all spectra
+        if database_identifier:
+            for spectrum in spectra:
+                spectrum.update_metadata("database_identifier", database_identifier)
+
+        # Apply prefix to spectrum IDs and track the prefix
+        if prefix:
+            for i, spectrum in enumerate(spectra):
+                # Create new spectrum ID with prefix
+                new_id = f"{prefix}_{spectrum.spectrum_id}"
+
+                # Update any existing metadata that might reference the spectrum ID
+                if "TITLE" in spectrum.metadata:
+                    # If there's a TITLE field, prefix it as well
+                    original_title = spectrum.metadata["TITLE"]
+                    spectrum.update_metadata("TITLE", f"{prefix}_{original_title}")
+                else:
+                    # If no TITLE, create one with the prefixed ID
+                    spectrum.update_metadata("TITLE", new_id)
+
+                # Update the spectrum ID itself (though this is mainly for internal tracking)
+                spectrum.spectrum_id = new_id
+
+            # Track this prefix as used
+            self.used_prefixes.add(prefix)
 
     def _create_widgets(self):
         """Create the main application widgets."""
@@ -312,17 +403,47 @@ class MGFExplorerApp:
         # For now, components handle empty data gracefully
         pass
 
-    def open_file(self):
-        """Open and parse an MGF file."""
-        file_path = filedialog.askopenfilename(
-            title="Open MGF File",
+    def open_files(self):
+        """Open and parse one or more MGF files."""
+        file_paths = filedialog.askopenfilenames(
+            title="Load MGF File(s)",
             filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
         )
 
-        if not file_path:
+        if not file_paths:
             return
 
-        self._load_mgf_file(file_path)
+        # Load files sequentially, each with its own dialog
+        for file_path in file_paths:
+            self._load_mgf_file(file_path)
+
+    def clear_data(self):
+        """Clear all loaded data."""
+        if self.parser.spectra:
+            result = messagebox.askyesno(
+                "Clear Data",
+                f"This will clear all {len(self.parser.spectra)} loaded spectra. Continue?",
+                icon="warning",
+            )
+            if not result:
+                return
+
+        # Clear data
+        self.parser.spectra.clear()
+        self.used_prefixes.clear()
+        self.current_file = None
+
+        # Clear components
+        self.spectrum_tree.load_data(self.parser)
+        self.metadata_editor.load_data(self.parser, [])
+        self.spectrum_viz.clear_plot()
+        self.ion_table.clear_data()
+        self.similarity_viz.clear_data()
+
+        # Update UI state
+        self._set_components_enabled(False)
+        self.status_var.set("Ready - Load MGF files to get started")
+        self.root.title("MGF Explorer")
 
     def _on_spectrum_selection_changed(self, selected_spectrum_ids):
         """Handle spectrum selection changes with debouncing for performance."""

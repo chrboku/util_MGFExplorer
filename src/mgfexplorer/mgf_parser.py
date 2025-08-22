@@ -3,14 +3,14 @@ MGF (Mascot Generic Format) file parser for mass spectrometry data.
 """
 
 import numpy as np
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 import re
 
 
 class Spectrum:
     """Represents a single MS/MS spectrum from an MGF file."""
 
-    def __init__(self, spectrum_id: int):
+    def __init__(self, spectrum_id: Union[int, str]):
         self.spectrum_id = spectrum_id
         self.metadata: Dict[str, str] = {}
         self.ions: np.ndarray = np.array([])  # 2D array: [mz, intensity]
@@ -71,6 +71,28 @@ class MGFParser:
                     self.spectra.append(spectrum)
 
         return self.spectra
+
+    def parse_and_append_file(
+        self, file_path: str, id_offset: int = 0
+    ) -> List[Spectrum]:
+        """Parse an MGF file and append spectra to existing list with ID offset."""
+        new_spectra = []
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+            content = file.read()
+
+        # Split content by BEGIN IONS blocks
+        blocks = re.split(r"BEGIN IONS\s*\n", content)
+
+        # Skip the first block (before any BEGIN IONS)
+        for i, block in enumerate(blocks[1:], 1):
+            if "END IONS" in block:
+                spectrum = self._parse_spectrum_block(block, i + id_offset)
+                if spectrum:
+                    new_spectra.append(spectrum)
+                    self.spectra.append(spectrum)
+
+        return new_spectra
 
     def _parse_spectrum_block(self, block: str, spectrum_id: int) -> Optional[Spectrum]:
         """Parse a single spectrum block."""
@@ -148,13 +170,29 @@ class MGFParser:
 
         return sorted(list(values))
 
+    def get_spectrum_by_id(self, spectrum_id: Union[int, str]) -> Optional[Spectrum]:
+        """Get a spectrum by its ID."""
+        for spectrum in self.spectra:
+            if spectrum.spectrum_id == spectrum_id:
+                return spectrum
+        return None
+
+    def get_spectra_by_ids(self, spectrum_ids: List[Union[int, str]]) -> List[Spectrum]:
+        """Get multiple spectra by their IDs."""
+        result = []
+        for spectrum_id in spectrum_ids:
+            spectrum = self.get_spectrum_by_id(spectrum_id)
+            if spectrum:
+                result.append(spectrum)
+        return result
+
     def rename_key_in_all_spectra(self, old_key: str, new_key: str):
         """Rename a metadata key in all spectra."""
         for spectrum in self.spectra:
             spectrum.rename_metadata_key(old_key, new_key)
 
     def update_key_value_in_selected_spectra(
-        self, spectrum_ids: List[int], key: str, value: str
+        self, spectrum_ids: List[Union[int, str]], key: str, value: str
     ):
         """Update a metadata value in selected spectra."""
         for spectrum in self.spectra:
@@ -251,7 +289,7 @@ class MGFParser:
         return max(0.0, min(1.0, dot_product))  # Clamp to [0, 1]
 
     def calculate_similarity_matrix(
-        self, spectrum_ids: List[int], mz_tolerance: float = 0.1
+        self, spectrum_ids: List[Union[int, str]], mz_tolerance: float = 0.1
     ) -> np.ndarray:
         """
         Calculate pairwise cosine similarity matrix for selected spectra.
@@ -287,7 +325,10 @@ class MGFParser:
         return similarity_matrix
 
     def calculate_similarity_matrix_batch(
-        self, spectrum_ids: List[int], mz_tolerance: float = 0.1, progress_callback=None
+        self,
+        spectrum_ids: List[Union[int, str]],
+        mz_tolerance: float = 0.1,
+        progress_callback=None,
     ) -> np.ndarray:
         """
         Calculate pairwise cosine similarity matrix with progress reporting.
@@ -334,7 +375,9 @@ class MGFParser:
 
         return similarity_matrix
 
-    def export_to_mgf(self, file_path: str, spectrum_ids: Optional[List[int]] = None):
+    def export_to_mgf(
+        self, file_path: str, spectrum_ids: Optional[List[Union[int, str]]] = None
+    ):
         """
         Export spectra to an MGF file.
 
@@ -365,7 +408,9 @@ class MGFParser:
 
                 f.write("END IONS\n\n")
 
-    def normalize_intensities(self, spectrum_ids: Optional[List[int]] = None):
+    def normalize_intensities(
+        self, spectrum_ids: Optional[List[Union[int, str]]] = None
+    ):
         """
         Normalize intensities in spectra so that the most abundant peak has intensity 1.
 

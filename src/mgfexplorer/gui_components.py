@@ -444,8 +444,14 @@ class SpectrumTreeView(ttk.Frame):
                 continue
 
             if tags[0] == "spectrum":
-                # Direct spectrum selection
-                selected_spectrum_ids.append(int(tags[1]))
+                # Direct spectrum selection - spectrum ID could be string or int
+                spectrum_id = tags[1]
+                # Try to convert to int, but keep as string if it fails (for prefixed IDs)
+                try:
+                    spectrum_id = int(spectrum_id)
+                except ValueError:
+                    pass  # Keep as string
+                selected_spectrum_ids.append(spectrum_id)
             elif tags[0] == "group":
                 # Group selection - get all spectra in group and children
                 group_spectra = self._get_spectra_in_group(item)
@@ -465,7 +471,13 @@ class SpectrumTreeView(ttk.Frame):
             for child in self.tree.get_children(item):
                 tags = self.tree.item(child, "tags")
                 if tags and tags[0] == "spectrum":
-                    spectrum_ids.append(int(tags[1]))
+                    spectrum_id = tags[1]
+                    # Try to convert to int, but keep as string if it fails (for prefixed IDs)
+                    try:
+                        spectrum_id = int(spectrum_id)
+                    except ValueError:
+                        pass  # Keep as string
+                    spectrum_ids.append(spectrum_id)
                 else:
                     # Recursive for nested groups
                     collect_spectra(child)
@@ -473,7 +485,7 @@ class SpectrumTreeView(ttk.Frame):
         collect_spectra(group_item)
         return spectrum_ids
 
-    def get_selected_spectrum_ids(self) -> List[int]:
+    def get_selected_spectrum_ids(self) -> List:
         """Get currently selected spectrum IDs."""
         selected_items = self.tree.selection()
         selected_ids = []
@@ -484,7 +496,13 @@ class SpectrumTreeView(ttk.Frame):
                 continue
 
             if tags[0] == "spectrum":
-                selected_ids.append(int(tags[1]))
+                spectrum_id = tags[1]
+                # Try to convert to int, but keep as string if it fails (for prefixed IDs)
+                try:
+                    spectrum_id = int(spectrum_id)
+                except ValueError:
+                    pass  # Keep as string
+                selected_ids.append(spectrum_id)
             elif tags[0] == "group":
                 group_spectra = self._get_spectra_in_group(item)
                 selected_ids.extend(group_spectra)
@@ -2065,6 +2083,39 @@ class SpectrumVisualization(ttk.Frame):
         if len(intensity_values) > 0:
             ax.set_ylim(0, intensity_values.max() * 1.1)
 
+    def clear_plot(self):
+        """Clear the plot and reset to empty state."""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            "No spectra loaded",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        self.canvas.draw()
+        self.parser = None
+        self.selected_spectrum_ids = []
+
+    def clear_plot(self):
+        """Clear the spectrum plot and reset data."""
+        fig = self.canvas.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            "No spectra loaded",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        self.canvas.draw()
+        self.parser = None
+        self.selected_spectrum_ids = []
+
 
 class IonDataTable(ttk.Frame):
     """Component for displaying ion data in table format."""
@@ -2144,6 +2195,15 @@ class IonDataTable(ttk.Frame):
         if spectrum.ions.size > 0:
             for i, (mz, intensity) in enumerate(spectrum.ions):
                 tree.insert("", "end", values=(i + 1, f"{mz:.6f}", f"{intensity:.3f}"))
+
+    def clear_data(self):
+        """Clear all data from the tables."""
+        # Clear all tabs
+        for tab_id in self.notebook.tabs():
+            self.notebook.forget(tab_id)
+
+        self.parser = None
+        self.selected_spectrum_ids = []
 
 
 class CosineSimilarityVisualization(ttk.Frame):
@@ -2609,6 +2669,185 @@ class CosineSimilarityVisualization(ttk.Frame):
 
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(tk.END, stats_text)
+
+    def clear_data(self):
+        """Clear all data from the cosine similarity visualization."""
+        self.heatmap_canvas.delete("all")
+        self.stats_text.delete(1.0, tk.END)
+        self.similarity_matrix = None
+        self.selected_spectra = []
+
+
+class FileLoadingDialog:
+    """Dialog for configuring file loading options including database identifier and prefix."""
+
+    def __init__(self, parent, existing_prefixes=None):
+        self.parent = parent
+        self.existing_prefixes = existing_prefixes or set()
+        self.result = None
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("File Loading Options")
+        self.dialog.geometry("450x400")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Center the dialog
+        self.dialog.geometry(
+            "+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50)
+        )
+
+        self._create_widgets()
+        self.dialog.wait_window()
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=15)
+        main_frame.pack(fill="both", expand=True)
+
+        # Instructions
+        instructions = ttk.Label(
+            main_frame,
+            text="Configure metadata and naming options for the loaded spectra:\n(* indicates required fields)",
+            font=("Arial", 10),
+        )
+        instructions.pack(anchor="w", pady=(0, 15))
+
+        # Database identifier section
+        db_frame = ttk.LabelFrame(main_frame, text="Database Information", padding=10)
+        db_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(db_frame, text="Database Identifier: *").pack(anchor="w")
+        self.database_identifier_var = tk.StringVar()
+        db_entry = ttk.Entry(
+            db_frame, textvariable=self.database_identifier_var, width=40
+        )
+        db_entry.pack(fill="x", pady=(5, 0))
+
+        # Bind validation to database identifier entry
+        self.database_identifier_var.trace_add("write", self._validate_database_id)
+
+        ttk.Label(
+            db_frame,
+            text="This identifier will be added to all spectra metadata (required)",
+            font=("Arial", 8),
+            foreground="gray",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Prefix section
+        prefix_frame = ttk.LabelFrame(main_frame, text="Spectrum ID Prefix", padding=10)
+        prefix_frame.pack(fill="x", pady=(0, 15))
+
+        ttk.Label(prefix_frame, text="Prefix for spectrum IDs: *").pack(anchor="w")
+        self.prefix_var = tk.StringVar()
+        self.prefix_entry = ttk.Entry(
+            prefix_frame, textvariable=self.prefix_var, width=40
+        )
+        self.prefix_entry.pack(fill="x", pady=(5, 0))
+
+        # Validation label for prefix
+        self.prefix_status_label = ttk.Label(
+            prefix_frame,
+            text="This prefix will be applied to each spectrum ID",
+            font=("Arial", 8),
+            foreground="gray",
+        )
+        self.prefix_status_label.pack(anchor="w", pady=(2, 0))
+
+        # Bind validation to prefix entry
+        self.prefix_var.trace_add("write", self._validate_prefix)
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
+            side="right", padx=(5, 0)
+        )
+        self.ok_button = ttk.Button(button_frame, text="OK", command=self._ok)
+        self.ok_button.pack(side="right")
+
+        # Initially disable OK button since fields are required
+        self.ok_button.config(state="disabled")
+
+        # Bind Enter and Escape keys
+        self.dialog.bind("<Return>", lambda e: self._ok())
+        self.dialog.bind("<Escape>", lambda e: self._cancel())
+
+        # Focus on database identifier entry
+        db_entry.focus_set()
+
+    def _validate_prefix(self, *args):
+        """Validate the prefix to ensure it hasn't been used before."""
+        prefix = self.prefix_var.get().strip()
+
+        if not prefix:
+            self.prefix_status_label.config(
+                text="⚠ Prefix is required",
+                foreground="red",
+            )
+            self._update_ok_button_state()
+        elif prefix in self.existing_prefixes:
+            self.prefix_status_label.config(
+                text="⚠ This prefix has already been used!", foreground="red"
+            )
+            self._update_ok_button_state()
+        else:
+            self.prefix_status_label.config(
+                text="✓ Prefix is available", foreground="green"
+            )
+            self._update_ok_button_state()
+
+    def _validate_database_id(self, *args):
+        """Validate the database identifier."""
+        self._update_ok_button_state()
+
+    def _update_ok_button_state(self):
+        """Update the OK button state based on validation."""
+        prefix = self.prefix_var.get().strip()
+        database_id = self.database_identifier_var.get().strip()
+
+        # Both fields are required and prefix must not be used
+        if database_id and prefix and prefix not in self.existing_prefixes:
+            self.ok_button.config(state="normal")
+        else:
+            self.ok_button.config(state="disabled")
+
+    def _ok(self):
+        """Handle OK button."""
+        prefix = self.prefix_var.get().strip()
+        database_id = self.database_identifier_var.get().strip()
+
+        # Validate required fields
+        if not database_id:
+            messagebox.showerror(
+                "Missing Information", "Database identifier is required."
+            )
+            return
+
+        if not prefix:
+            messagebox.showerror("Missing Information", "Prefix is required.")
+            return
+
+        # Final validation
+        if prefix in self.existing_prefixes:
+            messagebox.showerror(
+                "Invalid Prefix",
+                f"The prefix '{prefix}' has already been used. Please choose a different prefix.",
+            )
+            return
+
+        self.result = {
+            "database_identifier": database_id,
+            "prefix": prefix,
+        }
+        self.dialog.destroy()
+
+    def _cancel(self):
+        """Handle Cancel button."""
+        self.result = None
+        self.dialog.destroy()
 
 
 class AverageSpectrumDialog:
