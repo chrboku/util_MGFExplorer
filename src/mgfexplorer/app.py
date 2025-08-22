@@ -165,16 +165,23 @@ class MGFExplorerApp:
         """Handle file drop event."""
         try:
             # Get the dropped files
-            files = event.data.split()
+            files = event.data  # .split()
+
+            # files is '{}' or '{} {}'
+            if "} {" in files:
+                files = files.split("} {")
+                for fi in range(len(files)):
+                    files[fi] = files[fi].strip().lstrip("{")
+                    files[fi] = files[fi].rstrip("}")
+            else:
+                files = [files.strip().lstrip("{").rstrip("}")]
 
             if not files:
                 return
 
-            # Use the first file if multiple files are dropped
-            file_path = files[0].strip("{}")  # Remove any braces that might be present
-
             # Process the dropped file
-            self._process_dropped_file(file_path)
+            for file_path in files:
+                self._process_dropped_file(file_path)
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
@@ -216,7 +223,7 @@ class MGFExplorerApp:
         """Load an MGF file and append to existing data."""
         try:
             # Show file loading options dialog
-            dialog = FileLoadingDialog(self.root, self.used_prefixes)
+            dialog = FileLoadingDialog(self.root, file_path, self.used_prefixes)
 
             if dialog.result is None:
                 # User cancelled

@@ -761,6 +761,56 @@ class SpectrumTreeView(ttk.Frame):
             else:
                 return f"{spectrum.spectrum_id}: {self.naming_scheme}=<missing>"
 
+    def get_current_grouping_structure(self):
+        """Get the current grouping structure for export functionality."""
+        if not self.parser or not self.selected_grouping_tags:
+            return None
+
+        # Build the same hierarchy structure used in _populate_hierarchical_tree
+        hierarchy = {}
+
+        for spectrum in self.parser.spectra:
+            # Apply filter if specified
+            if not self._spectrum_matches_filter(spectrum):
+                continue
+
+            # Get values for grouping tags
+            path = []
+            for tag in self.selected_grouping_tags:
+                value = spectrum.get_metadata_value(tag)
+                if value is None:
+                    value = "<missing>"
+                path.append(f"{tag}={value}")
+
+            # Build nested dictionary
+            current = hierarchy
+            for level, path_part in enumerate(path):
+                if path_part not in current:
+                    current[path_part] = {"spectra": [], "children": {}}
+                current = current[path_part]["children"]
+
+            # Add spectrum to the final level
+            final_level = hierarchy
+            for path_part in path[:-1]:
+                final_level = final_level[path_part]["children"]
+            if path:
+                final_level[path[-1]]["spectra"].append(spectrum)
+            else:
+                # No valid grouping path, add to root
+                if "_ungrouped_" not in hierarchy:
+                    hierarchy["_ungrouped_"] = {"spectra": [], "children": {}}
+                hierarchy["_ungrouped_"]["spectra"].append(spectrum)
+
+        return hierarchy
+
+    def has_grouping(self):
+        """Check if there is currently active grouping."""
+        return bool(self.selected_grouping_tags)
+
+    def get_grouping_tags(self):
+        """Get the current grouping tags."""
+        return self.selected_grouping_tags.copy()
+
 
 class MetadataEditor(ttk.Frame):
     """Component for viewing and editing metadata."""
@@ -2681,15 +2731,16 @@ class CosineSimilarityVisualization(ttk.Frame):
 class FileLoadingDialog:
     """Dialog for configuring file loading options including database identifier and prefix."""
 
-    def __init__(self, parent, existing_prefixes=None):
+    def __init__(self, parent, file_to_load, existing_prefixes=None):
         self.parent = parent
+        self.file_to_load = file_to_load
         self.existing_prefixes = existing_prefixes or set()
         self.result = None
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("File Loading Options")
         self.dialog.geometry("450x400")
-        self.dialog.resizable(False, False)
+        self.dialog.resizable(True, True)
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
@@ -2709,7 +2760,7 @@ class FileLoadingDialog:
         # Instructions
         instructions = ttk.Label(
             main_frame,
-            text="Configure metadata and naming options for the loaded spectra:\n(* indicates required fields)",
+            text=f"Configure metadata and naming options for the loaded spectra:\n(* indicates required fields)\nFile is: '{self.file_to_load}'",
             font=("Arial", 10),
         )
         instructions.pack(anchor="w", pady=(0, 15))
