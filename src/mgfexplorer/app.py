@@ -89,9 +89,45 @@ class MGFExplorerApp:
             label="Convert Keys to lowercase", command=self._keys_to_lowercase
         )
         edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Intensity Normalization", command=self._normalize_intensities
+
+        # Intensity Normalization submenu
+        normalize_menu = tk.Menu(edit_menu, tearoff=0)
+        edit_menu.add_cascade(label="Intensity Normalization", menu=normalize_menu)
+
+        # Range submenus
+        range_01_menu = tk.Menu(normalize_menu, tearoff=0)
+        normalize_menu.add_cascade(label="Range 0-1", menu=range_01_menu)
+        range_01_menu.add_command(
+            label="Relative to most abundant signal",
+            command=lambda: self._normalize_intensities("max", 1.0),
         )
+        range_01_menu.add_command(
+            label="Relative to total sum of all signals",
+            command=lambda: self._normalize_intensities("sum", 1.0),
+        )
+
+        range_0100_menu = tk.Menu(normalize_menu, tearoff=0)
+        normalize_menu.add_cascade(label="Range 0-100", menu=range_0100_menu)
+        range_0100_menu.add_command(
+            label="Relative to most abundant signal",
+            command=lambda: self._normalize_intensities("max", 100.0),
+        )
+        range_0100_menu.add_command(
+            label="Relative to total sum of all signals",
+            command=lambda: self._normalize_intensities("sum", 100.0),
+        )
+
+        range_01000_menu = tk.Menu(normalize_menu, tearoff=0)
+        normalize_menu.add_cascade(label="Range 0-1000", menu=range_01000_menu)
+        range_01000_menu.add_command(
+            label="Relative to most abundant signal",
+            command=lambda: self._normalize_intensities("max", 1000.0),
+        )
+        range_01000_menu.add_command(
+            label="Relative to total sum of all signals",
+            command=lambda: self._normalize_intensities("sum", 1000.0),
+        )
+
         edit_menu.add_separator()
         edit_menu.add_command(
             label="Delete Selected Spectra", command=self._delete_selected_spectra
@@ -620,18 +656,31 @@ class MGFExplorerApp:
 
         self._on_metadata_changed()
 
-    def _normalize_intensities(self):
-        """Normalize intensities so that the most abundant peak in each spectrum has intensity 1."""
+    def _normalize_intensities(self, mode="max", scale=1.0):
+        """
+        Normalize intensities in all spectra.
+
+        Args:
+            mode: "max" to normalize relative to most abundant peak, "sum" to normalize relative to total sum
+            scale: target scale (1.0 for 0-1, 100.0 for 0-100, 1000.0 for 0-1000)
+        """
         if not self.parser or not self.parser.spectra:
             messagebox.showwarning(
                 "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
+        # Create descriptive text for the confirmation dialog
+        mode_text = (
+            "most abundant peak" if mode == "max" else "total sum of all signals"
+        )
+        range_text = f"0-{int(scale)}" if scale != 1.0 else "0-1"
+
         # Ask for confirmation
         if not messagebox.askyesno(
             "Intensity Normalization",
-            "Normalize intensities in all spectra so that the most abundant peak has intensity 1?\n\n"
+            f"Normalize intensities in all spectra to range {range_text}, "
+            f"relative to {mode_text}?\n\n"
             "This will modify the intensity values and cannot be undone.",
         ):
             return
@@ -641,7 +690,7 @@ class MGFExplorerApp:
             self.root.update()
 
             # Normalize all spectra
-            self.parser.normalize_intensities()
+            self.parser.normalize_intensities(mode=mode, scale=scale)
 
             # Update visualization and data
             self._on_metadata_changed()
@@ -652,7 +701,8 @@ class MGFExplorerApp:
 
             messagebox.showinfo(
                 "Normalization Complete",
-                f"Successfully normalized intensities in {len(self.parser.spectra)} spectra.",
+                f"Successfully normalized intensities in {len(self.parser.spectra)} spectra "
+                f"to range {range_text}, relative to {mode_text}.",
             )
 
         except Exception as e:

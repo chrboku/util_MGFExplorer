@@ -552,7 +552,7 @@ class SpectrumTreeView(ttk.Frame):
             for item in self.tree.get_children(parent):
                 tags = self.tree.item(item, "tags")
                 if tags and tags[0] == "spectrum":
-                    spectrum_id = int(tags[1])
+                    spectrum_id = tags[1]  # Don't convert to int - keep original type
                     if spectrum_id in self._async_selection_ids:
                         all_spectrum_items.append(item)
                 elif tags and tags[0] == "group":
@@ -583,37 +583,6 @@ class SpectrumTreeView(ttk.Frame):
         # You could add a temporary item here showing progress
         # For now, we'll just ensure the UI updates
         self.update_idletasks()
-
-    def _collect_all_spectrum_items_async(self):
-        """Collect all spectrum items from the tree structure."""
-        all_spectrum_items = []
-
-        def collect_items(parent=""):
-            for item in self.tree.get_children(parent):
-                tags = self.tree.item(item, "tags")
-                if tags and tags[0] == "spectrum":
-                    spectrum_id = int(tags[1])
-                    if spectrum_id in self._async_selection_ids:
-                        all_spectrum_items.append(item)
-                elif tags and tags[0] == "group":
-                    # Recursively check group children
-                    collect_items(item)
-                else:
-                    # Handle items without proper tags
-                    collect_items(item)
-
-        # Clear current selection first
-        self.tree.selection_remove(*self.tree.selection())
-
-        # Collect all matching items
-        collect_items()
-
-        # Store the collected items
-        self._async_selection_items = all_spectrum_items
-        self._selection_chunk_index = 0
-
-        # Start applying selection in chunks
-        self.after(10, self._apply_async_selection)
 
     def _apply_async_selection(self):
         """Apply the collected selection asynchronously."""
@@ -673,7 +642,7 @@ class SpectrumTreeView(ttk.Frame):
             for item in self.tree.get_children(parent):
                 tags = self.tree.item(item, "tags")
                 if tags and tags[0] == "spectrum":
-                    spectrum_id = int(tags[1])
+                    spectrum_id = tags[1]  # Don't convert to int - keep original type
                     if spectrum_id in target_ids:
                         self.tree.selection_add(item)
                         found_items.append(item)
@@ -713,7 +682,7 @@ class SpectrumTreeView(ttk.Frame):
             for item in self.tree.get_children(parent):
                 tags = self.tree.item(item, "tags")
                 if tags and tags[0] == "spectrum":
-                    spectrum_id = int(tags[1])
+                    spectrum_id = tags[1]  # Don't convert to int - keep original type
                     if spectrum_id in target_ids:
                         items_to_select.append(item)
                 else:
@@ -817,6 +786,7 @@ class MetadataEditor(ttk.Frame):
 
     def __init__(self, parent, on_metadata_changed=None):
         super().__init__(parent)
+        self.parent = parent  # Store parent reference
         self.on_metadata_changed = on_metadata_changed
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []

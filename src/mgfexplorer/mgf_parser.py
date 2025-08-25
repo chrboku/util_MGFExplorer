@@ -409,13 +409,18 @@ class MGFParser:
                 f.write("END IONS\n\n")
 
     def normalize_intensities(
-        self, spectrum_ids: Optional[List[Union[int, str]]] = None
+        self,
+        spectrum_ids: Optional[List[Union[int, str]]] = None,
+        mode: str = "max",
+        scale: float = 1.0,
     ):
         """
-        Normalize intensities in spectra so that the most abundant peak has intensity 1.
+        Normalize intensities in spectra.
 
         Args:
             spectrum_ids: Optional list of spectrum IDs to normalize. If None, normalizes all spectra.
+            mode: "max" to normalize relative to most abundant peak, "sum" to normalize relative to total sum
+            scale: target scale (1.0 for 0-1, 100.0 for 0-100, 1000.0 for 0-1000)
         """
         # Determine which spectra to normalize
         if spectrum_ids is None:
@@ -430,13 +435,25 @@ class MGFParser:
                 # Get current intensities
                 intensities = spectrum.ions[:, 1]
 
-                # Find maximum intensity
-                max_intensity = np.max(intensities)
+                if mode == "max":
+                    # Normalize relative to maximum intensity
+                    max_intensity = np.max(intensities)
 
-                # Only normalize if max intensity is not zero
-                if max_intensity > 0:
-                    # Scale intensities so max becomes 1
-                    normalized_intensities = intensities / max_intensity
+                    # Only normalize if max intensity is not zero
+                    if max_intensity > 0:
+                        normalized_intensities = (intensities / max_intensity) * scale
+                        spectrum.ions[:, 1] = normalized_intensities
 
-                    # Update the spectrum with normalized intensities
-                    spectrum.ions[:, 1] = normalized_intensities
+                elif mode == "sum":
+                    # Normalize relative to total sum of intensities
+                    total_intensity = np.sum(intensities)
+
+                    # Only normalize if total intensity is not zero
+                    if total_intensity > 0:
+                        normalized_intensities = (intensities / total_intensity) * scale
+                        spectrum.ions[:, 1] = normalized_intensities
+
+                else:
+                    raise ValueError(
+                        f"Unknown normalization mode: {mode}. Use 'max' or 'sum'."
+                    )
