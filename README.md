@@ -45,11 +45,16 @@ uv run mgfexplorer
 2. **Select Spectra**: 
    - Use the tree view on the left to select one or more spectra
    - Enable grouping options to organize spectra by metadata fields
-3. **Edit Metadata**:
+3. **Filter Spectra**:
+   - Use the filter box to search through spectra
+   - Default: searches all metadata fields (e.g., `positive`)
+   - `$$ key: value` - search only specific key for exact match (e.g., `$$ IONMODE: Positive`)
+   - `$$$ key: regex` - search only specific key using regex (e.g., `$$$ CHARGE: ^[12]\+`)
+4. **Edit Metadata**:
    - View and edit metadata in the center panel
    - Rename keys or update values
    - Changes apply to all selected spectra
-4. **View Data**:
+5. **View Data**:
    - Ion data tables appear in the bottom-left
    - Spectrum visualization in the bottom-right
    - Stick charts show m/z vs intensity
@@ -58,6 +63,7 @@ uv run mgfexplorer
 
 #### Left Panel - Spectrum Tree View
 - Lists all spectra in the MGF file
+- Advanced filtering: search all fields, specific keys, or use regex patterns
 - Grouping checkboxes to organize by metadata fields
 - Multi-select support for batch operations
 

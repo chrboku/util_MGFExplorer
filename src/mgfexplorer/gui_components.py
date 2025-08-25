@@ -74,6 +74,11 @@ class SpectrumTreeView(ttk.Frame):
         self.filter_entry.pack(fill="x", pady=5)
         self.filter_entry.bind("<KeyRelease>", self._on_filter_entry_change)
 
+        # Filter help text
+        help_text = "Default: search all fields\n$$ key: value (exact)\n$$$ key: regex"
+        filter_help = ttk.Label(filter_frame, text=help_text, font=("TkDefaultFont", 8))
+        filter_help.pack(fill="x", pady=(0, 5))
+
         # Tree view frame
         tree_frame = ttk.LabelFrame(self, text="Spectra", padding=5)
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
@@ -190,11 +195,57 @@ class SpectrumTreeView(ttk.Frame):
         if not self.filter_text:
             return True
 
-        # Search in all metadata values
-        for key, value in spectrum.metadata.items():
-            if value and self.filter_text in str(value).lower():
-                return True
+        # Check for special filtering syntax
+        if self.filter_text.startswith("$$$"):
+            # Regex search in specific key: "$$$ key: regex"
+            return self._filter_by_key_regex(spectrum, self.filter_text[3:].strip())
+        elif self.filter_text.startswith("$$"):
+            # Exact submatch in specific key: "$$ key: value"
+            return self._filter_by_key_exact(spectrum, self.filter_text[2:].strip())
+        else:
+            # Default: search in all metadata values
+            for key, value in spectrum.metadata.items():
+                if value and self.filter_text in str(value).lower():
+                    return True
+            return False
 
+    def _filter_by_key_exact(self, spectrum, filter_text):
+        """Filter by exact submatch in a specific key field."""
+        if ":" not in filter_text:
+            return False
+
+        key_part, value_part = filter_text.split(":", 1)
+        key = key_part.strip()
+        search_value = value_part.strip().lower()
+
+        if key in spectrum.metadata:
+            metadata_value = spectrum.metadata[key]
+            if metadata_value and search_value in str(metadata_value).lower():
+                return True
+        return False
+
+    def _filter_by_key_regex(self, spectrum, filter_text):
+        """Filter by regex match in a specific key field."""
+        import re
+
+        if ":" not in filter_text:
+            return False
+
+        key_part, regex_part = filter_text.split(":", 1)
+        key = key_part.strip()
+        regex_pattern = regex_part.strip()
+
+        if key in spectrum.metadata:
+            metadata_value = spectrum.metadata[key]
+            if metadata_value:
+                try:
+                    # Case-insensitive regex search
+                    if re.search(regex_pattern, str(metadata_value), re.IGNORECASE):
+                        return True
+                except re.error:
+                    # Invalid regex pattern - fall back to literal search
+                    if regex_pattern.lower() in str(metadata_value).lower():
+                        return True
         return False
 
     def _clean_spacing(self, text):
