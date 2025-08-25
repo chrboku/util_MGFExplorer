@@ -1543,6 +1543,23 @@ class MetadataEditor(ttk.Frame):
             return selection
         return None
 
+    def clear(self):
+        """Clear the metadata editor and reset to empty state."""
+        # Clear the metadata tree
+        for item in self.metadata_tree.get_children():
+            self.metadata_tree.delete(item)
+
+        # Clear the SMILES plot
+        self._show_smiles_message("No spectra selected")
+
+        # Reset state
+        self.parser = None
+        self.selected_spectrum_ids = []
+        self._pending_selection = None
+
+        # Close any open editor
+        self._close_editor()
+
 
 class AddKeyValueDialog:
     """Dialog for adding new key-value pairs."""
@@ -3093,4 +3110,748 @@ class AverageSpectrumDialog:
     def _cancel(self):
         """Handle Cancel button."""
         self.result = None
+        self.dialog.destroy()
+
+
+class SmartsFilterDialog:
+    """Dialog for SMARTS substructure filtering."""
+
+    def __init__(self, parent, spectra, apply_callback):
+        self.parent = parent
+        self.spectra = spectra
+        self.apply_callback = apply_callback
+        self.matching_spectra = []
+        self.unique_smiles = []
+        self.smiles_to_spectra = {}
+
+        # Create dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("SMARTS Substructure Filter")
+        self.dialog.geometry("1200x800")
+        self.dialog.resizable(True, True)
+        self.dialog.grab_set()  # Make dialog modal
+
+        self._create_widgets()
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        # Main frame
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # SMARTS input section
+        input_frame = ttk.LabelFrame(main_frame, text="SMARTS Pattern", padding=5)
+        input_frame.pack(fill="x", pady=(0, 10))
+
+        # SMARTS entry
+        ttk.Label(input_frame, text="Enter SMARTS pattern(s):").pack(anchor="w")
+        ttk.Label(
+            input_frame,
+            text="Use ' ' to separate multiple patterns for OR logic (e.g., 'c1ccccc1 C=O N')",
+            font=("Arial", 9),
+            foreground="gray",
+        ).pack(anchor="w", pady=(0, 5))
+        self.smarts_var = tk.StringVar()
+        self.smarts_entry = ttk.Entry(
+            input_frame, textvariable=self.smarts_var, font=("Courier", 12)
+        )
+        self.smarts_entry.pack(fill="x", pady=(5, 10))
+        self.smarts_entry.bind("<KeyRelease>", self._on_smarts_change)
+
+        # Example patterns
+        examples_frame = ttk.Frame(input_frame)
+        examples_frame.pack(fill="x")
+        ttk.Label(examples_frame, text="Examples:").pack(anchor="w")
+
+        example_buttons_frame = ttk.Frame(examples_frame)
+        example_buttons_frame.pack(fill="x", pady=5)
+
+        examples = [
+            ("Benzene ring", "c1ccccc1"),
+            ("Carbonyl", "C=O"),
+            ("Hydroxyl", "O"),
+            ("Ester", "C(=O)O"),
+            (
+                "Flavone or Iso-Flavone",
+                "[O,o]~[C,c]~1~[C,c]~[C,c](~[O,o]~[C,c]2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~1~2)~[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]3  [C,c]~1~[C,c]~[C,c](~[O,o]~[C,c]2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~1~2)~[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]3  [O,o]~[C,c]~1~[C,c]~2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~2~[O,o]~[C,c]~[C,c]~1[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~3  [C,c]~1~[C,c]~2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~2~[O,o]~[C,c]~[C,c]~1[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~3",
+            ),
+        ]
+
+        for i, (name, pattern) in enumerate(examples):
+            btn = ttk.Button(
+                example_buttons_frame,
+                text=f"{name}\n({pattern})",
+                command=lambda p=pattern: self._set_smarts_pattern(p),
+                width=12,
+            )
+            btn.grid(row=0, column=i, padx=2, sticky="ew")
+
+        # Configure column weights for even distribution
+        for i in range(len(examples)):
+            example_buttons_frame.columnconfigure(i, weight=1)
+
+        # SMARTS visualization frame
+        viz_frame = ttk.LabelFrame(main_frame, text="Pattern Visualization", padding=5)
+        viz_frame.pack(fill="x", pady=(0, 10))
+
+        self.pattern_canvas = tk.Canvas(viz_frame, height=150, bg="white")
+        self.pattern_canvas.pack(fill="x")
+
+        # Results section
+        results_frame = ttk.LabelFrame(main_frame, text="Filtering Results", padding=5)
+        results_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Create paned window for matched/unmatched structures
+        paned_window = ttk.PanedWindow(results_frame, orient="horizontal")
+        paned_window.pack(fill="both", expand=True)
+
+        # Matched structures frame
+        matched_frame = ttk.LabelFrame(
+            paned_window, text="Matched Structures (0)", padding=5
+        )
+        paned_window.add(matched_frame, weight=1)
+
+        # Create scrollable frame for matched structures
+        self.matched_canvas = tk.Canvas(matched_frame, bg="white")
+        matched_scrollbar = ttk.Scrollbar(
+            matched_frame, orient="vertical", command=self.matched_canvas.yview
+        )
+        self.matched_scrollable_frame = ttk.Frame(self.matched_canvas)
+
+        self.matched_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.matched_canvas.configure(
+                scrollregion=self.matched_canvas.bbox("all")
+            ),
+        )
+
+        self.matched_canvas.create_window(
+            (0, 0), window=self.matched_scrollable_frame, anchor="nw"
+        )
+        self.matched_canvas.configure(yscrollcommand=matched_scrollbar.set)
+
+        self.matched_canvas.pack(side="left", fill="both", expand=True)
+        matched_scrollbar.pack(side="right", fill="y")
+
+        # Unmatched structures frame
+        unmatched_frame = ttk.LabelFrame(
+            paned_window, text="Unmatched Structures (0)", padding=5
+        )
+        paned_window.add(unmatched_frame, weight=1)
+
+        # Create scrollable frame for unmatched structures
+        self.unmatched_canvas = tk.Canvas(unmatched_frame, bg="white")
+        unmatched_scrollbar = ttk.Scrollbar(
+            unmatched_frame, orient="vertical", command=self.unmatched_canvas.yview
+        )
+        self.unmatched_scrollable_frame = ttk.Frame(self.unmatched_canvas)
+
+        self.unmatched_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.unmatched_canvas.configure(
+                scrollregion=self.unmatched_canvas.bbox("all")
+            ),
+        )
+
+        self.unmatched_canvas.create_window(
+            (0, 0), window=self.unmatched_scrollable_frame, anchor="nw"
+        )
+        self.unmatched_canvas.configure(yscrollcommand=unmatched_scrollbar.set)
+
+        self.unmatched_canvas.pack(side="left", fill="both", expand=True)
+        unmatched_scrollbar.pack(side="right", fill="y")
+
+        # Bind mouse wheel to canvases
+        self._bind_mousewheel(self.matched_canvas)
+        self._bind_mousewheel(self.unmatched_canvas)
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(button_frame, text="Apply Filter", command=self._apply_filter).pack(
+            side="right", padx=(5, 0)
+        )
+        ttk.Button(
+            button_frame, text="Generate Overview", command=self._generate_overview
+        ).pack(side="right", padx=(5, 0))
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(side="right")
+
+        # Status label
+        self.status_var = tk.StringVar(
+            value="Enter a SMARTS pattern and click 'Generate Overview' to begin"
+        )
+        ttk.Label(button_frame, textvariable=self.status_var).pack(side="left")
+
+    def _bind_mousewheel(self, canvas):
+        """Bind mouse wheel scrolling to canvas."""
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_to_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_from_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_to_mousewheel)
+        canvas.bind("<Leave>", _unbind_from_mousewheel)
+
+    def _set_smarts_pattern(self, pattern):
+        """Set SMARTS pattern from example button."""
+        self.smarts_var.set(pattern)
+        self._on_smarts_change()
+        # Automatically generate overview when using example patterns
+        self._generate_overview()
+
+    def _on_smarts_change(self, event=None):
+        """Handle SMARTS pattern change."""
+        pattern = self.smarts_var.get().strip()
+
+        if not pattern:
+            self._clear_visualization()
+            return
+
+        # Only visualize the SMARTS pattern, don't perform filtering yet
+        self._visualize_smarts_pattern(pattern)
+
+        # Update status to prompt user to generate overview
+        self.status_var.set("Pattern loaded. Click 'Generate Overview' to see matches.")
+
+    def _generate_overview(self):
+        """Generate overview of matching and non-matching structures."""
+        pattern = self.smarts_var.get().strip()
+
+        if not pattern:
+            messagebox.showwarning("No Pattern", "Please enter a SMARTS pattern first.")
+            return
+
+        # Perform filtering and display results
+        self._perform_filtering(pattern)
+
+    def _visualize_smarts_pattern(self, pattern):
+        """Visualize the SMARTS pattern(s)."""
+        self.pattern_canvas.delete("all")
+
+        if not RDKIT_AVAILABLE:
+            self.pattern_canvas.create_text(
+                150, 75, text="RDKit not available", font=("Arial", 12), fill="red"
+            )
+            return
+
+        try:
+            # Split patterns by $$$
+            patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
+
+            if not patterns:
+                self.pattern_canvas.create_text(
+                    150,
+                    75,
+                    text="No valid patterns found",
+                    font=("Arial", 12),
+                    fill="red",
+                )
+                return
+
+            # Get canvas dimensions
+            canvas_width = self.pattern_canvas.winfo_width()
+            if canvas_width <= 1:  # Canvas not yet drawn
+                canvas_width = 800  # Assume larger width for multiple patterns
+            canvas_height = 150
+
+            # Calculate layout for multiple patterns
+            num_patterns = len(patterns)
+            if num_patterns == 1:
+                # Single pattern - center it
+                pattern_width = 300
+                x_positions = [canvas_width // 2]
+            else:
+                # Multiple patterns - distribute them
+                pattern_width = min(250, (canvas_width - 40) // num_patterns)
+                spacing = canvas_width / (num_patterns + 1)
+                x_positions = [int(spacing * (i + 1)) for i in range(num_patterns)]
+
+            # Generate and display each pattern
+            images = []
+            for i, single_pattern in enumerate(patterns):
+                try:
+                    mol = Chem.MolFromSmarts(single_pattern)
+                    if mol is None:
+                        # Show error for this specific pattern
+                        self.pattern_canvas.create_text(
+                            x_positions[i],
+                            40,
+                            text=f"Invalid:\n{single_pattern[:15]}...",
+                            font=("Arial", 9),
+                            fill="red",
+                            justify="center",
+                        )
+                        continue
+
+                    # Generate image
+                    img = Draw.MolToImage(mol, size=(pattern_width, 100))
+
+                    # Convert PIL image to PhotoImage
+                    from PIL import ImageTk
+
+                    photo = ImageTk.PhotoImage(img)
+                    images.append(photo)  # Keep reference
+
+                    # Display image
+                    self.pattern_canvas.create_image(x_positions[i], 60, image=photo)
+
+                    # Add pattern text below image
+                    pattern_text = (
+                        single_pattern
+                        if len(single_pattern) <= 15
+                        else single_pattern[:12] + "..."
+                    )
+                    self.pattern_canvas.create_text(
+                        x_positions[i],
+                        120,
+                        text=pattern_text,
+                        font=("Courier", 8),
+                        justify="center",
+                    )
+
+                except Exception as e:
+                    # Show error for this specific pattern
+                    self.pattern_canvas.create_text(
+                        x_positions[i],
+                        60,
+                        text=f"Error:\n{str(e)[:20]}",
+                        font=("Arial", 9),
+                        fill="red",
+                        justify="center",
+                    )
+
+            # Store images to prevent garbage collection
+            self.pattern_canvas.images = images
+
+            # Add OR indicator if multiple patterns
+            if num_patterns > 1:
+                for i in range(num_patterns - 1):
+                    or_x = (x_positions[i] + x_positions[i + 1]) // 2
+                    self.pattern_canvas.create_text(
+                        or_x, 75, text="OR", font=("Arial", 12, "bold"), fill="blue"
+                    )
+
+        except Exception as e:
+            self.pattern_canvas.create_text(
+                150, 75, text=f"Error: {str(e)}", font=("Arial", 10), fill="red"
+            )
+
+    def _clear_visualization(self):
+        """Clear pattern visualization."""
+        self.pattern_canvas.delete("all")
+
+        # Clear results
+        for widget in self.matched_scrollable_frame.winfo_children():
+            widget.destroy()
+        for widget in self.unmatched_scrollable_frame.winfo_children():
+            widget.destroy()
+
+        self.status_var.set(
+            "Enter a SMARTS pattern and click 'Generate Overview' to begin"
+        )
+
+    def _perform_filtering(self, pattern):
+        """Perform SMARTS filtering on spectra with support for multiple patterns (OR logic)."""
+        if not RDKIT_AVAILABLE:
+            return
+
+        try:
+            # Split patterns by $$$
+            patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
+
+            if not patterns:
+                self.status_var.set("No valid patterns found")
+                return
+
+            # Parse all SMARTS patterns
+            smarts_mols = []
+            valid_patterns = []
+
+            for single_pattern in patterns:
+                smarts_mol = Chem.MolFromSmarts(single_pattern)
+                if smarts_mol is not None:
+                    smarts_mols.append(smarts_mol)
+                    valid_patterns.append(single_pattern)
+                else:
+                    self.status_var.set(f"Invalid SMARTS pattern: {single_pattern}")
+                    return
+
+            if not smarts_mols:
+                self.status_var.set("No valid SMARTS patterns found")
+                return
+
+            # Collect unique SMILES from spectra
+            smiles_to_spectra = {}
+            unique_smiles = []
+
+            for spectrum in self.spectra:
+                smiles = (
+                    spectrum.metadata.get("SMILES")
+                    if "SMILES" in spectrum.metadata
+                    else spectrum.metadata.get("smiles")
+                    if "smiles" in spectrum.metadata
+                    else ""
+                )
+                if not smiles:
+                    continue
+
+                if smiles not in smiles_to_spectra:
+                    smiles_to_spectra[smiles] = []
+                    unique_smiles.append(smiles)
+                smiles_to_spectra[smiles].append(spectrum)
+
+            if not unique_smiles:
+                self.status_var.set("No SMILES found in spectra")
+                return
+
+            # Test each unique SMILES against all patterns (OR logic)
+            matched_smiles = []
+            unmatched_smiles = []
+
+            for smiles in unique_smiles:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    # Check if ANY of the SMARTS patterns match (OR logic)
+                    has_match = any(
+                        mol.HasSubstructMatch(smarts_mol) for smarts_mol in smarts_mols
+                    )
+                    if has_match:
+                        matched_smiles.append(smiles)
+                    else:
+                        unmatched_smiles.append(smiles)
+                else:
+                    unmatched_smiles.append(smiles)
+
+            # Update display
+            self._display_results(matched_smiles, unmatched_smiles, smiles_to_spectra)
+
+            # Store results
+            self.matching_spectra = []
+            for smiles in matched_smiles:
+                self.matching_spectra.extend(smiles_to_spectra[smiles])
+
+            # Update status
+            total_matched_spectra = sum(
+                len(smiles_to_spectra[smiles]) for smiles in matched_smiles
+            )
+            pattern_count = len(valid_patterns)
+            pattern_text = f"{pattern_count} pattern{'s' if pattern_count > 1 else ''}"
+            self.status_var.set(
+                f"Found {len(matched_smiles)} matching structures using {pattern_text} "
+                f"({total_matched_spectra} spectra)"
+            )
+
+        except Exception as e:
+            self.status_var.set(f"Error during filtering: {str(e)}")
+
+    def _display_results(self, matched_smiles, unmatched_smiles, smiles_to_spectra):
+        """Display matched and unmatched structures."""
+        # Clear previous results
+        for widget in self.matched_scrollable_frame.winfo_children():
+            widget.destroy()
+        for widget in self.unmatched_scrollable_frame.winfo_children():
+            widget.destroy()
+
+        # Update frame titles
+        total_matched_spectra = sum(
+            len(smiles_to_spectra[smiles]) for smiles in matched_smiles
+        )
+        total_unmatched_spectra = sum(
+            len(smiles_to_spectra[smiles]) for smiles in unmatched_smiles
+        )
+
+        matched_frame = self.matched_canvas.master
+        unmatched_frame = self.unmatched_canvas.master
+        matched_frame.configure(
+            text=f"Matched Structures ({len(matched_smiles)} unique, {total_matched_spectra} spectra)"
+        )
+        unmatched_frame.configure(
+            text=f"Unmatched Structures ({len(unmatched_smiles)} unique, {total_unmatched_spectra} spectra)"
+        )
+
+        # Display matched structures
+        self._display_smiles_grid(
+            self.matched_scrollable_frame, matched_smiles, smiles_to_spectra, True
+        )
+
+        # Display unmatched structures
+        self._display_smiles_grid(
+            self.unmatched_scrollable_frame, unmatched_smiles, smiles_to_spectra, False
+        )
+
+    def _display_smiles_grid(
+        self, parent_frame, smiles_list, smiles_to_spectra, highlight_match
+    ):
+        """Display SMILES structures in a grid layout."""
+        if not RDKIT_AVAILABLE:
+            return
+
+        # Create grid of structures (6 per row)
+        for i, smiles in enumerate(smiles_list):
+            row = i // 6
+            col = i % 6
+
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    continue
+
+                # Create frame for this structure
+                struct_frame = ttk.Frame(parent_frame, padding=2)
+                struct_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+
+                # Generate structure image
+                img_size = (150, 150)
+                if highlight_match and hasattr(self, "smarts_var"):
+                    # Highlight substructure match for multiple patterns
+                    pattern = self.smarts_var.get().strip()
+                    if pattern:
+                        try:
+                            # Split patterns by $$$
+                            patterns = [
+                                p.strip() for p in pattern.split(" ") if p.strip()
+                            ]
+                            highlight_atoms = set()
+
+                            # Collect all matching atoms from all patterns
+                            for single_pattern in patterns:
+                                smarts_mol = Chem.MolFromSmarts(single_pattern)
+                                if smarts_mol is not None:
+                                    match = mol.GetSubstructMatch(smarts_mol)
+                                    if match:
+                                        highlight_atoms.update(match)
+
+                            if highlight_atoms:
+                                img = Draw.MolToImage(
+                                    mol,
+                                    size=img_size,
+                                    highlightAtoms=list(highlight_atoms),
+                                )
+                            else:
+                                img = Draw.MolToImage(mol, size=img_size)
+                        except:
+                            img = Draw.MolToImage(mol, size=img_size)
+                    else:
+                        img = Draw.MolToImage(mol, size=img_size)
+                else:
+                    img = Draw.MolToImage(mol, size=img_size)
+
+                # Convert to PhotoImage
+                from PIL import ImageTk
+
+                photo = ImageTk.PhotoImage(img)
+
+                # Create label with image
+                img_label = ttk.Label(struct_frame, image=photo)
+                img_label.image = photo  # Keep reference
+                img_label.pack()
+
+                # Add click binding to show enlarged structure
+                img_label.bind(
+                    "<Button-1>",
+                    lambda e,
+                    s=smiles,
+                    h=highlight_match: self._show_enlarged_structure(s, h),
+                )
+                img_label.configure(
+                    cursor="hand2"
+                )  # Change cursor to indicate clickable
+
+                # Add SMILES text (truncated if too long)
+                smiles_text = smiles if len(smiles) <= 20 else smiles[:17] + "..."
+                ttk.Label(struct_frame, text=smiles_text, font=("Courier", 8)).pack()
+
+                # Add spectrum count
+                spectrum_count = len(smiles_to_spectra[smiles])
+                ttk.Label(
+                    struct_frame, text=f"({spectrum_count} spectra)", font=("Arial", 8)
+                ).pack()
+
+            except Exception as e:
+                # Create error frame
+                struct_frame = ttk.Frame(parent_frame, padding=2)
+                struct_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+                ttk.Label(struct_frame, text="Error", foreground="red").pack()
+                ttk.Label(struct_frame, text=str(e)[:20], font=("Arial", 8)).pack()
+
+        # Configure column weights
+        for col in range(6):
+            parent_frame.columnconfigure(col, weight=1)
+
+    def _show_enlarged_structure(self, smiles, highlight_match):
+        """Show an enlarged view of the structure in a popup window."""
+        if not RDKIT_AVAILABLE:
+            return
+
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                messagebox.showerror("Error", "Cannot parse SMILES structure")
+                return
+
+            # Create popup window
+            popup = tk.Toplevel(self.dialog)
+            popup.title(f"Structure View - {smiles}")
+            popup.geometry("600x700")
+            popup.resizable(True, True)
+            popup.grab_set()  # Make modal
+
+            # Main frame
+            main_frame = ttk.Frame(popup, padding=10)
+            main_frame.pack(fill="both", expand=True)
+
+            # Title
+            ttk.Label(
+                main_frame, text="Molecular Structure", font=("Arial", 14, "bold")
+            ).pack(pady=(0, 10))
+
+            # SMILES text
+            smiles_frame = ttk.LabelFrame(main_frame, text="SMILES", padding=5)
+            smiles_frame.pack(fill="x", pady=(0, 10))
+
+            # Create a text widget for SMILES so it's selectable
+            smiles_text = tk.Text(
+                smiles_frame, height=2, wrap="word", font=("Courier", 10)
+            )
+            smiles_text.insert("1.0", smiles)
+            smiles_text.config(state="disabled")  # Make read-only
+            smiles_text.pack(fill="x")
+
+            # Structure frame
+            struct_frame = ttk.LabelFrame(main_frame, text="Structure", padding=5)
+            struct_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+            # Generate large structure image
+            img_size = (500, 400)
+            if highlight_match and hasattr(self, "smarts_var"):
+                # Highlight substructure match for multiple patterns
+                pattern = self.smarts_var.get().strip()
+                if pattern:
+                    try:
+                        # Split patterns by $$$
+                        patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
+                        highlight_atoms = set()
+
+                        # Collect all matching atoms from all patterns
+                        for single_pattern in patterns:
+                            smarts_mol = Chem.MolFromSmarts(single_pattern)
+                            if smarts_mol is not None:
+                                match = mol.GetSubstructMatch(smarts_mol)
+                                if match:
+                                    highlight_atoms.update(match)
+
+                        if highlight_atoms:
+                            img = Draw.MolToImage(
+                                mol,
+                                size=img_size,
+                                highlightAtoms=list(highlight_atoms),
+                            )
+                        else:
+                            img = Draw.MolToImage(mol, size=img_size)
+                    except:
+                        img = Draw.MolToImage(mol, size=img_size)
+                else:
+                    img = Draw.MolToImage(mol, size=img_size)
+            else:
+                img = Draw.MolToImage(mol, size=img_size)
+
+            # Convert to PhotoImage
+            from PIL import ImageTk
+
+            photo = ImageTk.PhotoImage(img)
+
+            # Create canvas to display the image
+            canvas = tk.Canvas(struct_frame, width=500, height=400, bg="white")
+            canvas.pack(expand=True)
+            canvas.create_image(250, 200, image=photo)
+            canvas.image = photo  # Keep reference
+
+            # Info frame
+            info_frame = ttk.LabelFrame(
+                main_frame, text="Molecular Information", padding=5
+            )
+            info_frame.pack(fill="x", pady=(0, 10))
+
+            # Add molecular properties
+            try:
+                from rdkit.Chem import Descriptors
+
+                mol_weight = Descriptors.MolWt(mol)
+                num_atoms = mol.GetNumAtoms()
+                num_bonds = mol.GetNumBonds()
+
+                info_text = f"Molecular Weight: {mol_weight:.2f} Da\n"
+                info_text += f"Number of Atoms: {num_atoms}\n"
+                info_text += f"Number of Bonds: {num_bonds}"
+
+                ttk.Label(info_frame, text=info_text, font=("Arial", 10)).pack(
+                    anchor="w"
+                )
+            except:
+                ttk.Label(
+                    info_frame,
+                    text="Molecular properties unavailable",
+                    font=("Arial", 10),
+                ).pack(anchor="w")
+
+            # Button frame
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(fill="x", pady=(10, 0))
+
+            # Save image button
+            ttk.Button(
+                button_frame,
+                text="Save Image",
+                command=lambda: self._save_structure_image(img, smiles),
+            ).pack(side="left")
+
+            # Close button
+            ttk.Button(button_frame, text="Close", command=popup.destroy).pack(
+                side="right"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to display structure: {str(e)}")
+
+    def _save_structure_image(self, img, smiles):
+        """Save the structure image to a file."""
+        try:
+            # Ask user for file location
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".png",
+                filetypes=[
+                    ("PNG files", "*.png"),
+                    ("JPEG files", "*.jpg"),
+                    ("All files", "*.*"),
+                ],
+                title="Save Structure Image",
+            )
+
+            if filename:
+                img.save(filename)
+                messagebox.showinfo("Success", f"Structure image saved to {filename}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save image: {str(e)}")
+
+    def _apply_filter(self):
+        """Apply the SMARTS filter."""
+        if not self.matching_spectra:
+            messagebox.showwarning(
+                "No Matches", "No spectra match the current SMARTS pattern."
+            )
+            return
+
+        # Call the callback with matching spectra
+        self.apply_callback(self.matching_spectra)
+        self.dialog.destroy()
+
+    def _cancel(self):
+        """Cancel the dialog."""
         self.dialog.destroy()

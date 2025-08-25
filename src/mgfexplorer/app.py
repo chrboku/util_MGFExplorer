@@ -14,6 +14,7 @@ from .gui_components import (
     IonDataTable,
     CosineSimilarityVisualization,
     FileLoadingDialog,
+    SmartsFilterDialog,
 )
 
 # Try to import tkinterdnd2 for drag and drop support
@@ -23,6 +24,15 @@ try:
     DRAG_DROP_AVAILABLE = True
 except ImportError:
     DRAG_DROP_AVAILABLE = False
+
+# Try to import RDKit for SMARTS filtering
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Draw
+
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
 
 
 class MGFExplorerApp:
@@ -142,6 +152,13 @@ class MGFExplorerApp:
         # Regex Update submenu
         regex_menu = tk.Menu(edit_menu, tearoff=0)
         edit_menu.add_command(label="Regex Update", command=self._open_regex_editor)
+
+        # Filter menu
+        filter_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Filter", menu=filter_menu)
+        filter_menu.add_command(
+            label="SMARTS Substructure Filter...", command=self._open_smarts_filter
+        )
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -1284,6 +1301,50 @@ class MGFExplorerApp:
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export spectra:\n{str(e)}")
             self.status_var.set("Export failed")
+
+    def _open_smarts_filter(self):
+        """Open SMARTS substructure filter dialog."""
+        if not RDKIT_AVAILABLE:
+            messagebox.showerror(
+                "RDKit Not Available",
+                "RDKit is required for SMARTS filtering. Please install rdkit-pypi.",
+            )
+            return
+
+        if not self.parser.spectra:
+            messagebox.showwarning(
+                "No Data", "Please load MGF data before using SMARTS filtering."
+            )
+            return
+
+        # Create SMARTS filter dialog
+        dialog = SmartsFilterDialog(
+            self.root, self.parser.spectra, self._apply_smarts_filter
+        )
+
+    def _apply_smarts_filter(self, matching_spectra):
+        """Apply SMARTS filter by keeping only matching spectra."""
+        if not matching_spectra:
+            messagebox.showinfo("No Matches", "No spectra matched the SMARTS pattern.")
+            return
+
+        # Replace the spectra list with only matching ones
+        self.parser.spectra = matching_spectra
+
+        # Update all views - use load_data to refresh the tree view
+        self.spectrum_tree.load_data(self.parser)
+        self.metadata_editor.clear()
+        self.spectrum_viz.clear_plot()
+
+        # Update status
+        self.status_var.set(
+            f"SMARTS filter applied: {len(matching_spectra)} spectra remaining"
+        )
+
+        messagebox.showinfo(
+            "Filter Applied",
+            f"SMARTS filter applied successfully.\n{len(matching_spectra)} spectra remain.",
+        )
 
     def show_about(self):
         """Show about dialog."""
