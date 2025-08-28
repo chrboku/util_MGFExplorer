@@ -14,6 +14,9 @@ class Spectrum:
         self.spectrum_id = spectrum_id
         self.metadata: Dict[str, str] = {}
         self.ions: np.ndarray = np.array([])  # 2D array: [mz, intensity]
+        self.fragment_annotations: Dict[
+            int, List[Dict[str, Any]]
+        ] = {}  # {ion_index: [annotation_dict]}
 
     def add_metadata(self, key: str, value: str):
         """Add metadata key-value pair, handling duplicate keys."""
@@ -45,6 +48,32 @@ class Spectrum:
         """Rename a metadata key."""
         if old_key in self.metadata and new_key not in self.metadata:
             self.metadata[new_key] = self.metadata.pop(old_key)
+
+    def add_fragment_annotation(
+        self,
+        ion_index: int,
+        formula: str,
+        ppm_error: float,
+        additional_info: Dict[str, Any] = None,
+    ):
+        """Add a fragment annotation for a specific ion."""
+        if ion_index not in self.fragment_annotations:
+            self.fragment_annotations[ion_index] = []
+
+        annotation = {
+            "formula": formula,
+            "ppm_error": ppm_error,
+            **(additional_info or {}),
+        }
+        self.fragment_annotations[ion_index].append(annotation)
+
+    def get_fragment_annotations(self, ion_index: int) -> List[Dict[str, Any]]:
+        """Get fragment annotations for a specific ion."""
+        return self.fragment_annotations.get(ion_index, [])
+
+    def clear_fragment_annotations(self):
+        """Clear all fragment annotations."""
+        self.fragment_annotations.clear()
 
 
 class MGFParser:

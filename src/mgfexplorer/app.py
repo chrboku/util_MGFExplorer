@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
 import numpy as np
+from typing import List
 from .mgf_parser import MGFParser, Spectrum
 from .gui_components import (
     SpectrumTreeView,
@@ -15,7 +16,10 @@ from .gui_components import (
     CosineSimilarityVisualization,
     FileLoadingDialog,
     SmartsFilterDialog,
+    FragmentAnnotationDialog,
+    ProgressDialog,
 )
+from .molecular_formula import FragmentAnnotator, MolecularFormula
 
 # Try to import tkinterdnd2 for drag and drop support
 try:
@@ -158,6 +162,13 @@ class MGFExplorerApp:
         menubar.add_cascade(label="Filter", menu=filter_menu)
         filter_menu.add_command(
             label="SMARTS Substructure Filter...", command=self._open_smarts_filter
+        )
+
+        # Fragment annotation menu
+        fragment_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Fragment annotation", menu=fragment_menu)
+        fragment_menu.add_command(
+            label="Generate subformulas", command=self._generate_subformulas
         )
 
         # View menu
@@ -446,6 +457,9 @@ class MGFExplorerApp:
         self.similarity_viz = CosineSimilarityVisualization(similarity_frame)
         self.similarity_viz.pack(fill="both", expand=True)
 
+        # Set up communication between ion table and spectrum visualization
+        self.ion_table.set_spectrum_viz_callback(self._on_ion_selection_changed)
+
         # Status bar
         self.status_var = tk.StringVar()
         self.status_var.set("Ready - Open an MGF file to get started")
@@ -611,6 +625,13 @@ class MGFExplorerApp:
             self.ion_table.load_data(self.parser, selected_ids)
             self.spectrum_viz.load_data(self.parser, selected_ids)
             self.similarity_viz.load_data(self.parser, selected_ids)
+
+    def _on_ion_selection_changed(
+        self, spectrum_id: int, selected_ion_indices: List[int]
+    ):
+        """Handle ion selection changes in the ion data table."""
+        if self.spectrum_viz:
+            self.spectrum_viz.highlight_ions(spectrum_id, selected_ion_indices)
 
     def _add_new_key_value(self):
         """Add a new key-value pair via the Edit menu."""
@@ -1345,6 +1366,167 @@ class MGFExplorerApp:
             "Filter Applied",
             f"SMARTS filter applied successfully.\n{len(matching_spectra)} spectra remain.",
         )
+
+    def _generate_subformulas(self):
+        """Open fragment annotation dialog and generate subformulas."""
+        if not self.parser.spectra:
+            messagebox.showwarning(
+                "No Data", "Please load MGF data before generating subformulas."
+            )
+            return
+
+        # Open fragment annotation dialog
+        dialog = FragmentAnnotationDialog(self.root)
+        config = dialog.show()
+
+        if config is None:  # User cancelled
+            return
+
+        # Count spectra with formulas first
+        spectra_with_formulas = []
+        for spectrum in self.parser.spectra:
+            formula = self._extract_formula_from_spectrum(
+                spectrum, config["formula_tags"]
+            )
+            if formula:
+                spectra_with_formulas.append((spectrum, formula))
+
+        if not spectra_with_formulas:
+            messagebox.showwarning(
+                "No Formulas Found",
+                "No molecular formulas found in the specified metadata tags.\n"
+                f"Searched tags: {', '.join(config['formula_tags'])}",
+            )
+            return
+
+        # Show progress dialog
+        progress_dialog = ProgressDialog(
+            self.root,
+            title="Fragment Annotation",
+            message="Generating subformulas for fragments...",
+        )
+        progress_dialog.show(max_value=len(spectra_with_formulas))
+
+        try:
+            processed_count = 0
+
+            for spectrum, formula in spectra_with_formulas:
+                # Check if cancelled
+                if progress_dialog.is_cancelled():
+                    break
+
+                # Clear existing annotations
+                spectrum.clear_fragment_annotations()
+
+                # Update progress
+                progress_dialog.update_progress(
+                    processed_count,
+                    f"Processing spectrum {processed_count + 1}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
+                )
+
+                # Create fragment annotator
+                annotator = FragmentAnnotator(
+                    precursor_formula=formula,
+                    additional_elements=config["additional_elements"],
+                    ppm_tolerance=config["ppm_tolerance"],
+                )
+
+                # Annotate each ion
+                for ion_index, (mz, intensity) in enumerate(spectrum.ions):
+                    # Check for cancellation during ion processing
+                    if progress_dialog.is_cancelled():
+                        break
+
+                    annotations = annotator.annotate_mz(mz)
+
+                    for annotation in annotations:
+                        spectrum.add_fragment_annotation(
+                            ion_index=ion_index,
+                            formula=annotation["formula"],
+                            ppm_error=annotation["ppm_error"],
+                            additional_info={
+                                "theoretical_mass": annotation["theoretical_mass"],
+                                "charge": annotation["charge"],
+                            },
+                        )
+
+                processed_count += 1
+
+                # Small delay to allow UI updates
+                if processed_count % 5 == 0:
+                    self.root.update()
+
+            # Close progress dialog
+            progress_dialog.close()
+
+            if progress_dialog.is_cancelled():
+                self.status_var.set("Subformula generation cancelled")
+                messagebox.showinfo(
+                    "Cancelled", "Fragment annotation was cancelled by user."
+                )
+                return
+
+            # Refresh the ion data table if there are selected spectra
+            if (
+                hasattr(self, "ion_table")
+                and self.spectrum_tree.get_selected_spectrum_ids()
+            ):
+                selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+                self.ion_table.load_data(self.parser, selected_ids)
+
+            self.status_var.set(
+                f"Subformula generation completed for {processed_count} spectra"
+            )
+            messagebox.showinfo(
+                "Annotation Complete",
+                f"Fragment annotation completed successfully.\n"
+                f"Processed {processed_count} spectra with molecular formulas.",
+            )
+
+        except Exception as e:
+            progress_dialog.close()
+            messagebox.showerror(
+                "Annotation Error", f"Failed to generate subformulas:\n{str(e)}"
+            )
+            self.status_var.set("Subformula generation failed")
+
+    def _extract_formula_from_spectrum(
+        self, spectrum: Spectrum, formula_tags: List[str]
+    ) -> str:
+        """Extract molecular formula from spectrum metadata."""
+        for tag in formula_tags:
+            value = spectrum.get_metadata_value(tag)
+            if value:
+                # Try to extract formula from various formats
+                formula = self._parse_formula_from_value(value)
+                if formula:
+                    return formula
+        return ""
+
+    def _parse_formula_from_value(self, value: str) -> str:
+        """Parse molecular formula from metadata value."""
+        # Remove common prefixes and clean up
+        value = value.strip()
+
+        # Handle SMILES format - try to convert to molecular formula
+        if any(char in value for char in ["[", "]", "=", "#", "(", ")", "+"]):
+            # This might be SMILES, try to extract formula using basic pattern matching
+            # For now, skip SMILES conversion and look for explicit formulas
+            return ""
+
+        # Look for molecular formula pattern (letters followed by optional numbers)
+        import re
+
+        formula_pattern = r"^([A-Z][a-z]?\d*)+$"
+        if re.match(formula_pattern, value):
+            return value
+
+        # Try to extract formula from longer strings
+        formula_match = re.search(r"([A-Z][a-z]?\d*)+", value)
+        if formula_match:
+            return formula_match.group()
+
+        return ""
 
     def show_about(self):
         """Show about dialog."""

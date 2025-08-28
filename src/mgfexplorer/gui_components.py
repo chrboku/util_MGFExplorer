@@ -17,7 +17,7 @@ from .mgf_parser import MGFParser, Spectrum
 # RDKit imports for SMILES plotting
 try:
     from rdkit import Chem
-    from rdkit.Chem import Draw
+    from rdkit.Chem import Draw, rdMolDescriptors
     from rdkit.Chem.Draw import rdMolDraw2D
 
     RDKIT_AVAILABLE = True
@@ -911,18 +911,6 @@ class MetadataEditor(ttk.Frame):
         instructions_frame = ttk.Frame(self)
         instructions_frame.pack(fill="x", padx=5, pady=5)
 
-        instructions_text = (
-            "Double-click on Key or Value cells to edit. Press Enter to save, Escape to cancel.\n"
-            "Right-click on Value cells to select all spectra with that value (including empty values).\n"
-            "SMILES structures are displayed when available and consistent across selected spectra."
-        )
-        ttk.Label(
-            instructions_frame,
-            text=instructions_text,
-            font=("Arial", 9),
-            foreground="gray",
-        ).pack()
-
         # Bind selection and editing events
         self.metadata_tree.bind("<<TreeviewSelect>>", self._on_metadata_selection)
         self.metadata_tree.bind("<Double-1>", self._on_double_click)
@@ -1015,6 +1003,9 @@ class MetadataEditor(ttk.Frame):
                 self._show_smiles_message(f"Invalid SMILES code:\n{smiles_code}")
                 return
 
+            # Get molecular formula from RDKit
+            molecular_formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
+
             # Generate 2D coordinates
             from rdkit.Chem import rdDepictor
 
@@ -1039,8 +1030,11 @@ class MetadataEditor(ttk.Frame):
             ax = self.smiles_fig.add_subplot(111)
             ax.imshow(img)
             ax.axis("off")
+
+            # Create title with SMILES and formula
+            title_text = f"SMILES: {smiles_code[:30]}{'...' if len(smiles_code) > 30 else ''}\nFormula: {molecular_formula}"
             ax.set_title(
-                f"SMILES: {smiles_code[:30]}{'...' if len(smiles_code) > 30 else ''}",
+                title_text,
                 fontsize=8,
                 pad=10,
             )
@@ -2017,6 +2011,7 @@ class SpectrumVisualization(ttk.Frame):
         super().__init__(parent)
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []
+        self.highlighted_ions: Dict[int, List[int]] = {}  # {spectrum_id: [ion_indices]}
 
         self._create_widgets()
 
@@ -2039,7 +2034,13 @@ class SpectrumVisualization(ttk.Frame):
         """Load and visualize selected spectra."""
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
+        self.highlighted_ions = {}  # Clear highlighted ions when loading new data
         self._plot_spectra()
+
+    def highlight_ions(self, spectrum_id: int, ion_indices: List[int]):
+        """Highlight specific ions in the spectrum visualization."""
+        self.highlighted_ions[spectrum_id] = ion_indices
+        self._plot_spectra()  # Replot to show highlights
 
     def _plot_spectra(self):
         """Plot the selected spectra."""
@@ -2143,8 +2144,47 @@ class SpectrumVisualization(ttk.Frame):
         mz_values = spectrum.ions[:, 0]
         intensity_values = spectrum.ions[:, 1]
 
-        # Create stick plot
-        ax.vlines(mz_values, 0, intensity_values, colors="blue", linewidth=1.5)
+        # Get highlighted ions for this spectrum
+        highlighted_indices = self.highlighted_ions.get(spectrum.spectrum_id, [])
+
+        # Create stick plot with different colors for highlighted vs normal ions
+        for i, (mz, intensity) in enumerate(zip(mz_values, intensity_values)):
+            color = "green" if i in highlighted_indices else "blue"
+            linewidth = 2.0 if i in highlighted_indices else 1.5
+            ax.vlines(mz, 0, intensity, colors=color, linewidth=linewidth)
+
+        # Add precursor mass line if available
+        precursor_mass = self._get_precursor_mass_from_spectrum(spectrum)
+        if precursor_mass is not None:
+            # Check if precursor mass is within the current plot range
+            x_min, x_max = ax.get_xlim()
+            if mz_limits:
+                x_min, x_max = mz_limits
+            elif len(mz_values) > 0:
+                x_min = mz_values.min() * 0.95
+                x_max = mz_values.max() * 1.05
+
+            if x_min <= precursor_mass <= x_max:
+                y_max = intensity_values.max() if len(intensity_values) > 0 else 1
+                ax.axvline(
+                    precursor_mass,
+                    color="grey",
+                    linestyle="--",
+                    linewidth=1.5,
+                    alpha=0.7,
+                    label=f"Precursor: {precursor_mass:.4f}",
+                )
+                # Add a small text label at the top
+                ax.text(
+                    precursor_mass,
+                    y_max * 1.05,
+                    f"M: {precursor_mass:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="grey",
+                    rotation=90,
+                )
 
         # Only show x-axis label and ticks on the last spectrum
         if is_last:
@@ -2170,6 +2210,28 @@ class SpectrumVisualization(ttk.Frame):
         # Set y limits
         if len(intensity_values) > 0:
             ax.set_ylim(0, intensity_values.max() * 1.1)
+
+    def _get_precursor_mass_from_spectrum(self, spectrum):
+        """Extract precursor mass from spectrum metadata."""
+        # Common precursor mass key names to check
+        mass_keys = [
+            "pepmass",
+            "PEPMASS",
+            "precursor_mass",
+            "PRECURSOR_MASS",
+            "precursormass",
+        ]
+
+        for key in mass_keys:
+            value = spectrum.get_metadata_value(key)
+            if value:
+                try:
+                    # Handle different formats like "123.456" or "123.456 2" (mass and charge)
+                    mass_str = value.strip().split()[0]  # Take first part (mass)
+                    return float(mass_str)
+                except (ValueError, IndexError):
+                    continue
+        return None
 
     def clear_plot(self):
         """Clear the plot and reset to empty state."""
@@ -2212,6 +2274,8 @@ class IonDataTable(ttk.Frame):
         super().__init__(parent)
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []
+        self.spectrum_viz_callback = None  # Callback to update spectrum visualization
+        self.table_data = {}  # Store data for sorting: {tab_id: [(ion_index, mz, intensity, annotations), ...]}
 
         self._create_widgets()
 
@@ -2226,6 +2290,10 @@ class IonDataTable(ttk.Frame):
         # Notebook for multiple spectra
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def set_spectrum_viz_callback(self, callback):
+        """Set callback function to update spectrum visualization when ions are selected."""
+        self.spectrum_viz_callback = callback
 
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load ion data for selected spectra."""
@@ -2256,15 +2324,53 @@ class IonDataTable(ttk.Frame):
         """Create a table tab for a single spectrum."""
         # Create frame for this spectrum
         frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text=f"S {spectrum.spectrum_id}")
+        tab_text = f"S {spectrum.spectrum_id}"
+        self.notebook.add(frame, text=tab_text)
 
-        # Create treeview
-        columns = ("Index", "m/z", "Intensity")
-        tree = ttk.Treeview(frame, columns=columns, show="headings", height=15)
+        # Create treeview with additional columns for annotations
+        columns = ("Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations")
+        tree = ttk.Treeview(
+            frame, columns=columns, show="headings", height=15, selectmode="extended"
+        )
 
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=100)
+        # Configure columns with sorting callbacks
+        tree.heading(
+            "Index",
+            text="Index ↕",
+            command=lambda: self._sort_table(tree, spectrum, "Index"),
+        )
+        tree.column("Index", width=80)
+
+        tree.heading(
+            "m/z", text="m/z ↕", command=lambda: self._sort_table(tree, spectrum, "m/z")
+        )
+        tree.column("m/z", width=120)
+
+        tree.heading(
+            "Intensity",
+            text="Intensity ↕",
+            command=lambda: self._sort_table(tree, spectrum, "Intensity"),
+        )
+        tree.column("Intensity", width=120)
+
+        tree.heading(
+            "Rel. Intensity %",
+            text="Rel. Intensity % ↕",
+            command=lambda: self._sort_table(tree, spectrum, "Rel. Intensity %"),
+        )
+        tree.column("Rel. Intensity %", width=120)
+
+        tree.heading(
+            "Annotations",
+            text="Annotations (Formula [ppm]) ↕",
+            command=lambda: self._sort_table(tree, spectrum, "Annotations"),
+        )
+        tree.column("Annotations", width=300)
+
+        # Bind selection event
+        tree.bind(
+            "<<TreeviewSelect>>", lambda event: self._on_ion_selection(event, spectrum)
+        )
 
         # Add scrollbars
         v_scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
@@ -2279,10 +2385,211 @@ class IonDataTable(ttk.Frame):
         frame.grid_rowconfigure(0, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
-        # Populate with ion data
-        if spectrum.ions.size > 0:
-            for i, (mz, intensity) in enumerate(spectrum.ions):
-                tree.insert("", "end", values=(i + 1, f"{mz:.6f}", f"{intensity:.3f}"))
+        # Store reference to tree for later access
+        frame.tree = tree
+        frame.spectrum = spectrum
+
+        # Populate with ion data and store for sorting
+        self._populate_table_data(tree, spectrum)
+
+        # Populate with ion data and store for sorting
+        self._populate_table_data(tree, spectrum)
+
+    def _populate_table_data(self, tree, spectrum):
+        """Populate table with ion data and store for sorting."""
+        # Clear existing items
+        for item in tree.get_children():
+            tree.delete(item)
+
+        if spectrum.ions.size == 0:
+            return
+
+        # Get precursor mass for comparison
+        precursor_mass = self._get_precursor_mass(spectrum)
+
+        # Calculate total intensity for relative percentage calculation
+        total_intensity = (
+            float(spectrum.ions[:, 1].sum()) if spectrum.ions.size > 0 else 1.0
+        )
+
+        # Store data for this table
+        table_id = id(tree)
+        self.table_data[table_id] = []
+
+        for i, (mz, intensity) in enumerate(spectrum.ions):
+            # Calculate relative intensity percentage
+            rel_intensity_percent = (intensity / total_intensity) * 100.0
+
+            # Get fragment annotations for this ion
+            annotations = spectrum.get_fragment_annotations(i)
+
+            # Format annotations (sorted by ppm error)
+            annotation_text = ""
+            if annotations:
+                # Sort by ppm error
+                sorted_annotations = sorted(annotations, key=lambda x: x["ppm_error"])
+                annotation_strings = []
+                for ann in sorted_annotations[:3]:  # Show only top 3 matches
+                    annotation_strings.append(
+                        f"{ann['formula']} [{ann['ppm_error']:.1f}]"
+                    )
+                annotation_text = "; ".join(annotation_strings)
+                if len(annotations) > 3:
+                    annotation_text += f" (+{len(annotations) - 3} more)"
+
+            # Check if this fragment is close to precursor mass
+            precursor_indicator = ""
+            if precursor_mass and abs(mz - precursor_mass) < 0.1:  # Within 0.1 Da
+                precursor_indicator = " [M+H]+"
+            elif (
+                precursor_mass and abs(mz - (precursor_mass - 1.007825)) < 0.1
+            ):  # M+ (no proton)
+                precursor_indicator = " [M]+"
+
+            # Format m/z with precursor indicator
+            mz_text = f"{mz:.6f}{precursor_indicator}"
+
+            # Store raw data for sorting
+            self.table_data[table_id].append(
+                {
+                    "ion_index": i,
+                    "index_display": i + 1,
+                    "mz_value": mz,
+                    "mz_display": mz_text,
+                    "intensity": intensity,
+                    "intensity_display": f"{intensity:.3f}",
+                    "rel_intensity_percent": rel_intensity_percent,
+                    "rel_intensity_display": f"{rel_intensity_percent:.2f}%",
+                    "annotations": annotation_text,
+                    "precursor_indicator": precursor_indicator,
+                }
+            )
+
+            # Insert into tree
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    i + 1,
+                    mz_text,
+                    f"{intensity:.3f}",
+                    f"{rel_intensity_percent:.2f}%",
+                    annotation_text,
+                ),
+                tags=(f"ion_{i}",),  # Tag with ion index for highlighting
+            )
+
+    def _sort_table(self, tree, spectrum, column):
+        """Sort table by the specified column."""
+        table_id = id(tree)
+        if table_id not in self.table_data:
+            return
+
+        data = self.table_data[table_id]
+
+        # Determine sort key based on column
+        if column == "Index":
+            sort_key = lambda x: x["index_display"]
+        elif column == "m/z":
+            sort_key = lambda x: x["mz_value"]
+        elif column == "Intensity":
+            sort_key = lambda x: x["intensity"]
+        elif column == "Rel. Intensity %":
+            sort_key = lambda x: x["rel_intensity_percent"]
+        elif column == "Annotations":
+            sort_key = lambda x: x["annotations"]
+        else:
+            return
+
+        # Check current sort direction (stored as attribute on tree)
+        current_sort = getattr(tree, "_sort_column", None)
+        reverse = False
+        if current_sort == column:
+            reverse = not getattr(tree, "_sort_reverse", False)
+
+        # Store sort state
+        tree._sort_column = column
+        tree._sort_reverse = reverse
+
+        # Sort data
+        data.sort(key=sort_key, reverse=reverse)
+
+        # Update column headers to show sort direction
+        for col in ["Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations"]:
+            if col == column:
+                direction = "↓" if reverse else "↑"
+                if col == "Annotations":
+                    tree.heading(col, text=f"Annotations (Formula [ppm]) {direction}")
+                elif col == "Rel. Intensity %":
+                    tree.heading(col, text=f"Rel. Intensity % {direction}")
+                else:
+                    tree.heading(col, text=f"{col} {direction}")
+            else:
+                if col == "Annotations":
+                    tree.heading(col, text="Annotations (Formula [ppm]) ↕")
+                elif col == "Rel. Intensity %":
+                    tree.heading(col, text="Rel. Intensity % ↕")
+                else:
+                    tree.heading(col, text=f"{col} ↕")
+                    tree.heading(col, text=f"{col} ↕")
+
+        # Clear and repopulate tree
+        for item in tree.get_children():
+            tree.delete(item)
+
+        for row_data in data:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    row_data["index_display"],
+                    row_data["mz_display"],
+                    row_data["intensity_display"],
+                    row_data["rel_intensity_display"],
+                    row_data["annotations"],
+                ),
+                tags=(f"ion_{row_data['ion_index']}",),
+            )
+
+    def _on_ion_selection(self, event, spectrum):
+        """Handle ion selection in the table."""
+        tree = event.widget
+        selected_items = tree.selection()
+
+        # Extract ion indices from selected items
+        selected_ion_indices = []
+        for item in selected_items:
+            tags = tree.item(item)["tags"]
+            for tag in tags:
+                if tag.startswith("ion_"):
+                    ion_index = int(tag.split("_")[1])
+                    selected_ion_indices.append(ion_index)
+
+        # Update spectrum visualization if callback is set
+        if self.spectrum_viz_callback:
+            self.spectrum_viz_callback(spectrum.spectrum_id, selected_ion_indices)
+
+    def _get_precursor_mass(self, spectrum):
+        """Extract precursor mass from spectrum metadata."""
+        # Common precursor mass key names to check
+        mass_keys = [
+            "pepmass",
+            "PEPMASS",
+            "precursor_mass",
+            "PRECURSOR_MASS",
+            "precursormass",
+        ]
+
+        for key in mass_keys:
+            value = spectrum.get_metadata_value(key)
+            if value:
+                try:
+                    # Handle different formats like "123.456" or "123.456 2" (mass and charge)
+                    mass_str = value.strip().split()[0]  # Take first part (mass)
+                    return float(mass_str)
+                except (ValueError, IndexError):
+                    continue
+        return None
 
     def clear_data(self):
         """Clear all data from the tables."""
@@ -3855,3 +4162,280 @@ class SmartsFilterDialog:
     def _cancel(self):
         """Cancel the dialog."""
         self.dialog.destroy()
+
+
+class FragmentAnnotationDialog:
+    """Dialog for configuring fragment annotation parameters."""
+
+    def __init__(self, parent, callback=None):
+        self.parent = parent
+        self.callback = callback
+        self.dialog = None
+        self.result = None
+
+    def show(self):
+        """Show the fragment annotation dialog."""
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Fragment Annotation - Generate Subformulas")
+        self.dialog.geometry("500x550")
+        self.dialog.resizable(True, True)
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+
+        # Center the dialog
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (550 // 2)
+        self.dialog.geometry(f"500x550+{x}+{y}")
+
+        self._create_widgets()
+
+        # Wait for dialog to close
+        self.dialog.wait_window()
+        return self.result
+
+    def _create_widgets(self):
+        """Create the dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="Fragment Annotation Configuration",
+            font=("Arial", 12, "bold"),
+        )
+        title_label.pack(pady=(0, 15))
+
+        # Formula tag order section
+        formula_frame = ttk.LabelFrame(main_frame, text="Formula Tag Order", padding=10)
+        formula_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(
+            formula_frame,
+            text="Specify the order of metadata tags to search for molecular formulas:",
+        ).pack(anchor="w")
+
+        self.formula_tags_var = tk.StringVar(value="formula, FORMULA, smiles, SMILES")
+        formula_entry = ttk.Entry(
+            formula_frame, textvariable=self.formula_tags_var, width=60
+        )
+        formula_entry.pack(fill="x", pady=(5, 0))
+
+        ttk.Label(
+            formula_frame,
+            text="(Comma-separated list, will try in order until a formula is found)",
+            font=("Arial", 8),
+            foreground="gray",
+        ).pack(anchor="w")
+
+        # PPM tolerance section
+        ppm_frame = ttk.LabelFrame(main_frame, text="Mass Tolerance", padding=10)
+        ppm_frame.pack(fill="x", pady=(0, 10))
+
+        ppm_label_frame = ttk.Frame(ppm_frame)
+        ppm_label_frame.pack(fill="x")
+
+        ttk.Label(ppm_label_frame, text="PPM deviation:").pack(side="left")
+        self.ppm_var = tk.StringVar(value="50")
+        ppm_spinbox = ttk.Spinbox(
+            ppm_label_frame, from_=1, to=1000, textvariable=self.ppm_var, width=10
+        )
+        ppm_spinbox.pack(side="left", padx=(10, 0))
+
+        # Additional elements section
+        elements_frame = ttk.LabelFrame(
+            main_frame, text="Additional Elements", padding=10
+        )
+        elements_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(
+            elements_frame,
+            text="Additional elements that might be added during fragmentation:",
+        ).pack(anchor="w")
+
+        # Common additional elements with checkboxes
+        self.additional_elements = {}
+        elements_grid = ttk.Frame(elements_frame)
+        elements_grid.pack(fill="x", pady=(5, 0))
+
+        common_elements = [
+            ("H", "Hydrogen"),
+            ("O", "Oxygen"),
+            ("Na", "Sodium"),
+            ("K", "Potassium"),
+            ("NH3", "Ammonia"),
+            ("H2O", "Water"),
+        ]
+
+        row = 0
+        col = 0
+        for element, description in common_elements:
+            var = tk.BooleanVar()
+            self.additional_elements[element] = var
+            cb = ttk.Checkbutton(
+                elements_grid, text=f"{element} ({description})", variable=var
+            )
+            cb.grid(row=row, column=col, sticky="w", padx=(0, 20))
+            col += 1
+            if col > 1:
+                col = 0
+                row += 1
+
+        # Custom additional elements
+        custom_frame = ttk.Frame(elements_frame)
+        custom_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(custom_frame, text="Custom elements (comma-separated):").pack(
+            anchor="w"
+        )
+        self.custom_elements_var = tk.StringVar()
+        custom_entry = ttk.Entry(
+            custom_frame, textvariable=self.custom_elements_var, width=60
+        )
+        custom_entry.pack(fill="x", pady=(5, 0))
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(20, 0))
+
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
+            side="right", padx=(10, 0)
+        )
+        ttk.Button(button_frame, text="OK", command=self._ok).pack(side="right")
+
+    def _ok(self):
+        """Handle OK button click."""
+        try:
+            # Validate PPM value
+            ppm_value = float(self.ppm_var.get())
+            if ppm_value <= 0:
+                raise ValueError("PPM deviation must be positive")
+
+            # Parse formula tags
+            formula_tags = [
+                tag.strip()
+                for tag in self.formula_tags_var.get().split(",")
+                if tag.strip()
+            ]
+            if not formula_tags:
+                raise ValueError("At least one formula tag must be specified")
+
+            # Get selected additional elements
+            selected_elements = []
+            for element, var in self.additional_elements.items():
+                if var.get():
+                    selected_elements.append(element)
+
+            # Add custom elements
+            custom_elements = [
+                elem.strip()
+                for elem in self.custom_elements_var.get().split(",")
+                if elem.strip()
+            ]
+            selected_elements.extend(custom_elements)
+
+            # Prepare result
+            self.result = {
+                "formula_tags": formula_tags,
+                "ppm_tolerance": ppm_value,
+                "additional_elements": selected_elements,
+            }
+
+            self.dialog.destroy()
+
+        except ValueError as e:
+            messagebox.showerror("Invalid Input", str(e))
+
+    def _cancel(self):
+        """Handle Cancel button click."""
+        self.result = None
+        self.dialog.destroy()
+
+
+class ProgressDialog:
+    """Dialog for showing progress during long-running operations."""
+
+    def __init__(self, parent, title="Processing...", message="Please wait..."):
+        self.parent = parent
+        self.title = title
+        self.message = message
+        self.dialog = None
+        self.progress_var = None
+        self.progress_bar = None
+        self.status_label = None
+        self.cancelled = False
+
+    def show(self, max_value=100):
+        """Show the progress dialog."""
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title(self.title)
+        self.dialog.geometry("400x220")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+
+        # Center the dialog
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (400 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (220 // 2)
+        self.dialog.geometry(f"400x220+{x}+{y}")
+
+        # Prevent closing with X button
+        self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._create_widgets(max_value)
+
+    def _create_widgets(self, max_value):
+        """Create the progress dialog widgets."""
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill="both", expand=True)
+
+        # Message label
+        message_label = ttk.Label(main_frame, text=self.message, font=("Arial", 10))
+        message_label.pack(pady=(0, 15))
+
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(
+            main_frame,
+            variable=self.progress_var,
+            maximum=max_value,
+            length=350,
+            mode="determinate",
+        )
+        self.progress_bar.pack(pady=(0, 10))
+
+        # Status label
+        self.status_label = ttk.Label(main_frame, text="Starting...", font=("Arial", 9))
+        self.status_label.pack(pady=(0, 15))
+
+        # Cancel button
+        cancel_button = ttk.Button(main_frame, text="Cancel", command=self._cancel)
+        cancel_button.pack()
+
+    def update_progress(self, value, status_text=""):
+        """Update the progress bar and status text."""
+        if self.dialog and self.progress_var:
+            self.progress_var.set(value)
+            if status_text and self.status_label:
+                self.status_label.config(text=status_text)
+            self.dialog.update()
+
+    def _cancel(self):
+        """Handle cancel button click."""
+        self.cancelled = True
+
+    def _on_close(self):
+        """Handle dialog close attempt."""
+        self.cancelled = True
+
+    def close(self):
+        """Close the progress dialog."""
+        if self.dialog:
+            self.dialog.destroy()
+            self.dialog = None
+
+    def is_cancelled(self):
+        """Check if the operation was cancelled."""
+        return self.cancelled
