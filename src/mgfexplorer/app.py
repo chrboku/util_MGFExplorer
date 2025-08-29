@@ -23,11 +23,8 @@ from .gui_components import (
 from .molecular_formula import (
     FragmentAnnotator,
     MolecularFormula,
-    get_cache_stats,
-    clear_formula_cache,
-    get_cache_info,
-    force_save_cache,
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Try to import tkinterdnd2 for drag and drop support
 try:
@@ -180,10 +177,6 @@ class MGFExplorerApp:
         fragment_menu.add_command(
             label="Generate subformulas", command=self._generate_subformulas
         )
-        fragment_menu.add_separator()
-        fragment_menu.add_command(label="Cache info", command=self._show_cache_info)
-        fragment_menu.add_command(label="Save cache", command=self._save_cache)
-        fragment_menu.add_command(label="Clear cache", command=self._clear_cache)
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -1413,11 +1406,14 @@ class MGFExplorerApp:
             )
             return
 
+        # Use max_workers from dialog configuration
+        max_workers = config.get("max_workers", min(32, (os.cpu_count() or 1) + 2))
+
         # Show progress dialog
         progress_dialog = ProgressDialog(
             self.root,
             title="Fragment Annotation",
-            message="Generating subformulas for fragments...",
+            message=f"Generating subformulas for fragments ({max_workers} threads)...",
         )
         progress_dialog.show(max_value=len(spectra_with_formulas))
 
@@ -1426,71 +1422,112 @@ class MGFExplorerApp:
             # Collect all annotation data for the plot
             all_annotations = []
 
-            for spectrum, formula in spectra_with_formulas:
-                # Check if cancelled
-                if progress_dialog.is_cancelled():
-                    break
-
-                # Clear existing annotations
+            # Clear existing annotations up front (so workers don't need to modify shared state)
+            for spectrum, _ in spectra_with_formulas:
                 spectrum.clear_fragment_annotations()
 
-                # Update progress
-                progress_dialog.update_progress(
-                    processed_count,
-                    f"Processing spectrum {processed_count + 1}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
-                )
-                print(
-                    f"\n\nProcessing spectrum {processed_count + 1}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
-                )
+            # Map spectrum_id -> spectrum object for applying results in main thread
+            id_to_spectrum = {s.spectrum_id: s for s, _ in spectra_with_formulas}
 
-                # Annotate each ion
-                for ion_index, (mz, intensity) in enumerate(spectrum.ions):
-                    # Check for cancellation during ion processing
-                    if progress_dialog.is_cancelled():
-                        break
+            # Prepare worker inputs
+            worker_inputs = []
+            for spectrum, formula in spectra_with_formulas:
+                # Convert ions to a plain Python list to avoid accidental numpy/GIL issues in threads
+                ions_list = [tuple(x) for x in spectrum.ions]
+                worker_inputs.append((spectrum.spectrum_id, ions_list, formula))
 
-                    # Calculate PPM tolerance for this specific m/z using custom function if available
+            def _annotate_worker(spectrum_id, ions_list, formula):
+                """Worker function: compute annotations for one spectrum (no GUI / shared-state mutations)."""
+                results = []  # list of per-annotation dicts
+                annotator = FragmentAnnotator(
+                    precursor_formula=formula,
+                    additional_elements=config["additional_elements"],
+                )
+                annotator.generate_subformulas()
+
+                for ion_index, (mz, intensity) in enumerate(ions_list):
                     ppm_tolerance = self._get_ppm_tolerance_for_mz(mz, config)
-
-                    # Create annotator with specific tolerance for this m/z
-                    ion_annotator = FragmentAnnotator(
-                        precursor_formula=formula,
-                        additional_elements=config["additional_elements"],
-                        ppm_tolerance=ppm_tolerance,
-                    )
-                    print(f"   Annotating mz {mz}, with ppm_tolerance {ppm_tolerance}")
-
-                    annotations = ion_annotator.annotate_mz(mz)
-
+                    annotations = annotator.annotate_mz(mz, ppm_tolerance=ppm_tolerance)
                     for annotation_rank, annotation in enumerate(annotations):
-                        spectrum.add_fragment_annotation(
-                            ion_index=ion_index,
-                            formula=annotation["formula"],
-                            ppm_error=annotation["ppm_error"],
-                            additional_info={
-                                "theoretical_mass": annotation["theoretical_mass"],
-                                "charge": annotation["charge"],
-                            },
-                        )
-
-                        # Collect data for the plot
-                        all_annotations.append(
+                        results.append(
                             {
+                                "ion_index": ion_index,
                                 "mz": mz,
-                                "ppm_error": annotation["ppm_error"],
-                                "formula": annotation["formula"],
-                                "spectrum_id": spectrum.spectrum_id,
                                 "intensity": intensity,
-                                "annotation_rank": annotation_rank,  # 0-based rank
-                                "ppm_tolerance_used": ppm_tolerance,  # Track what tolerance was used
+                                "formula": annotation["formula"],
+                                "ppm_error": annotation["ppm_error"],
+                                "theoretical_mass": annotation.get("theoretical_mass"),
+                                "charge": annotation.get("charge"),
+                                "annotation_rank": annotation_rank,
+                                "ppm_tolerance_used": ppm_tolerance,
                             }
                         )
+                return (spectrum_id, results)
 
-                processed_count += 1
+            processed_count = 0
+            all_annotations = []
 
-                # Small delay to allow UI updates
-                if processed_count % 5 == 0:
-                    self.root.update()
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_id = {
+                    executor.submit(_annotate_worker, spec_id, ions, formula): spec_id
+                    for spec_id, ions, formula in worker_inputs
+                }
+
+                try:
+                    for future in as_completed(future_to_id):
+                        # If user cancelled, stop applying further results
+                        if progress_dialog.is_cancelled():
+                            break
+
+                        spec_id, annotations_for_spectrum = future.result()
+
+                        # Apply annotations in the main thread (modify spectrum objects and GUI-safe operations)
+                        spectrum = id_to_spectrum.get(spec_id)
+                        if spectrum is None:
+                            # Spectrum no longer exists (e.g. deleted) - skip
+                            continue
+
+                        for ann in annotations_for_spectrum:
+                            spectrum.add_fragment_annotation(
+                                ion_index=ann["ion_index"],
+                                formula=ann["formula"],
+                                ppm_error=ann["ppm_error"],
+                                additional_info={
+                                    "theoretical_mass": ann["theoretical_mass"],
+                                    "charge": ann["charge"],
+                                },
+                            )
+
+                            all_annotations.append(
+                                {
+                                    "mz": ann["mz"],
+                                    "ppm_error": ann["ppm_error"],
+                                    "formula": ann["formula"],
+                                    "spectrum_id": spectrum.spectrum_id,
+                                    "intensity": ann["intensity"],
+                                    "annotation_rank": ann["annotation_rank"],
+                                    "ppm_tolerance_used": ann["ppm_tolerance_used"],
+                                }
+                            )
+
+                        # Update progress and UI
+                        processed_count += 1
+                        progress_dialog.update_progress(
+                            processed_count,
+                            f"Processed spectrum {processed_count}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
+                        )
+
+                        # Periodically allow the UI to process events
+                        if processed_count % 5 == 0:
+                            self.root.update()
+
+                finally:
+                    # If cancelled while futures still running, attempt to shut down promptly
+                    if progress_dialog.is_cancelled():
+                        try:
+                            executor.shutdown(wait=False)
+                        except Exception:
+                            pass
 
             # Close progress dialog
             progress_dialog.close()
@@ -1623,89 +1660,6 @@ class MGFExplorerApp:
 
         # Fallback (should not reach here)
         return config["ppm_tolerance"]
-
-    def _show_cache_info(self):
-        """Show information about the molecular formula cache."""
-        try:
-            cache_info = get_cache_info()
-            stats = get_cache_stats()
-
-            # Format pending writes information
-            pending_info = ""
-            if stats["new_entries_pending"] > 0:
-                pending_info = (
-                    f"\nPending writes: {stats['new_entries_pending']} entries "
-                    f"(auto-save at {stats['write_threshold']})"
-                )
-
-            info_message = (
-                f"Molecular Formula Cache Information\n\n"
-                f"Total entries: {stats['total_entries']}\n"
-                f"Cache size: {stats['cache_size_mb']:.1f} MB\n"
-                f"Unsaved changes: {'Yes' if stats['has_unsaved_changes'] else 'No'}{pending_info}\n"
-                f"Cache file: {stats['cache_file']}\n\n"
-                f"The cache stores pre-calculated molecular formulas to speed up "
-                f"fragment annotation. New entries are saved automatically after "
-                f"{stats['write_threshold']} new calculations, or can be saved manually."
-            )
-
-            messagebox.showinfo("Cache Information", info_message)
-
-        except Exception as e:
-            messagebox.showerror(
-                "Cache Error", f"Error getting cache information:\n{str(e)}"
-            )
-
-    def _save_cache(self):
-        """Manually save the molecular formula cache to disk."""
-        try:
-            stats = get_cache_stats()
-
-            if not stats["has_unsaved_changes"]:
-                messagebox.showinfo(
-                    "Cache Saved",
-                    "The cache is already up to date with no unsaved changes.",
-                )
-                return
-
-            force_save_cache()
-            messagebox.showinfo(
-                "Cache Saved",
-                f"Successfully saved {stats['new_entries_pending']} pending entries to disk.",
-            )
-
-        except Exception as e:
-            messagebox.showerror("Cache Error", f"Error saving cache:\n{str(e)}")
-
-    def _clear_cache(self):
-        """Clear the molecular formula cache after user confirmation."""
-        try:
-            stats = get_cache_stats()
-
-            if stats["total_entries"] == 0:
-                messagebox.showinfo(
-                    "Cache Empty", "The molecular formula cache is already empty."
-                )
-                return
-
-            result = messagebox.askyesno(
-                "Clear Cache",
-                f"Are you sure you want to clear the molecular formula cache?\n\n"
-                f"This will remove {stats['total_entries']} cached entries "
-                f"({stats['cache_size_mb']:.1f} MB).\n\n"
-                f"Cached formulas will need to be recalculated when needed.",
-                icon="warning",
-            )
-
-            if result:
-                clear_formula_cache()
-                messagebox.showinfo(
-                    "Cache Cleared",
-                    "The molecular formula cache has been cleared successfully.",
-                )
-
-        except Exception as e:
-            messagebox.showerror("Cache Error", f"Error clearing cache:\n{str(e)}")
 
     def show_about(self):
         """Show about dialog."""

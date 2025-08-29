@@ -4225,7 +4225,7 @@ class FragmentAnnotationDialog:
         """Show the fragment annotation dialog."""
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title("Fragment Annotation - Generate Subformulas")
-        self.dialog.geometry("900x700")
+        self.dialog.geometry("900x800")
         self.dialog.resizable(True, True)
         self.dialog.transient(self.parent)
         self.dialog.grab_set()
@@ -4233,8 +4233,8 @@ class FragmentAnnotationDialog:
         # Center the dialog
         self.dialog.update_idletasks()
         x = (self.dialog.winfo_screenwidth() // 2) - (900 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (700 // 2)
-        self.dialog.geometry(f"900x700+{x}+{y}")
+        y = (self.dialog.winfo_screenheight() // 2) - (800 // 2)
+        self.dialog.geometry(f"900x800+{x}+{y}")
 
         self._create_widgets()
 
@@ -4407,6 +4407,40 @@ class FragmentAnnotationDialog:
         custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_elements_var)
         custom_entry.pack(fill="x", pady=(5, 0))
 
+        # Max workers section
+        workers_frame = ttk.LabelFrame(
+            parent_frame, text="Parallel Processing", padding=10
+        )
+        workers_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(
+            workers_frame,
+            text="Maximum worker threads for parallel processing:",
+            wraplength=300,
+        ).pack(anchor="w")
+
+        workers_input_frame = ttk.Frame(workers_frame)
+        workers_input_frame.pack(fill="x", pady=(5, 0))
+
+        ttk.Label(workers_input_frame, text="Max workers:").pack(side="left")
+        self.max_workers_var = tk.StringVar(value="600")
+        workers_spinbox = ttk.Spinbox(
+            workers_input_frame,
+            from_=1,
+            to=9000,
+            textvariable=self.max_workers_var,
+            width=10,
+        )
+        workers_spinbox.pack(side="left", padx=(10, 0))
+
+        ttk.Label(
+            workers_frame,
+            text="Higher values may speed up processing but use more system resources.\nAllows up to 9000 workers for very large datasets.",
+            font=("Arial", 8),
+            foreground="gray",
+            wraplength=300,
+        ).pack(anchor="w", pady=(5, 0))
+
     def _create_plot_widgets(self, parent_frame):
         """Create the interactive plot widgets on the right side."""
         # Instructions
@@ -4473,7 +4507,7 @@ class FragmentAnnotationDialog:
         # Set initial axis limits
         max_x = self.max_precursor_mz * 1.15  # Add 15% to maximum precursor m/z
         self.ax.set_xlim(0, max_x)
-        self.ax.set_ylim(0, 200)
+        self.ax.set_ylim(0, 55)
 
         # Connect mouse events
         # Use press+release to detect a "real" single click and ignore press-and-hold.
@@ -4731,6 +4765,13 @@ class FragmentAnnotationDialog:
             if ppm_value <= 0:
                 raise ValueError("PPM deviation must be positive")
 
+            # Validate max_workers value
+            max_workers = int(self.max_workers_var.get())
+            if max_workers <= 0:
+                raise ValueError("Max workers must be positive")
+            if max_workers > 9000:
+                raise ValueError("Max workers cannot exceed 9000")
+
             # Parse formula tags
             formula_tags = [
                 tag.strip()
@@ -4760,6 +4801,7 @@ class FragmentAnnotationDialog:
                 "ppm_tolerance": ppm_value,
                 "additional_elements": selected_elements,
                 "ppm_function_points": self.ppm_points.copy(),  # Include the custom function
+                "max_workers": max_workers,
             }
 
             self.dialog.destroy()
