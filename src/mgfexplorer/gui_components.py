@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from typing import List, Dict, Any, Optional
 import re
@@ -2012,6 +2012,8 @@ class SpectrumVisualization(ttk.Frame):
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List[int] = []
         self.highlighted_ions: Dict[int, List[int]] = {}  # {spectrum_id: [ion_indices]}
+        self.axes: List = []  # Track all subplot axes for zoom synchronization
+        self._syncing_zoom = False  # Prevent infinite recursion during sync
 
         self._create_widgets()
 
@@ -2028,7 +2030,13 @@ class SpectrumVisualization(ttk.Frame):
         # Matplotlib figure
         self.figure = Figure(figsize=(8, 6), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, self)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=(5, 0))
+
+        # Add navigation toolbar for zoom/pan functionality
+        toolbar_frame = ttk.Frame(self)
+        toolbar_frame.pack(fill="x", padx=5, pady=(0, 5))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
 
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load and visualize selected spectra."""
@@ -2045,6 +2053,7 @@ class SpectrumVisualization(ttk.Frame):
     def _plot_spectra(self):
         """Plot the selected spectra."""
         self.figure.clear()
+        self.axes = []  # Reset axes list
 
         if not self.parser or not self.selected_spectrum_ids:
             ax = self.figure.add_subplot(111)
@@ -2102,6 +2111,7 @@ class SpectrumVisualization(ttk.Frame):
         n_spectra = len(selected_spectra)
         if n_spectra == 1:
             ax = self.figure.add_subplot(111)
+            self.axes.append(ax)
             self._plot_single_spectrum(
                 ax, selected_spectra[0], (global_mz_min, global_mz_max), is_last=True
             )
@@ -2109,9 +2119,14 @@ class SpectrumVisualization(ttk.Frame):
             for i, spectrum in enumerate(selected_spectra):
                 is_last = i == n_spectra - 1
                 ax = self.figure.add_subplot(n_spectra, 1, i + 1)
+                self.axes.append(ax)
                 self._plot_single_spectrum(
                     ax, spectrum, (global_mz_min, global_mz_max), is_last=is_last
                 )
+
+        # Set up zoom synchronization for multiple spectra
+        if len(self.axes) > 1:
+            self._setup_zoom_synchronization()
 
         # Add performance warning if applicable
         if performance_warning:
@@ -2265,6 +2280,31 @@ class SpectrumVisualization(ttk.Frame):
         self.canvas.draw()
         self.parser = None
         self.selected_spectrum_ids = []
+
+    def _setup_zoom_synchronization(self):
+        """Set up zoom synchronization between all subplot axes."""
+        for ax in self.axes:
+            ax.callbacks.connect("xlim_changed", self._on_xlims_change)
+
+    def _on_xlims_change(self, ax):
+        """Handle x-axis limit changes to synchronize zoom across all subplots."""
+        if self._syncing_zoom:
+            return  # Prevent infinite recursion
+
+        self._syncing_zoom = True
+        try:
+            # Get the new x limits from the changed axis
+            xlims = ax.get_xlim()
+
+            # Apply the same x limits to all other axes
+            for other_ax in self.axes:
+                if other_ax != ax:
+                    other_ax.set_xlim(xlims)
+
+            # Redraw the canvas
+            self.canvas.draw_idle()
+        finally:
+            self._syncing_zoom = False
 
 
 class IonDataTable(ttk.Frame):
@@ -2675,7 +2715,7 @@ class CosineSimilarityVisualization(ttk.Frame):
         # Matplotlib figure for heatmap
         self.figure = Figure(figsize=(6, 4), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, content_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
 
         # Statistics frame
         stats_frame = ttk.LabelFrame(
@@ -4167,32 +4207,70 @@ class SmartsFilterDialog:
 class FragmentAnnotationDialog:
     """Dialog for configuring fragment annotation parameters."""
 
-    def __init__(self, parent, callback=None):
+    def __init__(self, parent, callback=None, spectra=None):
         self.parent = parent
         self.callback = callback
+        self.spectra = spectra or []
         self.dialog = None
         self.result = None
+        # Interactive PPM tolerance function
+        self.ppm_points = []  # List of (mz, ppm) points
+        self.figure = None
+        self.canvas = None
+        self.ax = None
+        self.plot_initialized = False  # Track if plot limits have been set
+        self.max_precursor_mz = self._calculate_max_precursor_mz()
 
     def show(self):
         """Show the fragment annotation dialog."""
         self.dialog = tk.Toplevel(self.parent)
         self.dialog.title("Fragment Annotation - Generate Subformulas")
-        self.dialog.geometry("500x550")
+        self.dialog.geometry("900x700")
         self.dialog.resizable(True, True)
         self.dialog.transient(self.parent)
         self.dialog.grab_set()
 
         # Center the dialog
         self.dialog.update_idletasks()
-        x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (550 // 2)
-        self.dialog.geometry(f"500x550+{x}+{y}")
+        x = (self.dialog.winfo_screenwidth() // 2) - (900 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (700 // 2)
+        self.dialog.geometry(f"900x700+{x}+{y}")
 
         self._create_widgets()
 
         # Wait for dialog to close
         self.dialog.wait_window()
         return self.result
+
+    def _calculate_max_precursor_mz(self):
+        """Calculate the maximum precursor m/z from the spectra."""
+        if not self.spectra:
+            return 1000  # Default fallback value
+
+        max_mz = 0
+        for spectrum in self.spectra:
+            # Try to get precursor m/z from metadata
+            precursor_mz = None
+
+            # Common metadata keys for precursor m/z
+            for key in ["PEPMASS", "pepmass", "precursor_mz", "PRECURSOR_MZ"]:
+                value = spectrum.metadata.get(key)
+                if value:
+                    try:
+                        # PEPMASS might be "123.456 1+" format, so take first part
+                        precursor_mz = float(str(value).split()[0])
+                        break
+                    except (ValueError, IndexError):
+                        continue
+
+            # If not found in metadata, use the highest m/z from ions as approximation
+            if precursor_mz is None and spectrum.ions:
+                precursor_mz = max(ion[0] for ion in spectrum.ions)
+
+            if precursor_mz and precursor_mz > max_mz:
+                max_mz = precursor_mz
+
+        return max_mz if max_mz > 0 else 1000  # Fallback to 1000 if no valid m/z found
 
     def _create_widgets(self):
         """Create the dialog widgets."""
@@ -4207,19 +4285,49 @@ class FragmentAnnotationDialog:
         )
         title_label.pack(pady=(0, 15))
 
+        # Create a paned window to split the dialog
+        paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
+        paned_window.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Left frame for configuration options
+        config_frame = ttk.Frame(paned_window, padding=5)
+        paned_window.add(config_frame, weight=1)
+
+        # Right frame for the interactive plot
+        plot_frame = ttk.Frame(paned_window, padding=5)
+        paned_window.add(plot_frame, weight=2)
+
+        # Configure the left side (configuration options)
+        self._create_config_widgets(config_frame)
+
+        # Configure the right side (interactive plot)
+        self._create_plot_widgets(plot_frame)
+
+        # Buttons at the bottom
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
+            side="right", padx=(10, 0)
+        )
+        ttk.Button(button_frame, text="OK", command=self._ok).pack(side="right")
+
+    def _create_config_widgets(self, parent_frame):
+        """Create the configuration widgets on the left side."""
         # Formula tag order section
-        formula_frame = ttk.LabelFrame(main_frame, text="Formula Tag Order", padding=10)
+        formula_frame = ttk.LabelFrame(
+            parent_frame, text="Formula Tag Order", padding=10
+        )
         formula_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(
             formula_frame,
             text="Specify the order of metadata tags to search for molecular formulas:",
+            wraplength=300,
         ).pack(anchor="w")
 
         self.formula_tags_var = tk.StringVar(value="formula, FORMULA, smiles, SMILES")
-        formula_entry = ttk.Entry(
-            formula_frame, textvariable=self.formula_tags_var, width=60
-        )
+        formula_entry = ttk.Entry(formula_frame, textvariable=self.formula_tags_var)
         formula_entry.pack(fill="x", pady=(5, 0))
 
         ttk.Label(
@@ -4227,31 +4335,41 @@ class FragmentAnnotationDialog:
             text="(Comma-separated list, will try in order until a formula is found)",
             font=("Arial", 8),
             foreground="gray",
+            wraplength=300,
         ).pack(anchor="w")
 
-        # PPM tolerance section
-        ppm_frame = ttk.LabelFrame(main_frame, text="Mass Tolerance", padding=10)
-        ppm_frame.pack(fill="x", pady=(0, 10))
+        # Default PPM tolerance section
+        default_ppm_frame = ttk.LabelFrame(
+            parent_frame, text="Default PPM Tolerance", padding=10
+        )
+        default_ppm_frame.pack(fill="x", pady=(0, 10))
 
-        ppm_label_frame = ttk.Frame(ppm_frame)
-        ppm_label_frame.pack(fill="x")
+        ttk.Label(
+            default_ppm_frame,
+            text="This value is used when no custom function is defined:",
+            wraplength=300,
+        ).pack(anchor="w")
 
-        ttk.Label(ppm_label_frame, text="PPM deviation:").pack(side="left")
+        ppm_input_frame = ttk.Frame(default_ppm_frame)
+        ppm_input_frame.pack(fill="x", pady=(5, 0))
+
+        ttk.Label(ppm_input_frame, text="PPM deviation:").pack(side="left")
         self.ppm_var = tk.StringVar(value="50")
         ppm_spinbox = ttk.Spinbox(
-            ppm_label_frame, from_=1, to=1000, textvariable=self.ppm_var, width=10
+            ppm_input_frame, from_=1, to=1000, textvariable=self.ppm_var, width=10
         )
         ppm_spinbox.pack(side="left", padx=(10, 0))
 
         # Additional elements section
         elements_frame = ttk.LabelFrame(
-            main_frame, text="Additional Elements", padding=10
+            parent_frame, text="Additional Elements", padding=10
         )
         elements_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(
             elements_frame,
             text="Additional elements that might be added during fragmentation:",
+            wraplength=300,
         ).pack(anchor="w")
 
         # Common additional elements with checkboxes
@@ -4269,40 +4387,341 @@ class FragmentAnnotationDialog:
         ]
 
         row = 0
-        col = 0
         for element, description in common_elements:
             var = tk.BooleanVar()
             self.additional_elements[element] = var
             cb = ttk.Checkbutton(
                 elements_grid, text=f"{element} ({description})", variable=var
             )
-            cb.grid(row=row, column=col, sticky="w", padx=(0, 20))
-            col += 1
-            if col > 1:
-                col = 0
-                row += 1
+            cb.grid(row=row, column=0, sticky="w", pady=1)
+            row += 1
 
         # Custom additional elements
         custom_frame = ttk.Frame(elements_frame)
         custom_frame.pack(fill="x", pady=(10, 0))
 
-        ttk.Label(custom_frame, text="Custom elements (comma-separated):").pack(
-            anchor="w"
-        )
+        ttk.Label(
+            custom_frame, text="Custom elements (comma-separated):", wraplength=300
+        ).pack(anchor="w")
         self.custom_elements_var = tk.StringVar()
-        custom_entry = ttk.Entry(
-            custom_frame, textvariable=self.custom_elements_var, width=60
-        )
+        custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_elements_var)
         custom_entry.pack(fill="x", pady=(5, 0))
 
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(20, 0))
-
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
-            side="right", padx=(10, 0)
+    def _create_plot_widgets(self, parent_frame):
+        """Create the interactive plot widgets on the right side."""
+        # Instructions
+        instructions_frame = ttk.LabelFrame(
+            parent_frame, text="Interactive PPM Tolerance Function", padding=5
         )
-        ttk.Button(button_frame, text="OK", command=self._ok).pack(side="right")
+        instructions_frame.pack(fill="x", pady=(0, 10))
+
+        instructions_text = (
+            "Define a custom PPM tolerance function:\n"
+            "• Left-click to add points\n"
+            "• Right-click on points to remove them\n"
+            "• Function interpolates linearly between points\n"
+            "• Constant values outside the range\n"
+            "• Use toolbar below to zoom/pan the plot"
+        )
+        ttk.Label(
+            instructions_frame,
+            text=instructions_text,
+            font=("Arial", 9),
+            justify="left",
+        ).pack(anchor="w")
+
+        # Plot frame
+        plot_container = ttk.Frame(parent_frame)
+        plot_container.pack(fill="both", expand=True)
+
+        # Create matplotlib figure
+        self.figure = Figure(figsize=(8, 5), dpi=80)
+        self.canvas = FigureCanvasTkAgg(self.figure, plot_container)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Add navigation toolbar for zoom/pan functionality
+        toolbar_frame = ttk.Frame(plot_container)
+        toolbar_frame.pack(fill="x")
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+
+        # Initialize the plot
+        self._init_plot()
+
+        # Control buttons
+        controls_frame = ttk.Frame(parent_frame)
+        controls_frame.pack(fill="x", pady=(5, 0))
+
+        ttk.Button(
+            controls_frame, text="Clear All Points", command=self._clear_all_points
+        ).pack(side="left", padx=(0, 5))
+
+        ttk.Button(
+            controls_frame, text="Add Default Points", command=self._add_default_points
+        ).pack(side="left")
+
+    def _init_plot(self):
+        """Initialize the interactive plot."""
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_xlabel("m/z", fontsize=12)
+        self.ax.set_ylabel("PPM Tolerance", fontsize=12)
+        self.ax.set_title(
+            "Interactive PPM Tolerance Function", fontsize=14, fontweight="bold"
+        )
+        self.ax.grid(True, alpha=0.3)
+
+        # Set initial axis limits
+        max_x = self.max_precursor_mz * 1.15  # Add 15% to maximum precursor m/z
+        self.ax.set_xlim(0, max_x)
+        self.ax.set_ylim(0, 200)
+
+        # Connect mouse events
+        # Use press+release to detect a "real" single click and ignore press-and-hold.
+        # Store reference to original handler and replace with a no-op so any direct
+        # bindings to button_press_event (later in this method) won't trigger behavior.
+        self._raw_on_click = self._on_click
+        self._on_click = lambda event: None  # temporarily disable direct press handling
+
+        # State for detecting short clicks
+        self._mouse_press_time = None
+        self._mouse_press_event = None
+        self._click_threshold = 0.35  # seconds - max duration to consider a click
+        self._move_threshold = 5  # pixels - max movement to consider a click
+
+        def _on_mouse_press(event):
+            # Only track presses inside the axes
+            if event.inaxes != self.ax:
+                self._mouse_press_time = None
+                self._mouse_press_event = None
+                return
+            self._mouse_press_time = time.time()
+            self._mouse_press_event = event
+
+        def _on_mouse_release(event):
+            # Only consider releases inside the axes and if we previously recorded a press
+            if self._mouse_press_time is None or event.inaxes != self.ax:
+                self._mouse_press_time = None
+                self._mouse_press_event = None
+                return
+
+            duration = time.time() - self._mouse_press_time
+
+            # Compute movement in display (pixel) coordinates if available
+            try:
+                dx = abs(event.x - self._mouse_press_event.x)
+                dy = abs(event.y - self._mouse_press_event.y)
+            except Exception:
+                dx = dy = 0
+
+            moved = max(dx, dy)
+
+            # Ignore double-click events and long presses or significant movement
+            if getattr(event, "dblclick", False):
+                pass
+            elif duration <= self._click_threshold and moved <= self._move_threshold:
+                # Treat as a single click -> call original handler with the release event
+                try:
+                    self._raw_on_click(event)
+                except Exception:
+                    # Be conservative: swallow exceptions from callback to avoid crashing UI
+                    pass
+
+                # Reset press state
+                self._mouse_press_time = None
+                self._mouse_press_event = None
+
+        # Connect press/release handlers instead of direct press handling
+        self.canvas.mpl_connect("button_press_event", _on_mouse_press)
+        self.canvas.mpl_connect("button_release_event", _on_mouse_release)
+
+        # Mark plot as initialized before the first update
+        self.plot_initialized = True
+
+        # Initial plot update
+        self._update_plot()
+
+    def _on_click(self, event):
+        """Handle mouse clicks on the plot."""
+        if event.inaxes != self.ax:
+            return
+
+        if event.button == 1:  # Left click - add point
+            self._add_point(event.xdata, event.ydata)
+        elif event.button == 3:  # Right click - remove point
+            self._remove_nearest_point(event.xdata, event.ydata)
+
+    def _add_point(self, mz, ppm):
+        """Add a point to the PPM function."""
+        if mz is None or ppm is None:
+            return
+
+        # Ensure positive PPM values
+        ppm = max(1, ppm)
+
+        # Add the point
+        self.ppm_points.append((mz, ppm))
+
+        # Sort points by m/z
+        self.ppm_points.sort(key=lambda x: x[0])
+
+        self._update_plot()
+
+    def _remove_nearest_point(self, mz, ppm):
+        """Remove the nearest point to the click location."""
+        if not self.ppm_points or mz is None or ppm is None:
+            return
+
+        # Find the nearest point
+        min_distance = float("inf")
+        nearest_index = -1
+
+        for i, (point_mz, point_ppm) in enumerate(self.ppm_points):
+            # Calculate distance (normalized by axis ranges)
+            mz_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
+            ppm_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
+
+            normalized_mz_dist = (mz - point_mz) / mz_range
+            normalized_ppm_dist = (ppm - point_ppm) / ppm_range
+
+            distance = (normalized_mz_dist**2 + normalized_ppm_dist**2) ** 0.5
+
+            if distance < min_distance:
+                min_distance = distance
+                nearest_index = i
+
+        # Remove the nearest point if it's close enough (within 5% of the plot)
+        if nearest_index >= 0 and min_distance < 0.05:
+            self.ppm_points.pop(nearest_index)
+            self._update_plot()
+
+    def _clear_all_points(self):
+        """Clear all points from the function."""
+        self.ppm_points.clear()
+        self._update_plot()
+
+    def _add_default_points(self):
+        """Add some default points to demonstrate the function."""
+        self.ppm_points = [(100, 50), (300, 30), (500, 20), (800, 40)]
+        self._update_plot()
+
+    def _update_plot(self):
+        """Update the plot display."""
+
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+
+        self.ax.clear()
+        self.ax.set_xlabel("m/z", fontsize=12)
+        self.ax.set_ylabel("PPM Tolerance", fontsize=12)
+        self.ax.set_title(
+            "Interactive PPM Tolerance Function", fontsize=14, fontweight="bold"
+        )
+        self.ax.grid(True, alpha=0.3)
+
+        if not self.ppm_points:
+            # No points - show default constant function
+            default_ppm = (
+                float(self.ppm_var.get())
+                if self.ppm_var.get().replace(".", "").isdigit()
+                else 50
+            )
+            self.ax.axhline(
+                y=default_ppm,
+                color="blue",
+                linestyle="--",
+                alpha=0.7,
+                label=f"Default: {default_ppm} PPM",
+            )
+            self.ax.legend()
+        else:
+            # Plot the function
+            if len(self.ppm_points) == 1:
+                # Single point - constant function
+                mz, ppm = self.ppm_points[0]
+                self.ax.axhline(
+                    y=ppm,
+                    color="blue",
+                    linestyle="-",
+                    linewidth=2,
+                    label=f"Constant: {ppm:.1f} PPM",
+                )
+                self.ax.plot(mz, ppm, "ro", markersize=8, label="Control Point")
+            else:
+                # Multiple points - interpolated function
+                mz_values = [point[0] for point in self.ppm_points]
+                ppm_values = [point[1] for point in self.ppm_points]
+
+                # Create continuous function across the full x-axis range
+                max_x = self.max_precursor_mz * 1.15
+                mz_extended = list(range(0, int(max_x) + 1, 10))
+
+                ppm_extended = []
+                for mz in mz_extended:
+                    ppm_extended.append(self._interpolate_ppm(mz))
+
+                # Plot the function
+                self.ax.plot(
+                    mz_extended, ppm_extended, "b-", linewidth=2, label="PPM Function"
+                )
+                self.ax.plot(
+                    mz_values, ppm_values, "ro", markersize=8, label="Control Points"
+                )
+
+            self.ax.legend()
+
+        # Set reasonable axis limits only during initial setup
+        if not self.plot_initialized:
+            max_x = self.max_precursor_mz * 1.15  # Add 15% to maximum precursor m/z
+            self.ax.set_xlim(
+                0, max_x
+            )  # Always use full range from 0 to max precursor + 15%
+            self.ax.set_ylim(0, 52)
+
+            self.plot_initialized = True
+
+        else:
+            self.ax.set_xlim(*xlim)
+            self.ax.set_ylim(*ylim)
+
+        self.canvas.draw()
+
+    def _interpolate_ppm(self, mz):
+        """Interpolate PPM value for a given m/z using the defined function."""
+        if not self.ppm_points:
+            return (
+                float(self.ppm_var.get())
+                if self.ppm_var.get().replace(".", "").isdigit()
+                else 50
+            )
+
+        if len(self.ppm_points) == 1:
+            return self.ppm_points[0][1]
+
+        # Sort points by m/z
+        sorted_points = sorted(self.ppm_points, key=lambda x: x[0])
+
+        # Check if mz is before the first point
+        if mz <= sorted_points[0][0]:
+            return sorted_points[0][1]
+
+        # Check if mz is after the last point
+        if mz >= sorted_points[-1][0]:
+            return sorted_points[-1][1]
+
+        # Find the two points to interpolate between
+        for i in range(len(sorted_points) - 1):
+            mz1, ppm1 = sorted_points[i]
+            mz2, ppm2 = sorted_points[i + 1]
+
+            if mz1 <= mz <= mz2:
+                # Linear interpolation
+                if mz2 == mz1:
+                    return ppm1
+                t = (mz - mz1) / (mz2 - mz1)
+                return ppm1 + t * (ppm2 - ppm1)
+
+        # Fallback (should not reach here)
+        return sorted_points[0][1]
 
     def _ok(self):
         """Handle OK button click."""
@@ -4340,6 +4759,7 @@ class FragmentAnnotationDialog:
                 "formula_tags": formula_tags,
                 "ppm_tolerance": ppm_value,
                 "additional_elements": selected_elements,
+                "ppm_function_points": self.ppm_points.copy(),  # Include the custom function
             }
 
             self.dialog.destroy()
@@ -4486,7 +4906,13 @@ class PPMDeviationPlotDialog:
         # Create matplotlib figure
         self.figure = Figure(figsize=(10, 6), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, main_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 10))
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
+
+        # Add navigation toolbar for zoom/pan functionality
+        toolbar_frame = ttk.Frame(main_frame)
+        toolbar_frame.pack(fill="x", pady=(0, 10))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
 
         # Plot the data
         self._plot_ppm_deviation(annotated_data)
@@ -4577,6 +5003,57 @@ class PPMDeviationPlotDialog:
                 facecolor=(1.0, 0.0, 0.0, 0.3), edgecolor="black", label="4th+ match"
             ),
         ]
+
+        # Check if PPM tolerance function was used and plot it
+        ppm_tolerances_used = [
+            item.get("ppm_tolerance_used") for item in annotated_data
+        ]
+        unique_tolerances = set(filter(None, ppm_tolerances_used))
+
+        if len(unique_tolerances) > 1:
+            # Variable tolerance was used - try to reconstruct and show the function
+            # Group by m/z ranges to show the tolerance function
+            mz_tolerance_pairs = []
+            for item in annotated_data:
+                mz = item["mz"]
+                tolerance = item.get("ppm_tolerance_used")
+                if tolerance is not None:
+                    mz_tolerance_pairs.append((mz, tolerance))
+
+            if mz_tolerance_pairs:
+                # Sort by m/z and create a smooth tolerance line
+                mz_tolerance_pairs.sort()
+                tolerance_mz = [pair[0] for pair in mz_tolerance_pairs]
+                tolerance_values = [pair[1] for pair in mz_tolerance_pairs]
+
+                # Plot tolerance function as positive and negative bounds
+                ax.plot(
+                    tolerance_mz,
+                    tolerance_values,
+                    "r--",
+                    alpha=0.7,
+                    linewidth=2,
+                    label="PPM Tolerance (upper limit)",
+                )
+                ax.plot(
+                    tolerance_mz,
+                    [-t for t in tolerance_values],
+                    "r--",
+                    alpha=0.7,
+                    linewidth=2,
+                    label="PPM Tolerance (lower limit)",
+                )
+
+                # Add to legend
+                legend_elements.append(
+                    Patch(
+                        facecolor="none",
+                        edgecolor="red",
+                        linestyle="--",
+                        label="PPM tolerance function",
+                    )
+                )
+
         ax.legend(handles=legend_elements, loc="upper right")
 
         # Add grid

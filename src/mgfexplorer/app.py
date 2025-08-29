@@ -73,6 +73,8 @@ class MGFExplorerApp:
         self._create_menu()
         self._setup_drag_drop()
 
+        self._get_ppm_tolerance_for_mz_cache = {}
+
     def _create_menu(self):
         """Create the application menu."""
         menubar = tk.Menu(self.root)
@@ -1388,7 +1390,7 @@ class MGFExplorerApp:
             return
 
         # Open fragment annotation dialog
-        dialog = FragmentAnnotationDialog(self.root)
+        dialog = FragmentAnnotationDialog(self.root, spectra=self.parser.spectra)
         config = dialog.show()
 
         if config is None:  # User cancelled
@@ -1437,12 +1439,8 @@ class MGFExplorerApp:
                     processed_count,
                     f"Processing spectrum {processed_count + 1}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
                 )
-
-                # Create fragment annotator
-                annotator = FragmentAnnotator(
-                    precursor_formula=formula,
-                    additional_elements=config["additional_elements"],
-                    ppm_tolerance=config["ppm_tolerance"],
+                print(
+                    f"\n\nProcessing spectrum {processed_count + 1}/{len(spectra_with_formulas)} (ID: {spectrum.spectrum_id})",
                 )
 
                 # Annotate each ion
@@ -1451,7 +1449,18 @@ class MGFExplorerApp:
                     if progress_dialog.is_cancelled():
                         break
 
-                    annotations = annotator.annotate_mz(mz)
+                    # Calculate PPM tolerance for this specific m/z using custom function if available
+                    ppm_tolerance = self._get_ppm_tolerance_for_mz(mz, config)
+
+                    # Create annotator with specific tolerance for this m/z
+                    ion_annotator = FragmentAnnotator(
+                        precursor_formula=formula,
+                        additional_elements=config["additional_elements"],
+                        ppm_tolerance=ppm_tolerance,
+                    )
+                    print(f"   Annotating mz {mz}, with ppm_tolerance {ppm_tolerance}")
+
+                    annotations = ion_annotator.annotate_mz(mz)
 
                     for annotation_rank, annotation in enumerate(annotations):
                         spectrum.add_fragment_annotation(
@@ -1473,6 +1482,7 @@ class MGFExplorerApp:
                                 "spectrum_id": spectrum.spectrum_id,
                                 "intensity": intensity,
                                 "annotation_rank": annotation_rank,  # 0-based rank
+                                "ppm_tolerance_used": ppm_tolerance,  # Track what tolerance was used
                             }
                         )
 
@@ -1567,6 +1577,52 @@ class MGFExplorerApp:
             return formula_match.group()
 
         return ""
+
+    def _get_ppm_tolerance_for_mz(self, mz: float, config: dict) -> float:
+        mz = int(mz)
+        if mz not in self._get_ppm_tolerance_for_mz_cache:
+            tol = self.__get_ppm_tolerance_for_mz(mz, config)
+            self._get_ppm_tolerance_for_mz_cache[mz] = tol
+
+        return self._get_ppm_tolerance_for_mz_cache[mz]
+
+    def __get_ppm_tolerance_for_mz(self, mz: float, config: dict) -> float:
+        """Calculate PPM tolerance for a given m/z using the custom function if available."""
+        ppm_function_points = config.get("ppm_function_points", [])
+
+        if not ppm_function_points:
+            # No custom function, use default tolerance
+            return config["ppm_tolerance"]
+
+        if len(ppm_function_points) == 1:
+            # Single point - constant function
+            return ppm_function_points[0][1]
+
+        # Sort points by m/z
+        sorted_points = sorted(ppm_function_points, key=lambda x: x[0])
+
+        # Check if mz is before the first point
+        if mz <= sorted_points[0][0]:
+            return sorted_points[0][1]
+
+        # Check if mz is after the last point
+        if mz >= sorted_points[-1][0]:
+            return sorted_points[-1][1]
+
+        # Find the two points to interpolate between
+        for i in range(len(sorted_points) - 1):
+            mz1, ppm1 = sorted_points[i]
+            mz2, ppm2 = sorted_points[i + 1]
+
+            if mz1 <= mz <= mz2:
+                # Linear interpolation
+                if mz2 == mz1:
+                    return ppm1
+                t = (mz - mz1) / (mz2 - mz1)
+                return ppm1 + t * (ppm2 - ppm1)
+
+        # Fallback (should not reach here)
+        return config["ppm_tolerance"]
 
     def _show_cache_info(self):
         """Show information about the molecular formula cache."""

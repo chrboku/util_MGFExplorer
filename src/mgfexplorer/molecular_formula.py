@@ -430,18 +430,26 @@ class FragmentAnnotator:
 
         annotations = []
         subformulas = self.generate_subformulas()
+        import time
 
-        for formula in subformulas:
-            theoretical_mass = formula.get_exact_mass()
+        print(f"   Got {len(subformulas)} subformulas {time.time()}")
 
+        for formula in (
+            formula
+            for formula in subformulas
+            if abs(formula.get_exact_mass() - neutral_mass) / neutral_mass * 1e6
+            <= self.ppm_tolerance
+        ):
             # Calculate ppm error
-            ppm_error = abs((theoretical_mass - neutral_mass) / neutral_mass * 1e6)
+            ppm_error = abs(
+                (formula.get_exact_mass() - neutral_mass) / neutral_mass * 1e6
+            )
 
             if ppm_error <= self.ppm_tolerance:
                 annotations.append(
                     {
                         "formula": formula.to_string(),
-                        "theoretical_mass": theoretical_mass,
+                        "theoretical_mass": formula.get_exact_mass(),
                         "ppm_error": ppm_error,
                         "charge": charge,
                     }
