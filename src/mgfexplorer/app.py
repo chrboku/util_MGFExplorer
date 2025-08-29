@@ -18,6 +18,7 @@ from .gui_components import (
     SmartsFilterDialog,
     FragmentAnnotationDialog,
     ProgressDialog,
+    PPMDeviationPlotDialog,
 )
 from .molecular_formula import (
     FragmentAnnotator,
@@ -1420,6 +1421,8 @@ class MGFExplorerApp:
 
         try:
             processed_count = 0
+            # Collect all annotation data for the plot
+            all_annotations = []
 
             for spectrum, formula in spectra_with_formulas:
                 # Check if cancelled
@@ -1450,7 +1453,7 @@ class MGFExplorerApp:
 
                     annotations = annotator.annotate_mz(mz)
 
-                    for annotation in annotations:
+                    for annotation_rank, annotation in enumerate(annotations):
                         spectrum.add_fragment_annotation(
                             ion_index=ion_index,
                             formula=annotation["formula"],
@@ -1459,6 +1462,18 @@ class MGFExplorerApp:
                                 "theoretical_mass": annotation["theoretical_mass"],
                                 "charge": annotation["charge"],
                             },
+                        )
+
+                        # Collect data for the plot
+                        all_annotations.append(
+                            {
+                                "mz": mz,
+                                "ppm_error": annotation["ppm_error"],
+                                "formula": annotation["formula"],
+                                "spectrum_id": spectrum.spectrum_id,
+                                "intensity": intensity,
+                                "annotation_rank": annotation_rank,  # 0-based rank
+                            }
                         )
 
                 processed_count += 1
@@ -1488,10 +1503,24 @@ class MGFExplorerApp:
             self.status_var.set(
                 f"Subformula generation completed for {processed_count} spectra"
             )
+
+            # Show PPM deviation plot if there are annotations
+            if all_annotations:
+                try:
+                    plot_dialog = PPMDeviationPlotDialog(self.root)
+                    plot_dialog.show(all_annotations)
+                except Exception as e:
+                    # If plot fails, just show a warning but don't stop the process
+                    messagebox.showwarning(
+                        "Plot Warning",
+                        f"Could not display PPM deviation plot:\n{str(e)}",
+                    )
+
             messagebox.showinfo(
                 "Annotation Complete",
                 f"Fragment annotation completed successfully.\n"
-                f"Processed {processed_count} spectra with molecular formulas.",
+                f"Processed {processed_count} spectra with molecular formulas.\n"
+                f"Total annotated fragments: {len(all_annotations)}",
             )
 
         except Exception as e:

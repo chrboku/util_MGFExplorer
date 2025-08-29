@@ -4439,3 +4439,284 @@ class ProgressDialog:
     def is_cancelled(self):
         """Check if the operation was cancelled."""
         return self.cancelled
+
+
+class PPMDeviationPlotDialog:
+    """Dialog for displaying a plot of m/z vs PPM deviation for annotated fragments."""
+
+    def __init__(self, parent):
+        """Initialize the dialog."""
+        self.parent = parent
+        self.dialog = None
+
+    def show(self, annotated_data):
+        """
+        Show the PPM deviation plot dialog.
+
+        Args:
+            annotated_data: List of dictionaries containing:
+                - mz: m/z value
+                - ppm_error: PPM deviation
+                - formula: molecular formula
+                - spectrum_id: spectrum ID (optional)
+        """
+        if not annotated_data:
+            messagebox.showinfo("No Data", "No annotated fragments to display.")
+            return
+
+        # Create dialog window
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("PPM Deviation Plot - Annotated Fragments")
+        self.dialog.geometry("800x600")
+        self.dialog.resizable(True, True)
+        self.dialog.grab_set()  # Make modal
+
+        # Main frame
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="PPM Deviation vs m/z for Annotated Fragments",
+            font=("Arial", 14, "bold"),
+        )
+        title_label.pack(pady=(0, 10))
+
+        # Create matplotlib figure
+        self.figure = Figure(figsize=(10, 6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, main_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 10))
+
+        # Plot the data
+        self._plot_ppm_deviation(annotated_data)
+
+        # Info frame with statistics
+        info_frame = ttk.LabelFrame(main_frame, text="Statistics", padding=5)
+        info_frame.pack(fill="x", pady=(0, 10))
+
+        self._display_statistics(annotated_data, info_frame)
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x")
+
+        # Save plot button
+        ttk.Button(
+            button_frame,
+            text="Save Plot",
+            command=lambda: self._save_plot(annotated_data),
+        ).pack(side="left", padx=(0, 5))
+
+        # Close button
+        ttk.Button(button_frame, text="Close", command=self._close).pack(side="right")
+
+        # Center the dialog
+        self.dialog.transient(self.parent)
+        self.dialog.wait_window()
+
+    def _plot_ppm_deviation(self, annotated_data):
+        """Create the PPM deviation plot."""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+
+        # Extract data
+        mz_values = [item["mz"] for item in annotated_data]
+        ppm_errors = [item["ppm_error"] for item in annotated_data]
+        formulas = [item.get("formula", "") for item in annotated_data]
+        annotation_ranks = [item.get("annotation_rank", 0) for item in annotated_data]
+
+        # Define colors based on annotation rank with 30% transparency (alpha=0.3)
+        def get_color(rank):
+            if rank == 0:
+                return (0.0, 0.8, 0.0, 0.3)  # Green for 1st (best match)
+            elif rank == 1:
+                return (0.0, 0.0, 1.0, 0.3)  # Blue for 2nd
+            elif rank == 2:
+                return (1.0, 0.65, 0.0, 0.3)  # Orange for 3rd
+            else:
+                return (1.0, 0.0, 0.0, 0.3)  # Red for 4th and beyond
+
+        # Create colors array
+        colors = [get_color(rank) for rank in annotation_ranks]
+
+        # Create scatter plot with color coding
+        scatter = ax.scatter(
+            mz_values,
+            ppm_errors,
+            alpha=1.0,  # Set to 1.0 since alpha is included in colors
+            s=50,
+            c=colors,
+            edgecolors="black",
+            linewidth=0.5,
+        )
+
+        # Set labels and title
+        ax.set_xlabel("m/z", fontsize=12)
+        ax.set_ylabel("PPM Deviation", fontsize=12)
+        ax.set_title(
+            "PPM Deviation vs m/z for Annotated Fragments",
+            fontsize=14,
+            fontweight="bold",
+        )
+
+        # Create legend for color coding
+        from matplotlib.patches import Patch
+
+        legend_elements = [
+            Patch(
+                facecolor=(0.0, 0.8, 0.0, 0.3),
+                edgecolor="black",
+                label="1st match (best)",
+            ),
+            Patch(facecolor=(0.0, 0.0, 1.0, 0.3), edgecolor="black", label="2nd match"),
+            Patch(
+                facecolor=(1.0, 0.65, 0.0, 0.3), edgecolor="black", label="3rd match"
+            ),
+            Patch(
+                facecolor=(1.0, 0.0, 0.0, 0.3), edgecolor="black", label="4th+ match"
+            ),
+        ]
+        ax.legend(handles=legend_elements, loc="upper right")
+
+        # Add grid
+        ax.grid(True, alpha=0.3)
+
+        # Add horizontal line at y=0 for reference
+        ax.axhline(y=0, color="red", linestyle="--", alpha=0.7, linewidth=1)
+
+        # Set axis limits with some padding
+        if mz_values and ppm_errors:
+            mz_range = max(mz_values) - min(mz_values)
+            ppm_range = max(ppm_errors) - min(ppm_errors)
+
+            ax.set_xlim(
+                min(mz_values) - mz_range * 0.05, max(mz_values) + mz_range * 0.05
+            )
+            ax.set_ylim(
+                min(ppm_errors) - ppm_range * 0.1, max(ppm_errors) + ppm_range * 0.1
+            )
+
+        # Add annotation on hover (if matplotlib supports it)
+        try:
+            # Create annotation box
+            self.annot = ax.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(20, 20),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round", fc="w", alpha=0.8),
+                arrowprops=dict(arrowstyle="->"),
+            )
+            self.annot.set_visible(False)
+
+            def update_annot(ind):
+                """Update annotation with point information."""
+                pos = scatter.get_offsets()[ind["ind"][0]]
+                self.annot.xy = pos
+                idx = ind["ind"][0]
+                rank = annotation_ranks[idx] + 1  # Convert to 1-based for display
+                text = f"m/z: {mz_values[idx]:.4f}\nPPM: {ppm_errors[idx]:.2f}\nFormula: {formulas[idx]}\nRank: {rank}"
+                self.annot.set_text(text)
+                self.annot.get_bbox_patch().set_facecolor("white")
+                self.annot.get_bbox_patch().set_alpha(0.8)
+
+            def hover(event):
+                """Handle hover events over data points."""
+                if event.inaxes == ax:
+                    cont, ind = scatter.contains(event)
+                    if cont:
+                        update_annot(ind)
+                        self.annot.set_visible(True)
+                        self.figure.canvas.draw()
+                    else:
+                        if self.annot.get_visible():
+                            self.annot.set_visible(False)
+                            self.figure.canvas.draw()
+
+            self.figure.canvas.mpl_connect("motion_notify_event", hover)
+        except:
+            # If hover annotation fails, continue without it
+            pass
+
+        # Adjust layout
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _display_statistics(self, annotated_data, parent_frame):
+        """Display statistics about the annotated data."""
+        if not annotated_data:
+            return
+
+        ppm_errors = [item["ppm_error"] for item in annotated_data]
+        annotation_ranks = [item.get("annotation_rank", 0) for item in annotated_data]
+
+        # Calculate statistics
+        min_ppm = min(ppm_errors)
+        max_ppm = max(ppm_errors)
+        mean_ppm = sum(ppm_errors) / len(ppm_errors)
+
+        # Calculate median
+        sorted_ppm = sorted(ppm_errors)
+        n = len(sorted_ppm)
+        median_ppm = (
+            sorted_ppm[n // 2]
+            if n % 2 == 1
+            else (sorted_ppm[n // 2 - 1] + sorted_ppm[n // 2]) / 2
+        )
+
+        # Calculate rank distribution
+        rank_counts = {}
+        for rank in annotation_ranks:
+            rank_display = rank + 1  # Convert to 1-based for display
+            if rank_display <= 3:
+                rank_counts[rank_display] = rank_counts.get(rank_display, 0) + 1
+            else:
+                rank_counts["4+"] = rank_counts.get("4+", 0) + 1
+
+        # Create statistics text
+        stats_text = (
+            f"Total annotated fragments: {len(annotated_data)}\n"
+            f"PPM deviation range: {min_ppm:.2f} - {max_ppm:.2f}\n"
+            f"Mean PPM deviation: {mean_ppm:.2f}\n"
+            f"Median PPM deviation: {median_ppm:.2f}\n\n"
+            f"Annotation rank distribution:\n"
+        )
+
+        # Add rank distribution
+        for rank in [1, 2, 3, "4+"]:
+            count = rank_counts.get(rank, 0)
+            percentage = (count / len(annotated_data)) * 100
+            stats_text += f"  Rank {rank}: {count} ({percentage:.1f}%)\n"
+
+        stats_label = ttk.Label(parent_frame, text=stats_text, font=("Arial", 10))
+        stats_label.pack(anchor="w")
+
+    def _save_plot(self, annotated_data):
+        """Save the plot to a file."""
+        from tkinter import filedialog
+
+        filename = filedialog.asksaveasfilename(
+            title="Save PPM Deviation Plot",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG files", "*.png"),
+                ("PDF files", "*.pdf"),
+                ("SVG files", "*.svg"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if filename:
+            try:
+                self.figure.savefig(filename, dpi=300, bbox_inches="tight")
+                messagebox.showinfo(
+                    "Success", f"Plot saved successfully to:\n{filename}"
+                )
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save plot:\n{str(e)}")
+
+    def _close(self):
+        """Close the dialog."""
+        if self.dialog:
+            self.dialog.destroy()
