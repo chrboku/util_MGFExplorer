@@ -3,9 +3,155 @@ Molecular formula utilities for fragment annotation.
 """
 
 import re
+import os
+import pickle
+import hashlib
+import time
 from typing import Dict, List, Tuple, Set
 from collections import defaultdict
 import itertools
+
+
+class FormulaCache:
+    """Persistent cache for molecular formula calculations with batched writes."""
+
+    def __init__(self, cache_dir=None, write_threshold=10000):
+        """Initialize the cache with a specified directory."""
+        if cache_dir is None:
+            # Default cache directory in user's home/.mgfexplorer_cache
+            cache_dir = os.path.expanduser("~/.mgfexplorer_cache")
+
+        self.cache_dir = cache_dir
+        self.cache_file = os.path.join(cache_dir, "formula_cache.pkl")
+        self._cache = {}
+        self._new_entries_count = 0  # Track new entries since last save
+        self._write_threshold = (
+            write_threshold  # Number of new entries before auto-save
+        )
+        self._dirty = False  # Track if cache has unsaved changes
+        self._load_cache()
+
+    def _load_cache(self):
+        """Load cache from disk once at startup."""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, "rb") as f:
+                    self._cache = pickle.load(f)
+                print(f"Loaded formula cache with {len(self._cache)} entries")
+            else:
+                self._cache = {}
+                print("No existing cache file found, starting with empty cache")
+        except Exception as e:
+            print(f"Warning: Could not load formula cache: {e}")
+            self._cache = {}
+
+    def _save_cache(self, force=False):
+        """Save cache to disk only when threshold is reached or forced."""
+        if not self._dirty and not force:
+            return  # Nothing to save
+
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(self.cache_file, "wb") as f:
+                pickle.dump(self._cache, f)
+            print(f"Saved formula cache with {len(self._cache)} entries to disk")
+            self._new_entries_count = 0
+            self._dirty = False
+        except Exception as e:
+            print(f"Warning: Could not save formula cache: {e}")
+
+    def _generate_key(
+        self,
+        precursor_formula: str,
+        additional_elements: List[str],
+        ppm_tolerance: float,
+    ) -> str:
+        """Generate a unique cache key for the given parameters."""
+        # Create a deterministic key based on parameters
+        key_data = f"{precursor_formula}|{sorted(additional_elements)}|{ppm_tolerance}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+
+    def get_subformulas(
+        self,
+        precursor_formula: str,
+        additional_elements: List[str] = None,
+        ppm_tolerance: float = 50.0,
+    ):
+        """Get cached subformulas or return None if not cached."""
+        if additional_elements is None:
+            additional_elements = []
+
+        key = self._generate_key(precursor_formula, additional_elements, ppm_tolerance)
+        return self._cache.get(key)
+
+    def store_subformulas(
+        self,
+        precursor_formula: str,
+        subformulas: List[Dict],
+        additional_elements: List[str] = None,
+        ppm_tolerance: float = 50.0,
+    ):
+        """Store subformulas in cache with batched writing."""
+        if additional_elements is None:
+            additional_elements = []
+
+        key = self._generate_key(precursor_formula, additional_elements, ppm_tolerance)
+
+        # Check if this is a new entry
+        is_new_entry = key not in self._cache
+
+        # Store with timestamp for potential cleanup
+        cache_entry = {
+            "subformulas": subformulas,
+            "timestamp": time.time(),
+            "precursor_formula": precursor_formula,
+            "additional_elements": additional_elements,
+            "ppm_tolerance": ppm_tolerance,
+        }
+
+        self._cache[key] = cache_entry
+        self._dirty = True
+
+        # Track new entries for batched writing
+        if is_new_entry:
+            self._new_entries_count += 1
+
+            # Auto-save when threshold is reached
+            if self._new_entries_count >= self._write_threshold:
+                print(
+                    f"Cache threshold reached ({self._new_entries_count} new entries), saving to disk..."
+                )
+                self._save_cache()
+
+    def force_save(self):
+        """Force save the cache to disk regardless of threshold."""
+        self._save_cache(force=True)
+
+    def clear_cache(self):
+        """Clear all cached data."""
+        self._cache.clear()
+        self._new_entries_count = 0
+        self._dirty = False
+        if os.path.exists(self.cache_file):
+            os.remove(self.cache_file)
+            print("Cache file deleted from disk")
+
+    def get_cache_stats(self):
+        """Get cache statistics including pending writes."""
+        return {
+            "total_entries": len(self._cache),
+            "new_entries_pending": self._new_entries_count,
+            "write_threshold": self._write_threshold,
+            "has_unsaved_changes": self._dirty,
+            "cache_file": self.cache_file,
+            "cache_size_mb": os.path.getsize(self.cache_file) / (1024 * 1024)
+            if os.path.exists(self.cache_file)
+            else 0,
+        }
+
+
+# Global cache instance
+_formula_cache = FormulaCache()
 
 
 class MolecularFormula:
@@ -165,11 +311,35 @@ class FragmentAnnotator:
         self.precursor_formula = MolecularFormula(precursor_formula)
         self.additional_elements = additional_elements or []
         self.ppm_tolerance = ppm_tolerance
+        self._cached_subformulas = None  # Cache subformulas once generated
 
     def generate_subformulas(
         self, max_additional_elements: int = 3
     ) -> List[MolecularFormula]:
         """Generate all possible sub-formulas of the precursor."""
+        # Check if we already have cached subformulas for this instance
+        if self._cached_subformulas is not None:
+            return self._cached_subformulas
+
+        # Check persistent cache first
+        precursor_formula_str = self.precursor_formula.to_string()
+        cached_result = _formula_cache.get_subformulas(
+            precursor_formula_str, self.additional_elements, self.ppm_tolerance
+        )
+
+        if cached_result is not None:
+            # Convert cached string formulas back to MolecularFormula objects
+            self._cached_subformulas = []
+            for formula_data in cached_result["subformulas"]:
+                formula = MolecularFormula(formula_data["formula_string"])
+                self._cached_subformulas.append(formula)
+            print(
+                f"Loaded {len(self._cached_subformulas)} subformulas from cache for {precursor_formula_str}"
+            )
+            return self._cached_subformulas
+
+        # Generate subformulas if not cached
+        print(f"Generating subformulas for {precursor_formula_str}...")
         subformulas = []
 
         # Generate all combinations of the precursor elements
@@ -191,6 +361,30 @@ class FragmentAnnotator:
                     combined = base_formula.add(additional_formula)
                     subformulas.append(combined)
 
+        # Cache the results
+        self._cached_subformulas = subformulas
+
+        # Prepare data for persistent storage
+        formula_data_for_cache = []
+        for formula in subformulas:
+            formula_data_for_cache.append(
+                {
+                    "formula_string": formula.to_string(),
+                    "exact_mass": formula.get_exact_mass(),
+                }
+            )
+
+        # Store in persistent cache
+        _formula_cache.store_subformulas(
+            precursor_formula_str,
+            formula_data_for_cache,
+            self.additional_elements,
+            self.ppm_tolerance,
+        )
+
+        print(
+            f"Generated and cached {len(subformulas)} subformulas for {precursor_formula_str}"
+        )
         return subformulas
 
     def _generate_element_combinations(
@@ -263,3 +457,32 @@ class FragmentAnnotator:
     ) -> float:
         """Calculate ppm error between experimental and theoretical masses."""
         return abs((experimental_mass - theoretical_mass) / theoretical_mass * 1e6)
+
+
+# Utility functions for cache management
+def get_cache_stats() -> Dict:
+    """Get cache statistics."""
+    return _formula_cache.get_cache_stats()
+
+
+def clear_formula_cache():
+    """Clear the persistent formula cache."""
+    _formula_cache.clear_cache()
+    print("Formula cache cleared.")
+
+
+def force_save_cache():
+    """Force save the cache to disk regardless of threshold."""
+    _formula_cache.force_save()
+    print("Formula cache saved to disk.")
+
+
+def get_cache_info() -> str:
+    """Get human-readable cache information."""
+    stats = get_cache_stats()
+    pending_info = (
+        f" ({stats['new_entries_pending']} pending)"
+        if stats["new_entries_pending"] > 0
+        else ""
+    )
+    return f"Cache: {stats['total_entries']} entries{pending_info}, {stats['cache_size_mb']:.1f} MB"

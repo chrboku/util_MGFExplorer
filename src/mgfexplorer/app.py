@@ -19,7 +19,14 @@ from .gui_components import (
     FragmentAnnotationDialog,
     ProgressDialog,
 )
-from .molecular_formula import FragmentAnnotator, MolecularFormula
+from .molecular_formula import (
+    FragmentAnnotator,
+    MolecularFormula,
+    get_cache_stats,
+    clear_formula_cache,
+    get_cache_info,
+    force_save_cache,
+)
 
 # Try to import tkinterdnd2 for drag and drop support
 try:
@@ -170,6 +177,10 @@ class MGFExplorerApp:
         fragment_menu.add_command(
             label="Generate subformulas", command=self._generate_subformulas
         )
+        fragment_menu.add_separator()
+        fragment_menu.add_command(label="Cache info", command=self._show_cache_info)
+        fragment_menu.add_command(label="Save cache", command=self._save_cache)
+        fragment_menu.add_command(label="Clear cache", command=self._clear_cache)
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -1527,6 +1538,89 @@ class MGFExplorerApp:
             return formula_match.group()
 
         return ""
+
+    def _show_cache_info(self):
+        """Show information about the molecular formula cache."""
+        try:
+            cache_info = get_cache_info()
+            stats = get_cache_stats()
+
+            # Format pending writes information
+            pending_info = ""
+            if stats["new_entries_pending"] > 0:
+                pending_info = (
+                    f"\nPending writes: {stats['new_entries_pending']} entries "
+                    f"(auto-save at {stats['write_threshold']})"
+                )
+
+            info_message = (
+                f"Molecular Formula Cache Information\n\n"
+                f"Total entries: {stats['total_entries']}\n"
+                f"Cache size: {stats['cache_size_mb']:.1f} MB\n"
+                f"Unsaved changes: {'Yes' if stats['has_unsaved_changes'] else 'No'}{pending_info}\n"
+                f"Cache file: {stats['cache_file']}\n\n"
+                f"The cache stores pre-calculated molecular formulas to speed up "
+                f"fragment annotation. New entries are saved automatically after "
+                f"{stats['write_threshold']} new calculations, or can be saved manually."
+            )
+
+            messagebox.showinfo("Cache Information", info_message)
+
+        except Exception as e:
+            messagebox.showerror(
+                "Cache Error", f"Error getting cache information:\n{str(e)}"
+            )
+
+    def _save_cache(self):
+        """Manually save the molecular formula cache to disk."""
+        try:
+            stats = get_cache_stats()
+
+            if not stats["has_unsaved_changes"]:
+                messagebox.showinfo(
+                    "Cache Saved",
+                    "The cache is already up to date with no unsaved changes.",
+                )
+                return
+
+            force_save_cache()
+            messagebox.showinfo(
+                "Cache Saved",
+                f"Successfully saved {stats['new_entries_pending']} pending entries to disk.",
+            )
+
+        except Exception as e:
+            messagebox.showerror("Cache Error", f"Error saving cache:\n{str(e)}")
+
+    def _clear_cache(self):
+        """Clear the molecular formula cache after user confirmation."""
+        try:
+            stats = get_cache_stats()
+
+            if stats["total_entries"] == 0:
+                messagebox.showinfo(
+                    "Cache Empty", "The molecular formula cache is already empty."
+                )
+                return
+
+            result = messagebox.askyesno(
+                "Clear Cache",
+                f"Are you sure you want to clear the molecular formula cache?\n\n"
+                f"This will remove {stats['total_entries']} cached entries "
+                f"({stats['cache_size_mb']:.1f} MB).\n\n"
+                f"Cached formulas will need to be recalculated when needed.",
+                icon="warning",
+            )
+
+            if result:
+                clear_formula_cache()
+                messagebox.showinfo(
+                    "Cache Cleared",
+                    "The molecular formula cache has been cleared successfully.",
+                )
+
+        except Exception as e:
+            messagebox.showerror("Cache Error", f"Error clearing cache:\n{str(e)}")
 
     def show_about(self):
         """Show about dialog."""
