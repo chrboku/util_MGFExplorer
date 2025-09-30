@@ -19,6 +19,7 @@ from .gui_components import (
     FragmentAnnotationDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
+    SpectrumPopupWindow,
 )
 from .molecular_formula import (
     FragmentAnnotator,
@@ -790,6 +791,10 @@ class MGFExplorerApp:
         # Set the naming scheme in the spectrum tree
         naming_scheme = self.spectrum_name_var.get()
         self.spectrum_tree.set_naming_scheme(naming_scheme)
+
+        # Set the naming scheme in the spectrum visualization
+        if hasattr(self, 'spectrum_viz') and self.spectrum_viz:
+            self.spectrum_viz.set_naming_scheme(naming_scheme)
 
         # Refresh the tree to show updated names
         self.spectrum_tree.load_data(self.parser)

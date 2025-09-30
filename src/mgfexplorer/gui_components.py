@@ -14,6 +14,22 @@ import threading
 import time
 from .mgf_parser import MGFParser, Spectrum
 
+# Natural sorting for spectrum names
+try:
+    from natsort import natsorted
+    NATSORT_AVAILABLE = True
+except ImportError:
+    NATSORT_AVAILABLE = False
+    # Simple natural sort implementation
+    def natsorted(items, key=None):
+        """Simple natural sort implementation."""
+        import re
+        def natural_key(text):
+            if key:
+                text = key(text)
+            return [int(c) if c.isdigit() else c.lower() for c in re.split('([0-9]+)', str(text))]
+        return sorted(items, key=natural_key)
+
 # RDKit imports for SMILES plotting
 try:
     from rdkit import Chem
@@ -1171,6 +1187,17 @@ class MetadataEditor(ttk.Frame):
                 command=lambda: self._select_spectra_by_value(key, value),
             )
 
+        # Add options for key column
+        if column == "#1":  # Key column
+            context_menu.add_command(
+                label=f"Add '{key}' as grouping tag",
+                command=lambda: self._add_key_as_grouping_tag(key),
+            )
+            context_menu.add_command(
+                label=f"Set '{key}' as spectrum name",
+                command=lambda: self._set_key_as_spectrum_name(key),
+            )
+
         # Show menu if it has items
         if context_menu.index("end") is not None:
             try:
@@ -1528,6 +1555,167 @@ class MetadataEditor(ttk.Frame):
         self._populate_metadata()
         if self.on_metadata_changed:
             self.on_metadata_changed()
+
+    def _add_key_as_grouping_tag(self, key: str):
+        """Add the selected key as a grouping tag in the spectrum tree view."""
+        # Find the spectrum tree view in the parent application
+        root = self.winfo_toplevel()
+        spectrum_tree = self._find_spectrum_tree_view(root)
+        
+        if spectrum_tree:
+            # Get current grouping tags
+            current_tags = spectrum_tree.tag_var.get().strip()
+            
+            # Add the new key if it's not already present
+            if current_tags:
+                tags = [tag.strip() for tag in current_tags.split(',')]
+                if key not in tags:
+                    tags.append(key)
+                    new_tags = ', '.join(tags)
+                else:
+                    messagebox.showinfo("Already Added", f"Key '{key}' is already in grouping tags.")
+                    return
+            else:
+                new_tags = key
+            
+            # Update the tag entry
+            spectrum_tree.tag_var.set(new_tags)
+            spectrum_tree._on_tag_entry_change()
+            
+        else:
+            messagebox.showwarning("Error", "Could not find spectrum tree view.")
+
+    def _set_key_as_spectrum_name(self, key: str):
+        """Set the selected key as the spectrum naming scheme."""
+        # Try to get the main app through the callback
+        main_app = None
+        
+        # First try: use the callback to find the main app
+        if self.on_metadata_changed and hasattr(self.on_metadata_changed, '__self__'):
+            potential_app = self.on_metadata_changed.__self__
+            if hasattr(potential_app, 'spectrum_name_var') and hasattr(potential_app, 'spectrum_tree'):
+                main_app = potential_app
+        
+        # Second try: search through widget hierarchy
+        if not main_app:
+            main_app = self._find_main_app(self.winfo_toplevel())
+        
+        if main_app and hasattr(main_app, 'spectrum_name_var'):
+            # Check if this key exists as a naming option
+            # First, we need to ensure the key is added to available naming options
+            if hasattr(main_app, 'spectrum_tree') and hasattr(main_app.spectrum_tree, 'parser'):
+                parser = main_app.spectrum_tree.parser
+                if parser:
+                    # Add this key to the spectrum naming menu if it doesn't exist
+                    self._add_naming_option_if_missing(main_app, key)
+                    
+                    # Set the naming scheme
+                    main_app.spectrum_name_var.set(key)
+                    main_app._update_spectrum_names()
+                    
+                else:
+                    messagebox.showwarning("Error", "No data loaded.")
+            else:
+                messagebox.showwarning("Error", "Could not access spectrum data.")
+        else:
+            messagebox.showwarning("Error", "Could not find main application.")
+
+    def _find_spectrum_tree_view(self, widget):
+        """Recursively find the SpectrumTreeView widget."""
+        if isinstance(widget, SpectrumTreeView):
+            return widget
+        
+        for child in widget.winfo_children():
+            result = self._find_spectrum_tree_view(child)
+            if result:
+                return result
+        return None
+
+    def _find_main_app(self, widget):
+        """Find the main application instance."""
+        # First, try to find the main app through the widget hierarchy
+        current = widget
+        while current:
+            # Check if this widget has the main app attributes
+            if hasattr(current, 'spectrum_name_var') and hasattr(current, 'spectrum_tree'):
+                return current
+            
+            # Check if current has a reference to main app via callbacks
+            if hasattr(current, 'on_metadata_changed') and current.on_metadata_changed:
+                # The callback is likely bound to the main app
+                try:
+                    # Get the instance that the callback method is bound to
+                    if hasattr(current.on_metadata_changed, '__self__'):
+                        potential_app = current.on_metadata_changed.__self__
+                        if hasattr(potential_app, 'spectrum_name_var') and hasattr(potential_app, 'spectrum_tree'):
+                            return potential_app
+                except:
+                    pass
+            
+            # Try the parent widget
+            try:
+                current = current.master
+            except:
+                current = None
+        
+        # If we can't find it through hierarchy, try a different approach
+        # Look through all top-level windows
+        root = self.winfo_toplevel()
+        try:
+            # Check all children of the root window
+            for child in root.winfo_children():
+                if hasattr(child, 'spectrum_name_var') and hasattr(child, 'spectrum_tree'):
+                    return child
+                # Recursively check children
+                result = self._search_for_main_app_in_children(child)
+                if result:
+                    return result
+        except:
+            pass
+        
+        return None
+
+    def _search_for_main_app_in_children(self, widget):
+        """Recursively search for main app in widget children."""
+        try:
+            if hasattr(widget, 'spectrum_name_var') and hasattr(widget, 'spectrum_tree'):
+                return widget
+            
+            for child in widget.winfo_children():
+                result = self._search_for_main_app_in_children(child)
+                if result:
+                    return result
+        except:
+            pass
+        return None
+
+    def _add_naming_option_if_missing(self, main_app, key: str):
+        """Add a naming option to the spectrum name menu if it doesn't exist."""
+        if hasattr(main_app, 'spectrum_name_menu'):
+            menu = main_app.spectrum_name_menu
+            
+            # Check if the option already exists
+            try:
+                last_index = menu.index('end')
+                if last_index is not None:
+                    for i in range(last_index + 1):
+                        try:
+                            label = menu.entrycget(i, 'label')
+                            if label == key:
+                                return  # Already exists
+                        except:
+                            continue
+                
+                # Add the new option
+                menu.add_radiobutton(
+                    label=key,
+                    variable=main_app.spectrum_name_var,
+                    value=key,
+                    command=main_app._update_spectrum_names,
+                )
+            except:
+                # If there's an error with the menu, ignore it
+                pass
 
     def get_pending_selection(self) -> Optional[List[int]]:
         """Get and clear any pending selection."""
@@ -2014,18 +2202,69 @@ class SpectrumVisualization(ttk.Frame):
         self.highlighted_ions: Dict[int, List[int]] = {}  # {spectrum_id: [ion_indices]}
         self.axes: List = []  # Track all subplot axes for zoom synchronization
         self._syncing_zoom = False  # Prevent infinite recursion during sync
+        self.show_combined_plot = tk.BooleanVar(value=False)  # Control combined plot display
+        self.ppm_tolerance = tk.DoubleVar(value=20.0)  # PPM tolerance for fragment matching
+        self.top_fragments_count = tk.IntVar(value=15)  # Number of top fragments to show
+        self.naming_scheme = "Numbered"  # Current spectrum naming scheme
 
         self._create_widgets()
 
     def _create_widgets(self):
         """Create the visualization widgets."""
-        # Header
+        # Header with controls
         header_frame = ttk.Frame(self)
         header_frame.pack(fill="x", padx=5, pady=5)
 
         ttk.Label(
             header_frame, text="Spectrum Visualization", font=("Arial", 12, "bold")
-        ).pack()
+        ).pack(side="left")
+
+        # Controls frame
+        controls_frame = ttk.Frame(header_frame)
+        controls_frame.pack(side="right")
+
+        # Combined plot checkbox
+        ttk.Checkbutton(
+            controls_frame,
+            text="Show Combined Plot",
+            variable=self.show_combined_plot,
+            command=self._plot_spectra
+        ).pack(side="left", padx=(0, 10))
+
+        # PPM tolerance for fragment matching in combined plot
+        ttk.Label(controls_frame, text="PPM tolerance:").pack(side="left", padx=(0, 2))
+        ppm_spinbox = ttk.Spinbox(
+            controls_frame,
+            from_=1.0,
+            to=100.0,
+            increment=1.0,
+            width=8,
+            textvariable=self.ppm_tolerance,
+            command=self._on_ppm_change
+        )
+        ppm_spinbox.pack(side="left", padx=(0, 10))
+        ppm_spinbox.bind('<KeyRelease>', self._on_ppm_change)
+
+        # Top fragments count for combined plot
+        ttk.Label(controls_frame, text="Top fragments:").pack(side="left", padx=(0, 2))
+        fragments_spinbox = ttk.Spinbox(
+            controls_frame,
+            from_=5,
+            to=50,
+            increment=1,
+            width=6,
+            textvariable=self.top_fragments_count,
+            command=self._on_fragments_count_change
+        )
+        fragments_spinbox.pack(side="left", padx=(0, 10))
+        fragments_spinbox.bind('<KeyRelease>', self._on_fragments_count_change)
+
+        # Popup button
+        ttk.Button(
+            controls_frame,
+            text="Create Popup",
+            command=self._create_popup_window
+        ).pack(side="left")
 
         # Matplotlib figure
         self.figure = Figure(figsize=(8, 6), dpi=100)
@@ -2037,6 +2276,13 @@ class SpectrumVisualization(ttk.Frame):
         toolbar_frame.pack(fill="x", padx=5, pady=(0, 5))
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
+
+    def set_naming_scheme(self, naming_scheme: str):
+        """Set the spectrum naming scheme."""
+        self.naming_scheme = naming_scheme
+        # Replot if we have data to show updated names
+        if self.parser and self.selected_spectrum_ids:
+            self._plot_spectra()
 
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
         """Load and visualize selected spectra."""
@@ -2078,6 +2324,13 @@ class SpectrumVisualization(ttk.Frame):
         if not selected_spectra:
             return
 
+        if self.show_combined_plot.get() and len(selected_spectra) > 1:
+            self._plot_combined_spectra(selected_spectra)
+        else:
+            self._plot_individual_spectra(selected_spectra)
+
+    def _plot_individual_spectra(self, selected_spectra):
+        """Plot individual spectra in separate subplots."""
         # Performance check: limit to first 5 spectra if more than 10 are selected
         original_count = len(selected_spectra)
         if original_count > 10:
@@ -2140,6 +2393,198 @@ class SpectrumVisualization(ttk.Frame):
         else:
             self.figure.subplots_adjust(hspace=0.1)
         self.canvas.draw()
+
+    def _plot_combined_spectra(self, selected_spectra):
+        """Plot all selected spectra in a combined plot with fragment matching."""
+        # Limit to 10 spectra for performance
+        original_count = len(selected_spectra)
+        if original_count > 10:
+            selected_spectra = selected_spectra[:10]
+            performance_warning = f"Performance limit: Showing first 10 of {original_count} selected spectra"
+        else:
+            performance_warning = None
+
+        ax = self.figure.add_subplot(111)
+        self.axes.append(ax)
+
+        # Collect all fragments from all spectra with sum-scaled intensities
+        all_fragments = {}  # {mz_value: [(spectrum_id, relative_intensity), ...]}
+        spectrum_colors = plt.cm.tab10(np.linspace(0, 1, min(len(selected_spectra), 10)))
+        spectrum_info = {}  # {spectrum_id: {'color': color, 'index': i, 'label': str}}
+
+        for i, spectrum in enumerate(selected_spectra):
+            if spectrum.ions.size == 0:
+                continue
+
+            mz_values = spectrum.ions[:, 0]
+            intensity_values = spectrum.ions[:, 1]
+            
+            # Sum-scale intensities (normalize to sum = 1)
+            total_intensity = np.sum(intensity_values)
+            if total_intensity > 0:
+                relative_intensities = intensity_values / total_intensity
+            else:
+                relative_intensities = intensity_values
+
+            spectrum_info[spectrum.spectrum_id] = {
+                'color': spectrum_colors[i],
+                'index': i,
+                'label': self._get_spectrum_display_name(spectrum)
+            }
+
+            # Add fragments to collection
+            for mz, rel_intensity in zip(mz_values, relative_intensities):
+                if mz not in all_fragments:
+                    all_fragments[mz] = []
+                all_fragments[mz].append((spectrum.spectrum_id, rel_intensity))
+
+        # Group fragments by similar m/z values within PPM tolerance
+        fragment_groups = self._group_fragments_by_mz(all_fragments, self.ppm_tolerance.get())
+
+        # Calculate total intensity for each fragment group and sort by intensity
+        fragment_intensities = []
+        for group_mz, fragments_in_group in fragment_groups.items():
+            if len(fragments_in_group) > 1:  # Only consider fragments present in multiple spectra
+                total_intensity = sum(rel_intensity for _, rel_intensity in fragments_in_group)
+                fragment_intensities.append((total_intensity, group_mz, fragments_in_group))
+        
+        # Sort by total intensity (descending) and take top N
+        top_fragments_count = self.top_fragments_count.get()
+        fragment_intensities.sort(key=lambda x: x[0], reverse=True)
+        top_fragments = fragment_intensities[:top_fragments_count]
+
+        # Create a plot showing spectra on x-axis and relative abundance on y-axis
+        # Each line represents a fragment group (similar m/z values)
+        
+        # Sort spectrum IDs by their display names using natural sorting
+        sorted_spec_ids = list(spectrum_info.keys())
+        try:
+            sorted_spec_ids = natsorted(sorted_spec_ids, 
+                                      key=lambda spec_id: self._get_spectrum_display_name(spec_id))
+        except NameError:
+            # Fallback to regular sorting if natsort is not available
+            sorted_spec_ids = sorted(sorted_spec_ids, 
+                                   key=lambda spec_id: self._get_spectrum_display_name(spec_id))
+        
+        spectrum_positions = {spec_id: i for i, spec_id in enumerate(sorted_spec_ids)}
+        spectrum_labels = [self._get_spectrum_display_name(spec_id) for spec_id in sorted_spec_ids]
+
+        # Plot each top fragment group as a line connecting spectra
+        for total_intensity, group_mz, fragments_in_group in top_fragments:
+            # Create arrays for plotting
+            x_positions = []
+            y_intensities = []
+            
+            # Sort fragments by spectrum index for consistent line drawing
+            sorted_fragments = sorted(fragments_in_group, 
+                                    key=lambda x: spectrum_info.get(x[0], {}).get('index', 999))
+            
+            for spectrum_id, rel_intensity in sorted_fragments:
+                if spectrum_id in spectrum_info:
+                    x_positions.append(spectrum_positions[spectrum_id])
+                    y_intensities.append(rel_intensity)
+            
+            if len(x_positions) > 1:
+                # Plot line connecting the same fragment across spectra
+                ax.plot(x_positions, y_intensities, 'o-', alpha=0.7, linewidth=2, 
+                       markersize=6, label=f'm/z {group_mz:.4f}')
+
+        # Set x-axis to show spectrum names
+        ax.set_xticks(range(len(spectrum_labels)))
+        ax.set_xticklabels(spectrum_labels, rotation=45, ha='right')
+        ax.set_xlabel("Spectra")
+        ax.set_ylabel("Relative Abundance (Sum-scaled)")
+        ax.set_title(f"Combined Spectrum Plot - Fragment Matching ({len(selected_spectra)} spectra)")
+        ax.grid(True, alpha=0.3)
+
+        # Add legend for fragment m/z values
+        handles, labels = ax.get_legend_handles_labels()
+        if len(handles) > 0:
+            legend_title = f"Top {min(len(handles), top_fragments_count)} fragments (by intensity)"
+            ax.legend(loc='upper right', framealpha=0.9, fontsize=8, title=legend_title)
+
+        # Add performance warning if applicable
+        if performance_warning:
+            ax.text(0.02, 0.98, performance_warning, transform=ax.transAxes, 
+                   fontsize=10, color="red", verticalalignment='top',
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _group_fragments_by_mz(self, all_fragments, ppm_tolerance):
+        """Group fragments by similar m/z values within PPM tolerance."""
+        fragment_groups = {}
+        sorted_mz_values = sorted(all_fragments.keys())
+        
+        for mz in sorted_mz_values:
+            # Find if this m/z belongs to an existing group
+            group_found = False
+            for group_mz in fragment_groups:
+                # Calculate PPM difference
+                ppm_diff = abs(mz - group_mz) / group_mz * 1e6
+                if ppm_diff <= ppm_tolerance:
+                    # Add to existing group
+                    fragment_groups[group_mz].extend(all_fragments[mz])
+                    group_found = True
+                    break
+            
+            if not group_found:
+                # Create new group
+                fragment_groups[mz] = all_fragments[mz][:]
+        
+        return fragment_groups
+
+    def _on_ppm_change(self, event=None):
+        """Handle PPM tolerance change."""
+        if self.show_combined_plot.get():
+            self._plot_spectra()
+
+    def _on_fragments_count_change(self, event=None):
+        """Handle top fragments count change."""
+        if self.show_combined_plot.get():
+            self._plot_spectra()
+
+    def _get_spectrum_display_name(self, spectrum_or_id):
+        """Get the display name for a spectrum based on the current naming scheme."""
+        # Handle both spectrum objects and spectrum IDs
+        if isinstance(spectrum_or_id, (str, int)):
+            # It's a spectrum ID, find the spectrum object
+            spectrum_id = spectrum_or_id
+            if not self.parser:
+                return f"S {spectrum_id}"
+            
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
+            )
+            if not spectrum:
+                return f"S {spectrum_id}"
+        else:
+            # It's already a spectrum object
+            spectrum = spectrum_or_id
+            spectrum_id = spectrum.spectrum_id
+        
+        # Use the local naming scheme
+        if self.naming_scheme == "Numbered":
+            return f"S {spectrum_id}"
+        else:
+            # Use the metadata value for the naming key
+            name_value = spectrum.get_metadata_value(self.naming_scheme)
+            if name_value:
+                return str(name_value)
+            else:
+                return f"S {spectrum_id}"  # Fall back to numbered if key not found
+
+    def _create_popup_window(self):
+        """Create a popup window with current selected spectra and metadata."""
+        if not self.parser or not self.selected_spectrum_ids:
+            messagebox.showwarning("No Selection", "No spectra selected for popup.")
+            return
+
+        # Get the root window from the widget hierarchy
+        root = self.winfo_toplevel()
+        popup = SpectrumPopupWindow(root, self.parser, self.selected_spectrum_ids, self.naming_scheme)
+        popup.show()
 
     def _plot_single_spectrum(self, ax, spectrum, mz_limits=None, is_last=False):
         """Plot a single spectrum as a stick chart."""
@@ -5239,3 +5684,506 @@ class PPMDeviationPlotDialog:
         """Close the dialog."""
         if self.dialog:
             self.dialog.destroy()
+
+
+class SpectrumPopupWindow:
+    """Popup window for displaying selected spectra and metadata."""
+
+    def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List[int], naming_scheme: str = "Numbered"):
+        self.parent = parent
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids[:]  # Create a copy
+        self.naming_scheme = naming_scheme
+        self.popup = None
+
+    def show(self):
+        """Show the popup window."""
+        if not self.parser or not self.selected_spectrum_ids:
+            return
+
+        # Create popup window
+        self.popup = tk.Toplevel(self.parent)
+        self.popup.title(f"Spectrum Popup - {len(self.selected_spectrum_ids)} Spectra")
+        self.popup.geometry("1200x800")
+        self.popup.resizable(True, True)
+
+        # Make it a regular window (not modal)
+        # self.popup.transient(self.parent)
+        # self.popup.grab_set()
+
+        # Create main frame
+        main_frame = ttk.Frame(self.popup, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # Create paned window for layout
+        paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
+        paned_window.pack(fill="both", expand=True)
+
+        # Left side: Spectrum visualization
+        viz_frame = ttk.LabelFrame(paned_window, text="Spectrum Visualization", padding=5)
+        paned_window.add(viz_frame, weight=2)
+
+        # Create spectrum visualization for popup
+        self.spectrum_viz = SpectrumVisualizationPopup(viz_frame)
+        self.spectrum_viz.naming_scheme = self.naming_scheme  # Set the naming scheme
+        self.spectrum_viz.pack(fill="both", expand=True)
+        self.spectrum_viz.load_data(self.parser, self.selected_spectrum_ids)
+
+        # Right side: Metadata and ion data
+        right_frame = ttk.Frame(paned_window)
+        paned_window.add(right_frame, weight=1)
+
+        # Metadata section
+        metadata_frame = ttk.LabelFrame(right_frame, text="Metadata", padding=5)
+        metadata_frame.pack(fill="both", expand=True, pady=(0, 5))
+
+        # Create text widget with scrollbar for metadata
+        metadata_text_frame = ttk.Frame(metadata_frame)
+        metadata_text_frame.pack(fill="both", expand=True)
+
+        self.metadata_text = tk.Text(metadata_text_frame, wrap="word", height=15)
+        metadata_scrollbar = ttk.Scrollbar(metadata_text_frame, orient="vertical", 
+                                         command=self.metadata_text.yview)
+        self.metadata_text.configure(yscrollcommand=metadata_scrollbar.set)
+
+        self.metadata_text.pack(side="left", fill="both", expand=True)
+        metadata_scrollbar.pack(side="right", fill="y")
+
+        # Ion data section
+        ion_frame = ttk.LabelFrame(right_frame, text="Ion Data Summary", padding=5)
+        ion_frame.pack(fill="both", expand=True)
+
+        # Create text widget with scrollbar for ion data
+        ion_text_frame = ttk.Frame(ion_frame)
+        ion_text_frame.pack(fill="both", expand=True)
+
+        self.ion_text = tk.Text(ion_text_frame, wrap="word", height=15)
+        ion_scrollbar = ttk.Scrollbar(ion_text_frame, orient="vertical", 
+                                    command=self.ion_text.yview)
+        self.ion_text.configure(yscrollcommand=ion_scrollbar.set)
+
+        self.ion_text.pack(side="left", fill="both", expand=True)
+        ion_scrollbar.pack(side="right", fill="y")
+
+        # Populate metadata and ion data
+        self._populate_metadata()
+        self._populate_ion_data()
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(button_frame, text="Close", command=self._close_popup).pack(side="right")
+
+        # Center the window
+        self.popup.update_idletasks()
+        width = self.popup.winfo_width()
+        height = self.popup.winfo_height()
+        x = (self.popup.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.popup.winfo_screenheight() // 2) - (height // 2)
+        self.popup.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _populate_metadata(self):
+        """Populate the metadata text widget."""
+        self.metadata_text.delete(1.0, tk.END)
+        
+        # Get selected spectra
+        selected_spectra = [
+            s for s in self.parser.spectra 
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+
+        for i, spectrum in enumerate(selected_spectra):
+            self.metadata_text.insert(tk.END, f"=== Spectrum {spectrum.spectrum_id} ===\n")
+            
+            if spectrum.metadata:
+                for key, value in spectrum.metadata.items():
+                    self.metadata_text.insert(tk.END, f"{key}: {value}\n")
+            else:
+                self.metadata_text.insert(tk.END, "No metadata available\n")
+            
+            if i < len(selected_spectra) - 1:
+                self.metadata_text.insert(tk.END, "\n")
+
+        self.metadata_text.config(state="disabled")
+
+    def _populate_ion_data(self):
+        """Populate the ion data text widget with summary."""
+        self.ion_text.delete(1.0, tk.END)
+        
+        # Get selected spectra
+        selected_spectra = [
+            s for s in self.parser.spectra 
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+
+        for i, spectrum in enumerate(selected_spectra):
+            self.ion_text.insert(tk.END, f"=== Spectrum {spectrum.spectrum_id} ===\n")
+            
+            if spectrum.ions.size > 0:
+                self.ion_text.insert(tk.END, f"Number of ions: {len(spectrum.ions)}\n")
+                
+                # Basic statistics
+                mz_values = spectrum.ions[:, 0]
+                intensity_values = spectrum.ions[:, 1]
+                
+                self.ion_text.insert(tk.END, f"m/z range: {mz_values.min():.4f} - {mz_values.max():.4f}\n")
+                self.ion_text.insert(tk.END, f"Intensity range: {intensity_values.min():.2f} - {intensity_values.max():.2f}\n")
+                
+                # Top 5 most intense ions
+                sorted_indices = np.argsort(intensity_values)[::-1]
+                self.ion_text.insert(tk.END, "\nTop 5 most intense ions:\n")
+                for j in range(min(5, len(sorted_indices))):
+                    idx = sorted_indices[j]
+                    mz = mz_values[idx]
+                    intensity = intensity_values[idx]
+                    self.ion_text.insert(tk.END, f"  {j+1}. m/z {mz:.4f}, intensity {intensity:.2f}\n")
+            else:
+                self.ion_text.insert(tk.END, "No ion data available\n")
+            
+            if i < len(selected_spectra) - 1:
+                self.ion_text.insert(tk.END, "\n")
+
+        self.ion_text.config(state="disabled")
+
+    def _close_popup(self):
+        """Close the popup window."""
+        if self.popup:
+            self.popup.destroy()
+
+
+class SpectrumVisualizationPopup(ttk.Frame):
+    """Spectrum visualization component for popup windows (simplified version)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parser: Optional[MGFParser] = None
+        self.selected_spectrum_ids: List[int] = []
+        self.show_combined_plot = tk.BooleanVar(value=False)
+        self.ppm_tolerance = tk.DoubleVar(value=20.0)
+        self.top_fragments_count = tk.IntVar(value=15)  # Number of top fragments to show
+        self.naming_scheme = "Numbered"  # Current spectrum naming scheme
+
+        self._create_widgets()
+
+    def _create_widgets(self):
+        """Create the visualization widgets."""
+        # Header with controls
+        header_frame = ttk.Frame(self)
+        header_frame.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(
+            header_frame, text="Spectrum Visualization", font=("Arial", 12, "bold")
+        ).pack(side="left")
+
+        # Controls frame
+        controls_frame = ttk.Frame(header_frame)
+        controls_frame.pack(side="right")
+
+        # Combined plot checkbox
+        ttk.Checkbutton(
+            controls_frame,
+            text="Show Combined Plot",
+            variable=self.show_combined_plot,
+            command=self._plot_spectra
+        ).pack(side="left", padx=(0, 10))
+
+        # PPM tolerance for fragment matching in combined plot
+        ttk.Label(controls_frame, text="PPM tolerance:").pack(side="left", padx=(0, 2))
+        ppm_spinbox = ttk.Spinbox(
+            controls_frame,
+            from_=1.0,
+            to=100.0,
+            increment=1.0,
+            width=8,
+            textvariable=self.ppm_tolerance,
+            command=self._on_ppm_change
+        )
+        ppm_spinbox.pack(side="left", padx=(0, 10))
+        ppm_spinbox.bind('<KeyRelease>', self._on_ppm_change)
+
+        # Top fragments count for combined plot
+        ttk.Label(controls_frame, text="Top fragments:").pack(side="left", padx=(0, 2))
+        fragments_spinbox = ttk.Spinbox(
+            controls_frame,
+            from_=5,
+            to=50,
+            increment=1,
+            width=6,
+            textvariable=self.top_fragments_count,
+            command=self._on_fragments_count_change
+        )
+        fragments_spinbox.pack(side="left")
+        fragments_spinbox.bind('<KeyRelease>', self._on_fragments_count_change)
+
+        # Matplotlib figure
+        self.figure = Figure(figsize=(10, 6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, self)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=(5, 0))
+
+        # Add navigation toolbar
+        toolbar_frame = ttk.Frame(self)
+        toolbar_frame.pack(fill="x", padx=5, pady=(0, 5))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+
+    def _get_spectrum_display_name(self, spectrum_or_id):
+        """Get the display name for a spectrum based on the current naming scheme."""
+        # Handle both spectrum objects and spectrum IDs
+        if isinstance(spectrum_or_id, (str, int)):
+            # It's a spectrum ID, find the spectrum object
+            spectrum_id = spectrum_or_id
+            if not self.parser:
+                return f"S {spectrum_id}"
+            
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
+            )
+            if not spectrum:
+                return f"S {spectrum_id}"
+        else:
+            # It's already a spectrum object
+            spectrum = spectrum_or_id
+            spectrum_id = spectrum.spectrum_id
+        
+        # Use the local naming scheme
+        if self.naming_scheme == "Numbered":
+            return f"S {spectrum_id}"
+        else:
+            # Use the metadata value for the naming key
+            name_value = spectrum.get_metadata_value(self.naming_scheme)
+            if name_value:
+                return str(name_value)
+            else:
+                return f"S {spectrum_id}"  # Fall back to numbered if key not found
+
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
+        """Load and visualize selected spectra."""
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids
+        self._plot_spectra()
+
+    def _plot_spectra(self):
+        """Plot the selected spectra."""
+        self.figure.clear()
+
+        if not self.parser or not self.selected_spectrum_ids:
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, "No spectra selected", ha="center", va="center", 
+                   transform=ax.transAxes)
+            self.canvas.draw()
+            return
+
+        # Get selected spectra
+        selected_spectra = [
+            s for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+
+        if not selected_spectra:
+            return
+
+        if self.show_combined_plot.get() and len(selected_spectra) > 1:
+            self._plot_combined_spectra(selected_spectra)
+        else:
+            self._plot_individual_spectra(selected_spectra)
+
+    def _plot_individual_spectra(self, selected_spectra):
+        """Plot individual spectra in separate subplots."""
+        # Limit to 10 spectra for popup
+        if len(selected_spectra) > 10:
+            selected_spectra = selected_spectra[:10]
+
+        # Calculate global m/z limits
+        global_mz_min = float("inf")
+        global_mz_max = float("-inf")
+
+        for spectrum in selected_spectra:
+            if spectrum.ions.size > 0:
+                mz_values = spectrum.ions[:, 0]
+                global_mz_min = min(global_mz_min, mz_values.min())
+                global_mz_max = max(global_mz_max, mz_values.max())
+
+        # Add padding
+        if global_mz_min != float("inf") and global_mz_max != float("-inf"):
+            mz_range = global_mz_max - global_mz_min
+            padding = mz_range * 0.02
+            global_mz_min -= padding
+            global_mz_max += padding
+        else:
+            global_mz_min, global_mz_max = 0, 1000
+
+        # Create subplots
+        n_spectra = len(selected_spectra)
+        for i, spectrum in enumerate(selected_spectra):
+            is_last = i == n_spectra - 1
+            ax = self.figure.add_subplot(n_spectra, 1, i + 1)
+            self._plot_single_spectrum(ax, spectrum, (global_mz_min, global_mz_max), is_last)
+
+        self.figure.tight_layout(pad=0.5, h_pad=0.2)
+        self.canvas.draw()
+
+    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None, is_last=False):
+        """Plot a single spectrum as a stick chart."""
+        if spectrum.ions.size == 0:
+            ax.text(0.5, 0.5, "No ion data", ha="center", va="center", 
+                   transform=ax.transAxes)
+            if mz_limits:
+                ax.set_xlim(mz_limits)
+            return
+
+        mz_values = spectrum.ions[:, 0]
+        intensity_values = spectrum.ions[:, 1]
+
+        # Create stick plot
+        ax.vlines(mz_values, 0, intensity_values, colors="blue", linewidth=1.5)
+
+        # Only show x-axis label and ticks on the last spectrum
+        if is_last:
+            ax.set_xlabel("m/z")
+        else:
+            ax.set_xticklabels([])
+            ax.tick_params(axis="x", which="both", bottom=False)
+
+        ax.set_ylabel(f"S {spectrum.spectrum_id}\nIntensity", fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+        # Set limits
+        if mz_limits:
+            ax.set_xlim(mz_limits)
+        elif len(mz_values) > 0:
+            ax.set_xlim(mz_values.min() * 0.95, mz_values.max() * 1.05)
+
+        if len(intensity_values) > 0:
+            ax.set_ylim(0, intensity_values.max() * 1.1)
+
+    def _plot_combined_spectra(self, selected_spectra):
+        """Plot all selected spectra in a combined plot with fragment matching."""
+        # Limit to 10 spectra
+        if len(selected_spectra) > 10:
+            selected_spectra = selected_spectra[:10]
+
+        ax = self.figure.add_subplot(111)
+
+        # Use the same combined plotting logic as the main visualization
+        all_fragments = {}
+        spectrum_colors = plt.cm.tab10(np.linspace(0, 1, min(len(selected_spectra), 10)))
+        spectrum_info = {}
+
+        for i, spectrum in enumerate(selected_spectra):
+            if spectrum.ions.size == 0:
+                continue
+
+            mz_values = spectrum.ions[:, 0]
+            intensity_values = spectrum.ions[:, 1]
+            
+            # Sum-scale intensities
+            total_intensity = np.sum(intensity_values)
+            if total_intensity > 0:
+                relative_intensities = intensity_values / total_intensity
+            else:
+                relative_intensities = intensity_values
+
+            spectrum_info[spectrum.spectrum_id] = {
+                'color': spectrum_colors[i],
+                'index': i,
+                'label': self._get_spectrum_display_name(spectrum)
+            }
+
+            for mz, rel_intensity in zip(mz_values, relative_intensities):
+                if mz not in all_fragments:
+                    all_fragments[mz] = []
+                all_fragments[mz].append((spectrum.spectrum_id, rel_intensity))
+
+        # Group fragments by similar m/z values
+        fragment_groups = self._group_fragments_by_mz(all_fragments, self.ppm_tolerance.get())
+
+        # Calculate total intensity for each fragment group and sort by intensity
+        fragment_intensities = []
+        for group_mz, fragments_in_group in fragment_groups.items():
+            if len(fragments_in_group) > 1:  # Only consider fragments present in multiple spectra
+                total_intensity = sum(rel_intensity for _, rel_intensity in fragments_in_group)
+                fragment_intensities.append((total_intensity, group_mz, fragments_in_group))
+        
+        # Sort by total intensity (descending) and take top N
+        top_fragments_count = self.top_fragments_count.get()
+        fragment_intensities.sort(key=lambda x: x[0], reverse=True)
+        top_fragments = fragment_intensities[:top_fragments_count]
+
+        # Create a plot showing spectra on x-axis and relative abundance on y-axis
+        
+        # Sort spectrum IDs by their display names using natural sorting
+        sorted_spec_ids = list(spectrum_info.keys())
+        try:
+            sorted_spec_ids = natsorted(sorted_spec_ids, 
+                                      key=lambda spec_id: self._get_spectrum_display_name(spec_id))
+        except NameError:
+            # Fallback to regular sorting if natsort is not available
+            sorted_spec_ids = sorted(sorted_spec_ids, 
+                                   key=lambda spec_id: self._get_spectrum_display_name(spec_id))
+        
+        spectrum_positions = {spec_id: i for i, spec_id in enumerate(sorted_spec_ids)}
+        spectrum_labels = [self._get_spectrum_display_name(spec_id) for spec_id in sorted_spec_ids]
+
+        # Plot each top fragment group as a line connecting spectra
+        for total_intensity, group_mz, fragments_in_group in top_fragments:
+            x_positions = []
+            y_intensities = []
+            
+            sorted_fragments = sorted(fragments_in_group, 
+                                    key=lambda x: spectrum_info.get(x[0], {}).get('index', 999))
+            
+            for spectrum_id, rel_intensity in sorted_fragments:
+                if spectrum_id in spectrum_info:
+                    x_positions.append(spectrum_positions[spectrum_id])
+                    y_intensities.append(rel_intensity)
+            
+            if len(x_positions) > 1:
+                ax.plot(x_positions, y_intensities, 'o-', alpha=0.7, linewidth=2, 
+                       markersize=6, label=f'm/z {group_mz:.4f}')
+
+        # Set x-axis to show spectrum names
+        ax.set_xticks(range(len(spectrum_labels)))
+        ax.set_xticklabels(spectrum_labels, rotation=45, ha='right')
+        ax.set_xlabel("Spectra")
+        ax.set_ylabel("Relative Abundance (Sum-scaled)")
+        ax.set_title(f"Combined Spectrum Plot - Fragment Matching ({len(selected_spectra)} spectra)")
+        ax.grid(True, alpha=0.3)
+
+        # Add legend for fragment m/z values
+        handles, labels = ax.get_legend_handles_labels()
+        if len(handles) > 0:
+            legend_title = f"Top {min(len(handles), top_fragments_count)} fragments (by intensity)"
+            ax.legend(loc='upper right', framealpha=0.9, fontsize=8, title=legend_title)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _group_fragments_by_mz(self, all_fragments, ppm_tolerance):
+        """Group fragments by similar m/z values within PPM tolerance."""
+        fragment_groups = {}
+        sorted_mz_values = sorted(all_fragments.keys())
+        
+        for mz in sorted_mz_values:
+            group_found = False
+            for group_mz in fragment_groups:
+                ppm_diff = abs(mz - group_mz) / group_mz * 1e6
+                if ppm_diff <= ppm_tolerance:
+                    fragment_groups[group_mz].extend(all_fragments[mz])
+                    group_found = True
+                    break
+            
+            if not group_found:
+                fragment_groups[mz] = all_fragments[mz][:]
+        
+        return fragment_groups
+
+    def _on_ppm_change(self, event=None):
+        """Handle PPM tolerance change."""
+        if self.show_combined_plot.get():
+            self._plot_spectra()
+
+    def _on_fragments_count_change(self, event=None):
+        """Handle top fragments count change."""
+        if self.show_combined_plot.get():
+            self._plot_spectra()

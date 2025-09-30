@@ -14,6 +14,8 @@ A comprehensive GUI tool for exploring and editing MGF (Mascot Generic Format) f
   - Parse ion data as 2D numpy arrays (m/z, intensity)
   - Display spectra as stick charts with m/z on x-axis
   - View multiple spectra simultaneously
+  - **Combined spectrum plot** with fragment matching and natural sorting
+  - Popup windows for detailed spectrum analysis
 - **Interactive GUI**:
   - Tree view for spectrum selection and grouping
   - Metadata editor with unique value tracking
@@ -58,6 +60,8 @@ uv run mgfexplorer
    - Ion data tables appear in the bottom-left
    - Spectrum visualization in the bottom-right
    - Stick charts show m/z vs intensity
+   - **Combined Plot Mode**: View fragment matching across multiple spectra
+   - **Popup Windows**: Create separate windows for detailed spectrum analysis
 
 ### Key Components
 
@@ -79,6 +83,12 @@ uv run mgfexplorer
 #### Bottom-Right Panel - Spectrum Visualization
 - Stick chart visualization of selected spectra
 - Automatic scaling and multiple spectrum support
+- **Combined Plot Mode**: 
+  - Fragment matching with configurable PPM tolerance (default: 20 PPM)
+  - Top N fragments selection (default: 15)
+  - Natural sorting of spectrum names on x-axis
+  - Color-coded fragment lines connecting spectra
+- **Popup Windows**: Create separate analysis windows with full functionality
 
 ## Example Data
 
