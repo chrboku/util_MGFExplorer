@@ -1,6 +1,6 @@
 [project]
 name = "util-mgfexplorer"
-version = "0.24.0"
+version = "0.24.1"
 description = "A GUI tool for exploring and editing MGF (Mascot Generic Format) files"
 readme = "README.md"
 requires-python = ">=3.13"

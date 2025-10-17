@@ -945,10 +945,6 @@ class MetadataEditor(ttk.Frame):
         header_frame = ttk.Frame(self)
         header_frame.pack(fill="x", padx=5, pady=5)
 
-        ttk.Label(
-            header_frame, text="Metadata Editor", font=("Arial", 12, "bold")
-        ).pack()
-
         # Main content area with horizontal split
         content_frame = ttk.Frame(self)
         content_frame.pack(fill="both", expand=True, padx=5, pady=5)
