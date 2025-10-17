@@ -21,6 +21,7 @@ from .gui_components import (
     ProgressDialog,
     PPMDeviationPlotDialog,
     SpectrumPopupWindow,
+    FragmentDistributionDialog,
 )
 from .molecular_formula import (
     FragmentAnnotator,
@@ -205,6 +206,11 @@ class MGFExplorerApp:
 
         # Will be populated when data is loaded
         self.spectrum_name_menu = spectrum_name_menu
+
+        view_menu.add_separator()
+        view_menu.add_command(
+            label="Fragment Distribution...", command=self._show_fragment_distribution
+        )
 
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -1753,6 +1759,20 @@ class MGFExplorerApp:
 
         # Fallback (should not reach here)
         return config["ppm_tolerance"]
+
+    def _show_fragment_distribution(self):
+        """Show the fragment distribution dialog."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showinfo(
+                "No Data", "No spectra loaded. Please load an MGF file first."
+            )
+            return
+
+        # Get currently selected spectrum IDs
+        selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+
+        dialog = FragmentDistributionDialog(self.root)
+        dialog.show(self.parser, selected_ids)
 
     def show_about(self):
         """Show about dialog."""

@@ -6829,3 +6829,720 @@ class SpectrumVisualizationPopup(ttk.Frame):
         """Handle top fragments count change."""
         if self.show_combined_plot.get():
             self._plot_spectra()
+
+
+class FragmentDistributionDialog:
+    """Dialog for analyzing fragment distribution across all spectra."""
+
+    def __init__(self, parent):
+        """Initialize the dialog."""
+        self.parent = parent
+        self.dialog = None
+        self.parser = None
+        self.fragments_data = []
+        self.selected_fragments = []
+        self.canvas = None
+        self.toolbar = None
+        self.figure = None
+        self.ax = None
+        self.intensity_mode_var = None
+        self.selector = None
+        self.selection_active = False
+
+    def show(self, parser, selected_spectrum_ids=None):
+        """Show the fragment distribution dialog."""
+        if not parser or not parser.spectra:
+            messagebox.showinfo("No Data", "No spectra data available.")
+            return
+
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids or []
+
+        # Create dialog window
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Fragment Distribution Analysis")
+        self.dialog.geometry("1200x800")
+        self.dialog.resizable(True, True)
+        self.dialog.grab_set()  # Make modal
+
+        # Main frame
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="Fragment Distribution Across All Spectra",
+            font=("Arial", 14, "bold"),
+        )
+        title_label.pack(pady=(0, 10))
+
+        # Controls frame
+        controls_frame = ttk.LabelFrame(main_frame, text="Controls", padding=5)
+        controls_frame.pack(fill="x", pady=(0, 10))
+
+        # Intensity mode selection
+        intensity_frame = ttk.Frame(controls_frame)
+        intensity_frame.pack(fill="x", pady=5)
+
+        ttk.Label(intensity_frame, text="Intensity Mode:").pack(
+            side="left", padx=(0, 10)
+        )
+
+        self.intensity_mode_var = tk.StringVar(value="raw")
+        intensity_modes = [
+            ("Raw", "raw"),
+            ("Relative to Sum", "relative_sum"),
+            ("Relative to Most Abundant", "relative_max"),
+        ]
+
+        for text, value in intensity_modes:
+            ttk.Radiobutton(
+                intensity_frame,
+                text=text,
+                variable=self.intensity_mode_var,
+                value=value,
+                command=self._update_plot,
+            ).pack(side="left", padx=10)
+
+        # Spectrum selection frame
+        spectrum_frame = ttk.Frame(controls_frame)
+        spectrum_frame.pack(fill="x", pady=5)
+
+        ttk.Label(spectrum_frame, text="Spectra to Analyze:").pack(
+            side="left", padx=(0, 10)
+        )
+
+        self.spectrum_mode_var = tk.StringVar(value="all")
+
+        # Check if there are selected spectra to determine default
+        if self.selected_spectrum_ids:
+            default_mode = "selected"
+            self.spectrum_mode_var.set("selected")
+        else:
+            default_mode = "all"
+
+        ttk.Radiobutton(
+            spectrum_frame,
+            text=f"Use All Spectra ({len(self.parser.spectra)})",
+            variable=self.spectrum_mode_var,
+            value="all",
+            command=self._update_plot,
+        ).pack(side="left", padx=10)
+
+        selected_count = (
+            len(self.selected_spectrum_ids) if self.selected_spectrum_ids else 0
+        )
+        ttk.Radiobutton(
+            spectrum_frame,
+            text=f"Use Selected Spectra ({selected_count})",
+            variable=self.spectrum_mode_var,
+            value="selected",
+            command=self._update_plot,
+            state="normal" if selected_count > 0 else "disabled",
+        ).pack(side="left", padx=10)
+
+        # Selection info frame
+        selection_frame = ttk.Frame(controls_frame)
+        selection_frame.pack(fill="x", pady=5)
+
+        ttk.Label(selection_frame, text="Selection:").pack(side="left", padx=(0, 10))
+
+        ttk.Button(
+            selection_frame,
+            text="Enable Rectangle Selection",
+            command=self._toggle_selection,
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            selection_frame, text="Clear Selection", command=self._clear_selection
+        ).pack(side="left", padx=5)
+
+        # Plot frame
+        plot_frame = ttk.LabelFrame(
+            main_frame, text="Fragment Distribution Plot", padding=5
+        )
+        plot_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Create matplotlib figure
+        self.figure = Figure(figsize=(12, 6), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, plot_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
+
+        # Add navigation toolbar for zoom/pan functionality
+        toolbar_frame = ttk.Frame(plot_frame)
+        toolbar_frame.pack(fill="x", pady=(0, 5))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+
+        # Results frame
+        results_frame = ttk.LabelFrame(main_frame, text="Selection Results", padding=5)
+        results_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Create notebook for results
+        results_notebook = ttk.Notebook(results_frame)
+        results_notebook.pack(fill="both", expand=True)
+
+        # Fragments table tab
+        fragments_tab = ttk.Frame(results_notebook)
+        results_notebook.add(fragments_tab, text="Selected Fragments")
+
+        # Create fragments table
+        self._create_fragments_table(fragments_tab)
+
+        # Annotations tab
+        annotations_tab = ttk.Frame(results_notebook)
+        results_notebook.add(annotations_tab, text="Chemical Formulas")
+
+        # Create annotations table
+        self._create_annotations_table(annotations_tab)
+
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x")
+
+        # Remove fragments button
+        ttk.Button(
+            button_frame,
+            text="Remove Selected Fragments",
+            command=self._remove_fragments,
+            style="Accent.TButton",
+        ).pack(side="left", padx=(0, 5))
+
+        # Export button
+        ttk.Button(
+            button_frame, text="Export Selection", command=self._export_selection
+        ).pack(side="left", padx=5)
+
+        # Close button
+        ttk.Button(button_frame, text="Close", command=self._close).pack(side="right")
+
+        # Prepare fragment data and initial plot
+        self._update_plot()
+
+        # Center the dialog
+        self.dialog.transient(self.parent)
+        self.dialog.wait_window()
+
+    def _prepare_fragment_data(self):
+        """Prepare fragment data from selected or all spectra."""
+        self.fragments_data = []
+
+        # Determine which spectra to use
+        if (
+            hasattr(self, "spectrum_mode_var")
+            and self.spectrum_mode_var.get() == "selected"
+        ):
+            # Use only selected spectra
+            spectra_to_use = [
+                spectrum
+                for spectrum in self.parser.spectra
+                if spectrum.spectrum_id in self.selected_spectrum_ids
+            ]
+        else:
+            # Use all spectra
+            spectra_to_use = self.parser.spectra
+
+        for spectrum in spectra_to_use:
+            if len(spectrum.ions) == 0:
+                continue
+
+            spectrum_id = spectrum.spectrum_id
+
+            for i, (mz, intensity) in enumerate(spectrum.ions):
+                # Get annotations if available
+                annotations = spectrum.get_fragment_annotations(i)
+
+                fragment_data = {
+                    "spectrum_id": spectrum_id,
+                    "ion_index": i,
+                    "mz": mz,
+                    "raw_intensity": intensity,
+                    "annotations": annotations,
+                }
+
+                self.fragments_data.append(fragment_data)
+
+    def _calculate_intensities(self):
+        """Calculate intensities based on selected mode."""
+        mode = self.intensity_mode_var.get()
+
+        if mode == "raw":
+            return [f["raw_intensity"] for f in self.fragments_data]
+
+        # Group fragments by spectrum for relative calculations
+        spectrum_data = {}
+        for fragment in self.fragments_data:
+            spec_id = fragment["spectrum_id"]
+            if spec_id not in spectrum_data:
+                spectrum_data[spec_id] = []
+            spectrum_data[spec_id].append(fragment)
+
+        intensities = []
+        for fragment in self.fragments_data:
+            spec_id = fragment["spectrum_id"]
+            spec_fragments = spectrum_data[spec_id]
+            raw_intensity = fragment["raw_intensity"]
+
+            if mode == "relative_sum":
+                total_intensity = sum(f["raw_intensity"] for f in spec_fragments)
+                if total_intensity > 0:
+                    intensities.append((raw_intensity / total_intensity) * 100)
+                else:
+                    intensities.append(0)
+            elif mode == "relative_max":
+                max_intensity = max(f["raw_intensity"] for f in spec_fragments)
+                if max_intensity > 0:
+                    intensities.append((raw_intensity / max_intensity) * 100)
+                else:
+                    intensities.append(0)
+            else:
+                intensities.append(raw_intensity)
+
+        return intensities
+
+    def _update_plot(self):
+        """Update the fragment distribution plot."""
+        # Prepare data first (this respects the spectrum selection mode)
+        self._prepare_fragment_data()
+
+        if not self.fragments_data:
+            return
+
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+
+        # Get data
+        mz_values = [f["mz"] for f in self.fragments_data]
+        intensities = self._calculate_intensities()
+
+        # Create scatter plot
+        self.ax.scatter(
+            mz_values, intensities, alpha=0.6, s=20, c="blue", edgecolors="none"
+        )
+
+        # Set labels
+        self.ax.set_xlabel("m/z", fontsize=12)
+
+        mode = self.intensity_mode_var.get()
+        if mode == "raw":
+            ylabel = "Intensity"
+        elif mode == "relative_sum":
+            ylabel = "Relative Intensity (% of sum)"
+        else:  # relative_max
+            ylabel = "Relative Intensity (% of max)"
+
+        self.ax.set_ylabel(ylabel, fontsize=12)
+
+        # Dynamic title based on spectrum selection mode
+        if (
+            hasattr(self, "spectrum_mode_var")
+            and self.spectrum_mode_var.get() == "selected"
+        ):
+            spectra_count = len(self.selected_spectrum_ids)
+            title = f"Fragment Distribution Across {spectra_count} Selected Spectra"
+        else:
+            spectra_count = len(self.parser.spectra)
+            title = f"Fragment Distribution Across All {spectra_count} Spectra"
+
+        self.ax.set_title(title, fontsize=14, fontweight="bold")
+
+        # Add grid
+        self.ax.grid(True, alpha=0.3)
+
+        # Reset selector if it exists
+        if self.selector:
+            self.selector.disconnect_events()
+        self.selector = None
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _toggle_selection(self):
+        """Toggle rectangle selection mode."""
+        if not self.selection_active:
+            from matplotlib.widgets import RectangleSelector
+
+            def onselect(eclick, erelease):
+                """Handle rectangle selection."""
+                x1, x2 = sorted([eclick.xdata, erelease.xdata])
+                y1, y2 = sorted([eclick.ydata, erelease.ydata])
+
+                if x1 is not None and y1 is not None:
+                    self._select_fragments_in_range(x1, x2, y1, y2)
+
+            self.selector = RectangleSelector(
+                self.ax,
+                onselect,
+                useblit=True,
+                button=[1],  # Only left mouse button
+                minspanx=5,
+                minspany=5,
+                spancoords="pixels",
+                interactive=True,
+            )
+
+            self.selection_active = True
+            self.toolbar.set_message(
+                "Rectangle selection enabled. Click and drag to select fragments."
+            )
+        else:
+            if self.selector:
+                self.selector.disconnect_events()
+                self.selector = None
+            self.selection_active = False
+            self.toolbar.set_message("")
+
+    def _select_fragments_in_range(self, x1, x2, y1, y2):
+        """Select fragments within the specified range."""
+        intensities = self._calculate_intensities()
+
+        self.selected_fragments = []
+        for i, fragment in enumerate(self.fragments_data):
+            mz = fragment["mz"]
+            intensity = intensities[i]
+
+            if x1 <= mz <= x2 and y1 <= intensity <= y2:
+                self.selected_fragments.append(
+                    {**fragment, "calculated_intensity": intensity}
+                )
+
+        # Update tables
+        self._update_fragments_table()
+        self._update_annotations_table()
+
+        # Highlight selected points
+        self._highlight_selection()
+
+    def _highlight_selection(self):
+        """Highlight selected fragments on the plot."""
+        if not self.selected_fragments:
+            return
+
+        # Get selected data points
+        selected_mz = [f["mz"] for f in self.selected_fragments]
+        selected_intensity = [
+            f["calculated_intensity"] for f in self.selected_fragments
+        ]
+
+        # Note: Highlighting disabled per user request
+        # No visual highlighting of selected fragments
+
+        self.canvas.draw()
+
+    def _clear_selection(self):
+        """Clear current selection."""
+        self.selected_fragments = []
+        self._update_fragments_table()
+        self._update_annotations_table()
+        self._update_plot()  # Redraw without highlights
+
+    def _create_fragments_table(self, parent):
+        """Create the fragments table."""
+        # Table frame
+        table_frame = ttk.Frame(parent)
+        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Create treeview
+        columns = (
+            "Spectrum ID",
+            "m/z",
+            "Raw Intensity",
+            "Calculated Intensity",
+            "Annotations",
+            "PPM Deviation",
+        )
+        self.fragments_tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=8
+        )
+
+        # Configure columns
+        self.fragments_tree.heading("Spectrum ID", text="Spectrum ID")
+        self.fragments_tree.heading("m/z", text="m/z")
+        self.fragments_tree.heading("Raw Intensity", text="Raw Intensity")
+        self.fragments_tree.heading("Calculated Intensity", text="Calculated Intensity")
+        self.fragments_tree.heading("Annotations", text="Annotations")
+        self.fragments_tree.heading("PPM Deviation", text="PPM Deviation")
+
+        self.fragments_tree.column("Spectrum ID", width=100)
+        self.fragments_tree.column("m/z", width=100)
+        self.fragments_tree.column("Raw Intensity", width=120)
+        self.fragments_tree.column("Calculated Intensity", width=140)
+        self.fragments_tree.column("Annotations", width=200)
+        self.fragments_tree.column("PPM Deviation", width=120)
+
+        # Scrollbars
+        v_scrollbar = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.fragments_tree.yview
+        )
+        h_scrollbar = ttk.Scrollbar(
+            table_frame, orient="horizontal", command=self.fragments_tree.xview
+        )
+        self.fragments_tree.configure(
+            yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set
+        )
+
+        # Pack elements
+        self.fragments_tree.pack(side="left", fill="both", expand=True)
+        v_scrollbar.pack(side="right", fill="y")
+        h_scrollbar.pack(side="bottom", fill="x")
+
+    def _create_annotations_table(self, parent):
+        """Create the annotations table."""
+        # Table frame
+        table_frame = ttk.Frame(parent)
+        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Create treeview
+        columns = (
+            "Formula",
+            "Count",
+            "Average PPM Error",
+            "Min PPM Error",
+            "Max PPM Error",
+            "StdDev PPM Error",
+        )
+        self.annotations_tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", height=8
+        )
+
+        # Configure columns
+        self.annotations_tree.heading("Formula", text="Chemical Formula")
+        self.annotations_tree.heading("Count", text="Occurrence Count")
+        self.annotations_tree.heading("Average PPM Error", text="Avg PPM Error")
+        self.annotations_tree.heading("Min PPM Error", text="Min PPM Error")
+        self.annotations_tree.heading("Max PPM Error", text="Max PPM Error")
+        self.annotations_tree.heading("StdDev PPM Error", text="StdDev PPM Error")
+
+        self.annotations_tree.column("Formula", width=200)
+        self.annotations_tree.column("Count", width=120)
+        self.annotations_tree.column("Average PPM Error", width=120)
+        self.annotations_tree.column("Min PPM Error", width=120)
+        self.annotations_tree.column("Max PPM Error", width=120)
+        self.annotations_tree.column("StdDev PPM Error", width=120)
+
+        # Scrollbars
+        v_scrollbar2 = ttk.Scrollbar(
+            table_frame, orient="vertical", command=self.annotations_tree.yview
+        )
+        h_scrollbar2 = ttk.Scrollbar(
+            table_frame, orient="horizontal", command=self.annotations_tree.xview
+        )
+        self.annotations_tree.configure(
+            yscrollcommand=v_scrollbar2.set, xscrollcommand=h_scrollbar2.set
+        )
+
+        # Pack elements
+        self.annotations_tree.pack(side="left", fill="both", expand=True)
+        v_scrollbar2.pack(side="right", fill="y")
+        h_scrollbar2.pack(side="bottom", fill="x")
+
+    def _update_fragments_table(self):
+        """Update the fragments table with selected data."""
+        # Clear existing items
+        for item in self.fragments_tree.get_children():
+            self.fragments_tree.delete(item)
+
+        # Add selected fragments
+        for fragment in self.selected_fragments:
+            # Format annotations
+            annotations_text = ""
+            ppm_deviations = []
+            if fragment["annotations"]:
+                formulas = [ann.get("formula", "") for ann in fragment["annotations"]]
+                annotations_text = ", ".join(filter(None, formulas))
+
+                # Collect PPM errors
+                for ann in fragment["annotations"]:
+                    ppm_error = ann.get("ppm_error")
+                    if ppm_error is not None:
+                        ppm_deviations.append(ppm_error)
+
+            # Format PPM deviation text
+            ppm_text = ""
+            if ppm_deviations:
+                if len(ppm_deviations) == 1:
+                    ppm_text = f"{ppm_deviations[0]:.2f}"
+                else:
+                    ppm_text = ", ".join([f"{ppm:.2f}" for ppm in ppm_deviations])
+
+            self.fragments_tree.insert(
+                "",
+                "end",
+                values=(
+                    fragment["spectrum_id"],
+                    f"{fragment['mz']:.4f}",
+                    f"{fragment['raw_intensity']:.2f}",
+                    f"{fragment['calculated_intensity']:.2f}",
+                    annotations_text,
+                    ppm_text,
+                ),
+            )
+
+    def _update_annotations_table(self):
+        """Update the annotations table with formula statistics."""
+        # Clear existing items
+        for item in self.annotations_tree.get_children():
+            self.annotations_tree.delete(item)
+
+        # Collect annotation statistics
+        formula_stats = {}
+        for fragment in self.selected_fragments:
+            for annotation in fragment["annotations"]:
+                formula = annotation.get("formula", "")
+                if formula:
+                    if formula not in formula_stats:
+                        formula_stats[formula] = {"count": 0, "ppm_errors": []}
+
+                    formula_stats[formula]["count"] += 1
+                    ppm_error = annotation.get("ppm_error")
+                    if ppm_error is not None:
+                        formula_stats[formula]["ppm_errors"].append(ppm_error)
+
+        # Add to table
+        for formula, stats in sorted(formula_stats.items()):
+            avg_ppm = ""
+            min_ppm = ""
+            max_ppm = ""
+            std_ppm = ""
+
+            if stats["ppm_errors"]:
+                ppm_array = np.array(stats["ppm_errors"])
+                avg_ppm = f"{np.mean(ppm_array):.2f}"
+                min_ppm = f"{np.min(ppm_array):.2f}"
+                max_ppm = f"{np.max(ppm_array):.2f}"
+
+                if len(ppm_array) > 1:
+                    std_ppm = (
+                        f"{np.std(ppm_array, ddof=1):.2f}"  # Sample standard deviation
+                    )
+                else:
+                    std_ppm = "N/A"
+
+            self.annotations_tree.insert(
+                "",
+                "end",
+                values=(formula, stats["count"], avg_ppm, min_ppm, max_ppm, std_ppm),
+            )
+
+    def _remove_fragments(self):
+        """Remove selected fragments from their respective spectra."""
+        if not self.selected_fragments:
+            messagebox.showinfo("No Selection", "No fragments selected for removal.")
+            return
+
+        result = messagebox.askyesno(
+            "Confirm Removal",
+            f"Are you sure you want to remove {len(self.selected_fragments)} selected fragments from their spectra?\n\nThis action cannot be undone.",
+        )
+
+        if not result:
+            return
+
+        # Group fragments by spectrum for efficient removal
+        spectrum_fragments = {}
+        for fragment in self.selected_fragments:
+            spec_id = fragment["spectrum_id"]
+            if spec_id not in spectrum_fragments:
+                spectrum_fragments[spec_id] = []
+            spectrum_fragments[spec_id].append(fragment["ion_index"])
+
+        # Remove fragments (in reverse order to maintain indices)
+        removed_count = 0
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id in spectrum_fragments:
+                indices_to_remove = sorted(
+                    spectrum_fragments[spectrum.spectrum_id], reverse=True
+                )
+
+                for ion_index in indices_to_remove:
+                    if ion_index < len(spectrum.ions):
+                        # Remove from ions array
+                        spectrum.ions = np.delete(spectrum.ions, ion_index, axis=0)
+
+                        # Update fragment annotations (shift indices)
+                        new_annotations = {}
+                        for idx, annotations in spectrum.fragment_annotations.items():
+                            if idx < ion_index:
+                                new_annotations[idx] = annotations
+                            elif idx > ion_index:
+                                new_annotations[idx - 1] = annotations
+                            # Skip the removed index
+
+                        spectrum.fragment_annotations = new_annotations
+                        removed_count += 1
+
+        messagebox.showinfo(
+            "Fragments Removed",
+            f"Successfully removed {removed_count} fragments from the spectra.",
+        )
+
+        # Refresh data and plot
+        self._clear_selection()
+        self._update_plot()
+
+        # Notify parent to refresh views if needed
+        if hasattr(self.parent, "_on_tree_selection"):
+            self.parent._on_tree_selection()
+
+    def _export_selection(self):
+        """Export selected fragments to a file."""
+        if not self.selected_fragments:
+            messagebox.showinfo("No Selection", "No fragments selected for export.")
+            return
+
+        from tkinter import filedialog
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+            title="Export Selected Fragments",
+        )
+
+        if not filename:
+            return
+
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as f:
+                f.write(
+                    "Spectrum_ID,m/z,Raw_Intensity,Calculated_Intensity,Annotations\n"
+                )
+
+                for fragment in self.selected_fragments:
+                    annotations = []
+                    for ann in fragment["annotations"]:
+                        formula = ann.get("formula", "")
+                        if formula:
+                            ppm = ann.get("ppm_error", "")
+                            if ppm != "":
+                                annotations.append(f"{formula}({ppm:.2f}ppm)")
+                            else:
+                                annotations.append(formula)
+
+                    annotations_str = "; ".join(annotations)
+
+                    f.write(
+                        f"{fragment['spectrum_id']},{fragment['mz']:.4f},"
+                        f"{fragment['raw_intensity']:.2f},{fragment['calculated_intensity']:.2f},"
+                        f'"{annotations_str}"\n'
+                    )
+
+            messagebox.showinfo(
+                "Export Complete", f"Selected fragments exported to:\n{filename}"
+            )
+
+        except Exception as e:
+            messagebox.showerror(
+                "Export Error", f"Failed to export fragments:\n{str(e)}"
+            )
+
+    def _close(self):
+        """Close the dialog."""
+        if self.selector:
+            self.selector.disconnect_events()
+        if self.dialog:
+            self.dialog.destroy()
