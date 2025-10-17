@@ -16,6 +16,7 @@ from .gui_components import (
     CosineSimilarityVisualization,
     FileLoadingDialog,
     SmartsFilterDialog,
+    IntensityFilterDialog,
     FragmentAnnotationDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
@@ -170,6 +171,9 @@ class MGFExplorerApp:
         menubar.add_cascade(label="Filter", menu=filter_menu)
         filter_menu.add_command(
             label="SMARTS Substructure Filter...", command=self._open_smarts_filter
+        )
+        filter_menu.add_command(
+            label="Intensity Filter...", command=self._open_intensity_filter
         )
 
         # Fragment annotation menu
@@ -1375,12 +1379,34 @@ class MGFExplorerApp:
 
         # Update status
         self.status_var.set(
-            f"SMARTS filter applied: {len(matching_spectra)} spectra remaining"
+            f"SMARTS filter applied - {len(matching_spectra)} spectra remaining"
         )
 
-        messagebox.showinfo(
-            "Filter Applied",
-            f"SMARTS filter applied successfully.\n{len(matching_spectra)} spectra remain.",
+    def _open_intensity_filter(self):
+        """Open intensity filter dialog."""
+        if not self.parser.spectra:
+            messagebox.showwarning(
+                "No Data", "Please load MGF data before using intensity filtering."
+            )
+            return
+
+        # Create intensity filter dialog
+        dialog = IntensityFilterDialog(
+            self.root, self.parser.spectra, self._apply_intensity_filter
+        )
+
+    def _apply_intensity_filter(self):
+        """Apply intensity filter - callback after filter is applied."""
+        # Update all views to reflect the filtered data
+        self.spectrum_tree.load_data(self.parser)
+        self.metadata_editor.clear()
+        self.spectrum_viz.clear_plot()
+        self.ion_table.clear()
+
+        # Update status
+        total_fragments = sum(len(spectrum.ions) for spectrum in self.parser.spectra)
+        self.status_var.set(
+            f"Intensity filter applied - {total_fragments} total fragments remaining"
         )
 
     def _generate_subformulas(self):

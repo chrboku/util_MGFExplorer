@@ -2983,6 +2983,9 @@ class IonDataTable(ttk.Frame):
             "<<TreeviewSelect>>", lambda event: self._on_ion_selection(event, spectrum)
         )
 
+        # Bind right-click event for context menu
+        tree.bind("<Button-3>", lambda event: self._on_right_click(event, spectrum))
+
         # Add scrollbars
         v_scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         h_scrollbar = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
@@ -3179,6 +3182,94 @@ class IonDataTable(ttk.Frame):
         # Update spectrum visualization if callback is set
         if self.spectrum_viz_callback:
             self.spectrum_viz_callback(spectrum.spectrum_id, selected_ion_indices)
+
+    def _on_right_click(self, event, spectrum):
+        """Handle right-click on ion table to show context menu."""
+        tree = event.widget
+
+        # Get the item under the cursor
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+
+        # Select the item if it's not already selected
+        if item not in tree.selection():
+            tree.selection_set(item)
+
+        # Get the ion index from the selected item
+        tags = tree.item(item)["tags"]
+        ion_index = None
+        for tag in tags:
+            if tag.startswith("ion_"):
+                ion_index = int(tag.split("_")[1])
+                break
+
+        if ion_index is None:
+            return
+
+        # Create context menu
+        context_menu = tk.Menu(tree, tearoff=0)
+        context_menu.add_command(
+            label="Delete fragment",
+            command=lambda: self._delete_fragment(spectrum, ion_index, tree),
+        )
+
+        # Show context menu
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+
+    def _delete_fragment(self, spectrum, ion_index, tree):
+        """Delete a specific fragment after confirmation."""
+        # Get fragment info for confirmation
+        if ion_index >= len(spectrum.ions):
+            messagebox.showerror("Error", "Invalid fragment index.")
+            return
+
+        mz_value = spectrum.ions[ion_index, 0]
+        intensity_value = spectrum.ions[ion_index, 1]
+
+        # Confirmation dialog
+        result = messagebox.askyesno(
+            "Confirm Deletion",
+            f"Are you sure you want to delete fragment at m/z {mz_value:.6f} "
+            f"with intensity {intensity_value:.3f}?\n\n"
+            f"This action cannot be undone.",
+        )
+
+        if not result:
+            return
+
+        # Delete the fragment
+        mask = np.ones(len(spectrum.ions), dtype=bool)
+        mask[ion_index] = False
+        spectrum.ions = spectrum.ions[mask]
+
+        # Update fragment annotations - reindex them
+        if spectrum.fragment_annotations:
+            new_annotations = {}
+            for old_idx, annotations in spectrum.fragment_annotations.items():
+                if old_idx < ion_index:
+                    # Indices before deleted fragment stay the same
+                    new_annotations[old_idx] = annotations
+                elif old_idx > ion_index:
+                    # Indices after deleted fragment shift down by 1
+                    new_annotations[old_idx - 1] = annotations
+                # old_idx == ion_index gets deleted (not added to new_annotations)
+            spectrum.fragment_annotations = new_annotations
+
+        # Refresh the table display
+        self._populate_table_data(tree, spectrum)
+
+        # Update spectrum visualization if callback is set
+        if self.spectrum_viz_callback:
+            self.spectrum_viz_callback(spectrum.spectrum_id, [])  # Clear selection
+
+        messagebox.showinfo(
+            "Fragment Deleted",
+            f"Fragment at m/z {mz_value:.6f} has been successfully deleted.",
+        )
 
     def _get_precursor_mass(self, spectrum):
         """Extract precursor mass from spectrum metadata."""
@@ -6019,6 +6110,342 @@ class SpectrumPopupWindow:
         """Close the popup window."""
         if self.popup:
             self.popup.destroy()
+
+
+class IntensityFilterDialog:
+    """Dialog for intensity filtering of spectra."""
+
+    def __init__(self, parent, spectra, apply_callback):
+        self.parent = parent
+        self.spectra = spectra
+        self.apply_callback = apply_callback
+
+        # Create dialog window
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Intensity Filter")
+        self.dialog.geometry("500x550")
+        self.dialog.resizable(False, False)
+        self.dialog.grab_set()  # Make dialog modal
+
+        # Center the dialog
+        self.dialog.transient(parent)
+        self.dialog.update_idletasks()
+        x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (550 // 2)
+        self.dialog.geometry(f"500x550+{x}+{y}")
+
+        self._create_widgets()
+
+    def _create_widgets(self):
+        """Create dialog widgets."""
+        # Main frame
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill="both", expand=True)
+
+        # Title label
+        title_label = ttk.Label(
+            main_frame, text="Intensity Filter Options", font=("Arial", 14, "bold")
+        )
+        title_label.pack(pady=(0, 20))
+
+        # Filter 1: Global intensity threshold
+        self.global_enabled = tk.BooleanVar()
+        global_frame = ttk.LabelFrame(
+            main_frame, text="Global Intensity Threshold", padding=10
+        )
+        global_frame.pack(fill="x", pady=(0, 15))
+
+        global_check_frame = ttk.Frame(global_frame)
+        global_check_frame.pack(fill="x")
+
+        self.global_checkbox = ttk.Checkbutton(
+            global_check_frame,
+            text="Enable global intensity filter",
+            variable=self.global_enabled,
+            command=self._on_global_enabled_change,
+        )
+        self.global_checkbox.pack(side="left")
+
+        global_input_frame = ttk.Frame(global_frame)
+        global_input_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(global_input_frame, text="Minimum intensity:").pack(side="left")
+        self.global_value = tk.StringVar(value="1000")
+        self.global_entry = ttk.Entry(
+            global_input_frame,
+            textvariable=self.global_value,
+            width=15,
+            state="disabled",
+        )
+        self.global_entry.pack(side="left", padx=(10, 0))
+
+        # Filter 2: Relative to most abundant
+        self.relative_max_enabled = tk.BooleanVar()
+        relative_max_frame = ttk.LabelFrame(
+            main_frame, text="Relative to Most Abundant Signal", padding=10
+        )
+        relative_max_frame.pack(fill="x", pady=(0, 15))
+
+        relative_max_check_frame = ttk.Frame(relative_max_frame)
+        relative_max_check_frame.pack(fill="x")
+
+        self.relative_max_checkbox = ttk.Checkbutton(
+            relative_max_check_frame,
+            text="Enable relative filter (most abundant)",
+            variable=self.relative_max_enabled,
+            command=self._on_relative_max_enabled_change,
+        )
+        self.relative_max_checkbox.pack(side="left")
+
+        relative_max_input_frame = ttk.Frame(relative_max_frame)
+        relative_max_input_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(relative_max_input_frame, text="Minimum percentage:").pack(
+            side="left"
+        )
+        self.relative_max_value = tk.DoubleVar(value=5.0)
+        self.relative_max_spinbox = ttk.Spinbox(
+            relative_max_input_frame,
+            from_=0.0,
+            to=100.0,
+            increment=0.01,
+            textvariable=self.relative_max_value,
+            width=15,
+            format="%.2f",
+            state="disabled",
+        )
+        self.relative_max_spinbox.pack(side="left", padx=(10, 0))
+        ttk.Label(relative_max_input_frame, text="%").pack(side="left", padx=(5, 0))
+
+        # Filter 3: Relative to sum of all signals
+        self.relative_sum_enabled = tk.BooleanVar()
+        relative_sum_frame = ttk.LabelFrame(
+            main_frame, text="Relative to Sum of All Signals", padding=10
+        )
+        relative_sum_frame.pack(fill="x", pady=(0, 20))
+
+        relative_sum_check_frame = ttk.Frame(relative_sum_frame)
+        relative_sum_check_frame.pack(fill="x")
+
+        self.relative_sum_checkbox = ttk.Checkbutton(
+            relative_sum_check_frame,
+            text="Enable relative filter (total sum)",
+            variable=self.relative_sum_enabled,
+            command=self._on_relative_sum_enabled_change,
+        )
+        self.relative_sum_checkbox.pack(side="left")
+
+        relative_sum_input_frame = ttk.Frame(relative_sum_frame)
+        relative_sum_input_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(relative_sum_input_frame, text="Minimum percentage:").pack(
+            side="left"
+        )
+        self.relative_sum_value = tk.DoubleVar(value=1.0)
+        self.relative_sum_spinbox = ttk.Spinbox(
+            relative_sum_input_frame,
+            from_=0.0,
+            to=100.0,
+            increment=0.01,
+            textvariable=self.relative_sum_value,
+            width=15,
+            format="%.2f",
+            state="disabled",
+        )
+        self.relative_sum_spinbox.pack(side="left", padx=(10, 0))
+        ttk.Label(relative_sum_input_frame, text="%").pack(side="left", padx=(5, 0))
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(20, 0))
+
+        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
+            side="right", padx=(10, 0)
+        )
+        ttk.Button(button_frame, text="Apply Filter", command=self._apply_filter).pack(
+            side="right"
+        )
+
+    def _on_global_enabled_change(self):
+        """Handle global filter checkbox change."""
+        if self.global_enabled.get():
+            self.global_entry.config(state="normal")
+        else:
+            self.global_entry.config(state="disabled")
+
+    def _on_relative_max_enabled_change(self):
+        """Handle relative max filter checkbox change."""
+        if self.relative_max_enabled.get():
+            self.relative_max_spinbox.config(state="normal")
+        else:
+            self.relative_max_spinbox.config(state="disabled")
+
+    def _on_relative_sum_enabled_change(self):
+        """Handle relative sum filter checkbox change."""
+        if self.relative_sum_enabled.get():
+            self.relative_sum_spinbox.config(state="normal")
+        else:
+            self.relative_sum_spinbox.config(state="disabled")
+
+    def _validate_inputs(self):
+        """Validate user inputs."""
+        # Check if at least one filter is enabled
+        if not (
+            self.global_enabled.get()
+            or self.relative_max_enabled.get()
+            or self.relative_sum_enabled.get()
+        ):
+            messagebox.showerror("Error", "Please enable at least one filter.")
+            return False
+
+        # Validate global intensity value
+        if self.global_enabled.get():
+            try:
+                value = float(self.global_value.get())
+                if value < 0:
+                    messagebox.showerror(
+                        "Error", "Global intensity threshold must be non-negative."
+                    )
+                    return False
+            except ValueError:
+                messagebox.showerror(
+                    "Error", "Global intensity threshold must be a valid number."
+                )
+                return False
+
+        # Validate relative percentages
+        if self.relative_max_enabled.get():
+            value = self.relative_max_value.get()
+            if value < 0 or value > 100:
+                messagebox.showerror(
+                    "Error",
+                    "Relative percentage (most abundant) must be between 0 and 100.",
+                )
+                return False
+
+        if self.relative_sum_enabled.get():
+            value = self.relative_sum_value.get()
+            if value < 0 or value > 100:
+                messagebox.showerror(
+                    "Error",
+                    "Relative percentage (total sum) must be between 0 and 100.",
+                )
+                return False
+
+        return True
+
+    def _apply_filter(self):
+        """Apply the intensity filter."""
+        if not self._validate_inputs():
+            return
+
+        # Prepare filter parameters
+        filter_params = {
+            "global_enabled": self.global_enabled.get(),
+            "global_threshold": float(self.global_value.get())
+            if self.global_enabled.get()
+            else None,
+            "relative_max_enabled": self.relative_max_enabled.get(),
+            "relative_max_percentage": self.relative_max_value.get()
+            if self.relative_max_enabled.get()
+            else None,
+            "relative_sum_enabled": self.relative_sum_enabled.get(),
+            "relative_sum_percentage": self.relative_sum_value.get()
+            if self.relative_sum_enabled.get()
+            else None,
+        }
+
+        # Apply filter to all spectra
+        filtered_count = 0
+        total_fragments_before = 0
+        total_fragments_after = 0
+
+        for spectrum in self.spectra:
+            if spectrum.ions.size == 0:
+                continue
+
+            original_count = len(spectrum.ions)
+            total_fragments_before += original_count
+
+            # Get current ions
+            mz_values = spectrum.ions[:, 0]
+            intensity_values = spectrum.ions[:, 1]
+
+            # Create mask for fragments to keep
+            keep_mask = np.ones(len(intensity_values), dtype=bool)
+
+            # Apply global intensity filter
+            if filter_params["global_enabled"]:
+                global_mask = intensity_values >= filter_params["global_threshold"]
+                keep_mask = keep_mask & global_mask
+
+            # Apply relative to most abundant filter
+            if filter_params["relative_max_enabled"]:
+                max_intensity = np.max(intensity_values)
+                threshold = max_intensity * (
+                    filter_params["relative_max_percentage"] / 100.0
+                )
+                relative_max_mask = intensity_values >= threshold
+                keep_mask = keep_mask & relative_max_mask
+
+            # Apply relative to sum filter
+            if filter_params["relative_sum_enabled"]:
+                sum_intensity = np.sum(intensity_values)
+                threshold = sum_intensity * (
+                    filter_params["relative_sum_percentage"] / 100.0
+                )
+                relative_sum_mask = intensity_values >= threshold
+                keep_mask = keep_mask & relative_sum_mask
+
+            # Filter the ions
+            if np.any(~keep_mask):  # If any fragments were filtered out
+                filtered_mz = mz_values[keep_mask]
+                filtered_intensities = intensity_values[keep_mask]
+                spectrum.ions = np.column_stack((filtered_mz, filtered_intensities))
+
+                # Also filter fragment annotations if they exist
+                if spectrum.fragment_annotations:
+                    # Get the indices of kept fragments
+                    kept_indices = np.where(keep_mask)[0]
+                    new_annotations = {}
+                    for new_idx, old_idx in enumerate(kept_indices):
+                        if old_idx in spectrum.fragment_annotations:
+                            new_annotations[new_idx] = spectrum.fragment_annotations[
+                                old_idx
+                            ]
+                    spectrum.fragment_annotations = new_annotations
+
+                filtered_count += 1
+
+            total_fragments_after += len(spectrum.ions)
+
+        # Show warning about re-normalization
+        fragments_removed = total_fragments_before - total_fragments_after
+        if fragments_removed > 0:
+            message = (
+                f"Intensity filtering completed!\n\n"
+                f"Spectra processed: {len(self.spectra)}\n"
+                f"Spectra modified: {filtered_count}\n"
+                f"Total fragments removed: {fragments_removed}\n\n"
+                f"Warning: It might be necessary to re-normalize the intensity values\n"
+                f"after filtering to ensure proper relative intensities."
+            )
+            messagebox.showinfo("Filter Applied", message)
+        else:
+            messagebox.showinfo(
+                "Filter Applied",
+                "No fragments were removed with the current filter settings.",
+            )
+
+        # Close dialog immediately after user sees the message
+        self.dialog.destroy()
+
+        # Call the callback to update the GUI
+        self.apply_callback()
+
+    def _cancel(self):
+        """Cancel the dialog."""
+        self.dialog.destroy()
 
 
 class SpectrumVisualizationPopup(ttk.Frame):
