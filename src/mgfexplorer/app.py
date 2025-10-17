@@ -178,6 +178,10 @@ class MGFExplorerApp:
         fragment_menu.add_command(
             label="Generate subformulas", command=self._generate_subformulas
         )
+        fragment_menu.add_separator()
+        fragment_menu.add_command(
+            label="Clear all annotations", command=self._clear_all_annotations
+        )
 
         # View menu
         view_menu = tk.Menu(menubar, tearoff=0)
@@ -793,7 +797,7 @@ class MGFExplorerApp:
         self.spectrum_tree.set_naming_scheme(naming_scheme)
 
         # Set the naming scheme in the spectrum visualization
-        if hasattr(self, 'spectrum_viz') and self.spectrum_viz:
+        if hasattr(self, "spectrum_viz") and self.spectrum_viz:
             self.spectrum_viz.set_naming_scheme(naming_scheme)
 
         # Refresh the tree to show updated names
@@ -1394,6 +1398,9 @@ class MGFExplorerApp:
         if config is None:  # User cancelled
             return
 
+        # Clear PPM tolerance cache to ensure new tolerance function is used
+        self._get_ppm_tolerance_for_mz_cache.clear()
+
         # Count spectra with formulas first
         spectra_with_formulas = []
         for spectrum in self.parser.spectra:
@@ -1581,6 +1588,61 @@ class MGFExplorerApp:
                 "Annotation Error", f"Failed to generate subformulas:\n{str(e)}"
             )
             self.status_var.set("Subformula generation failed")
+
+    def _clear_all_annotations(self):
+        """Clear all fragment annotations from all spectra."""
+        if not self.parser.spectra:
+            messagebox.showwarning(
+                "No Data", "Please load MGF data before clearing annotations."
+            )
+            return
+
+        # Count spectra with annotations
+        spectra_with_annotations = [
+            spectrum
+            for spectrum in self.parser.spectra
+            if spectrum.fragment_annotations
+        ]
+
+        if not spectra_with_annotations:
+            messagebox.showinfo(
+                "No Annotations", "No fragment annotations found to clear."
+            )
+            return
+
+        # Ask for confirmation
+        result = messagebox.askyesno(
+            "Clear All Annotations",
+            f"Are you sure you want to clear all fragment annotations?\n\n"
+            f"This will remove annotations from {len(spectra_with_annotations)} "
+            f"spectra and cannot be undone.",
+            icon="warning",
+        )
+
+        if not result:
+            return
+
+        # Clear annotations from all spectra
+        cleared_count = 0
+        for spectrum in self.parser.spectra:
+            if spectrum.fragment_annotations:
+                spectrum.clear_fragment_annotations()
+                cleared_count += 1
+
+        # Refresh the ion data table if there are selected spectra
+        if (
+            hasattr(self, "ion_table")
+            and self.spectrum_tree.get_selected_spectrum_ids()
+        ):
+            selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+            self.ion_table.load_data(self.parser, selected_ids)
+
+        self.status_var.set(f"Cleared annotations from {cleared_count} spectra")
+
+        messagebox.showinfo(
+            "Annotations Cleared",
+            f"Successfully cleared fragment annotations from {cleared_count} spectra.",
+        )
 
     def _extract_formula_from_spectrum(
         self, spectrum: Spectrum, formula_tags: List[str]
