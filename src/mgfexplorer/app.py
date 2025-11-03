@@ -5,6 +5,7 @@ Main application window for the MGF Explorer.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
+import re
 import numpy as np
 from typing import List
 from .mgf_parser import MGFParser, Spectrum
@@ -91,11 +92,19 @@ class MGFExplorerApp:
             label="Clear All Data", command=self.clear_data, accelerator="Ctrl+N"
         )
         file_menu.add_separator()
-        file_menu.add_command(
+
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        export_menu.add_command(
             label="Export All Spectra...",
             command=self.export_all_spectra,
             accelerator="Ctrl+E",
         )
+        export_menu.add_command(
+            label="Export Grouped Spectra...",
+            command=self.export_grouped_spectra,
+        )
+        file_menu.add_cascade(label="Export Spectra", menu=export_menu)
+
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
@@ -1312,6 +1321,143 @@ class MGFExplorerApp:
         average_spectrum.add_metadata("AVERAGED_FROM_COUNT", str(len(spectra_list)))
         spectrum_ids = [str(s.spectrum_id) for s in spectra_list]
         average_spectrum.add_metadata("AVERAGED_FROM_IDS", ",".join(spectrum_ids))
+
+    def export_grouped_spectra(self):
+        """Export spectra into separate MGF files for each active group."""
+        if not self.parser.spectra:
+            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            return
+
+        if not self.spectrum_tree.has_grouping():
+            messagebox.showwarning(
+                "No Grouping", "Please configure grouping tags before exporting."
+            )
+            return
+
+        grouping_structure = self.spectrum_tree.get_current_grouping_structure()
+        if not grouping_structure:
+            messagebox.showwarning(
+                "No Groups",
+                "No groups available for export with the current grouping or filter.",
+            )
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Grouped Spectra",
+            defaultextension=".mgf",
+            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        )
+
+        if not file_path:
+            return
+
+        base_dir, base_name = os.path.split(file_path)
+        if not base_dir:
+            base_dir = os.getcwd()
+        base_dir = os.path.abspath(base_dir)
+
+        name_root, ext = os.path.splitext(base_name)
+        if not name_root:
+            name_root = "grouped_export"
+        if not ext:
+            ext = ".mgf"
+
+        groups = []
+
+        def collect_groups(nodes, path):
+            for key, data in nodes.items():
+                new_path = path + [key]
+                children = data.get("children", {})
+                if children:
+                    collect_groups(children, new_path)
+                elif data.get("spectra"):
+                    groups.append((new_path, data["spectra"]))
+
+        collect_groups(grouping_structure, [])
+
+        if not groups:
+            messagebox.showwarning(
+                "No Groups",
+                "No grouped spectra available for export with the current grouping or filter.",
+            )
+            return
+
+        def sanitize_component(text):
+            value = str(text).strip()
+            if not value:
+                value = "group"
+            value = value.replace(" ", "_")
+            value = re.sub(r"[\\/:*?\"<>|]", "_", value)
+            value = re.sub(r"_+", "_", value)
+            value = value.strip("_")
+            return value or "group"
+
+        used_suffixes = set()
+        total_files = 0
+        total_spectra = 0
+
+        try:
+            self.status_var.set("Exporting grouped spectra...")
+            self.root.update_idletasks()
+
+            for path_components, spectra in groups:
+                if not spectra:
+                    continue
+
+                value_parts = []
+                for component in path_components:
+                    if "=" in component:
+                        value = component.split("=", 1)[1]
+                    else:
+                        value = component
+                    sanitized = sanitize_component(value or "missing")
+                    value_parts.append(sanitized)
+
+                if not value_parts:
+                    value_parts.append("group")
+
+                suffix = "_".join(value_parts)
+                candidate_suffix = suffix
+                counter = 2
+                while candidate_suffix in used_suffixes:
+                    candidate_suffix = f"{suffix}_{counter}"
+                    counter += 1
+                used_suffixes.add(candidate_suffix)
+
+                if name_root:
+                    output_name = f"{name_root}_{candidate_suffix}{ext}"
+                else:
+                    output_name = f"{candidate_suffix}{ext}"
+
+                output_path = os.path.join(base_dir, output_name)
+                spectrum_ids = [s.spectrum_id for s in spectra]
+                self.parser.export_to_mgf(output_path, spectrum_ids)
+
+                total_files += 1
+                total_spectra += len(spectra)
+
+            if total_files == 0:
+                messagebox.showwarning(
+                    "No Groups",
+                    "No grouped spectra available for export with the current grouping or filter.",
+                )
+                self.status_var.set("No grouped spectra exported")
+                return
+
+            self.status_var.set(
+                f"Exported {total_spectra} spectra into {total_files} grouped file(s)"
+            )
+            messagebox.showinfo(
+                "Export Complete",
+                f"Exported {total_spectra} spectra into {total_files} file(s).\n"
+                f"Files saved to: {base_dir}",
+            )
+
+        except Exception as e:
+            messagebox.showerror(
+                "Export Error", f"Failed to export grouped spectra:\n{str(e)}"
+            )
+            self.status_var.set("Export failed")
 
     def export_all_spectra(self):
         """Export all spectra to a new MGF file."""

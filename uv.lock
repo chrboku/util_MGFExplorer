@@ -383,7 +383,7 @@ wheels = [
 
 [[package]]
 name = "util-mgfexplorer"
-version = "0.26.1"
+version = "0.27.0"
 source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
