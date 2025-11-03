@@ -277,7 +277,7 @@ class SpectrumTreeView(ttk.Frame):
     def _apply_filter(self):
         """Apply the current filter to the tree view."""
         self.filter_job = None
-        self.filter_text = self.filter_var.get().strip().lower()
+        self.filter_text = self.filter_var.get().strip()
         self._populate_tree()
 
     def _spectrum_matches_filter(self, spectrum):
