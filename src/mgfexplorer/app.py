@@ -9,6 +9,7 @@ import re
 import numpy as np
 from typing import List
 from .mgf_parser import MGFParser, Spectrum
+from .config import load_config, save_config
 from .gui_components import (
     SpectrumTreeView,
     MetadataEditor,
@@ -24,6 +25,7 @@ from .gui_components import (
     SpectrumPopupWindow,
     FragmentDistributionDialog,
 )
+from .options_dialog import OptionsDialog
 from .molecular_formula import (
     FragmentAnnotator,
     MolecularFormula,
@@ -65,6 +67,7 @@ class MGFExplorerApp:
         self.parser = MGFParser()
         self.current_file = None
         self.used_prefixes = set()  # Track used prefixes to prevent conflicts
+        self.config_data = load_config()
 
         # Selection debouncing
         self.selection_update_job = None
@@ -72,6 +75,7 @@ class MGFExplorerApp:
 
         self._create_widgets()
         self._create_menu()
+        self._apply_persistent_options()
         self._setup_drag_drop()
 
         self._get_ppm_tolerance_for_mz_cache = {}
@@ -221,6 +225,13 @@ class MGFExplorerApp:
             label="Fragment Distribution...", command=self._show_fragment_distribution
         )
 
+        # Options menu
+        options_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Options", menu=options_menu)
+        options_menu.add_command(
+            label="Preferences...", command=self._open_options_dialog
+        )
+
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -247,6 +258,38 @@ class MGFExplorerApp:
         # Optional: Add visual feedback during drag
         self.root.dnd_bind("<<DragEnter>>", self._on_drag_enter)
         self.root.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+
+    def _apply_persistent_options(self):
+        """Apply loaded configuration to UI components."""
+        grouping_tags = self.config_data.get("default_grouping_tags", [])
+        if hasattr(self, "spectrum_tree"):
+            self.spectrum_tree.set_grouping_tags(grouping_tags)
+
+        metadata_groups = self.config_data.get("metadata_groups", [])
+        if hasattr(self, "metadata_editor"):
+            self.metadata_editor.set_metadata_groups(metadata_groups)
+
+    def _open_options_dialog(self):
+        """Launch the options dialog and persist any updates."""
+        dialog = OptionsDialog(self.root, self.config_data)
+        if not dialog.result:
+            return
+
+        self.config_data = dialog.result
+
+        try:
+            save_config(self.config_data)
+        except Exception as exc:
+            messagebox.showerror(
+                "Save Options",
+                f"Failed to save options: {exc}",
+            )
+            return
+
+        self._apply_persistent_options()
+
+        if hasattr(self, "status_var"):
+            self.status_var.set("Options updated")
 
     def _on_drag_enter(self, event):
         """Handle drag enter event."""

@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import re
 import threading
 import time
@@ -476,6 +476,13 @@ class SpectrumTreeView(ttk.Frame):
         """Apply the grouping based on entered tags (legacy method)."""
         self._apply_grouping_auto()
 
+    def set_grouping_tags(self, tags: List[str]):
+        """Set the grouping tags from a list and refresh the hierarchy."""
+        tag_text = ", ".join(tag.strip() for tag in tags if tag.strip())
+        self.tag_var.set(tag_text)
+        self.previous_text = tag_text
+        self._apply_grouping_auto()
+
     def _populate_tree(self):
         """Populate the tree view with spectra using hierarchical grouping."""
         # Clear existing items
@@ -936,6 +943,8 @@ class MetadataEditor(ttk.Frame):
         self.editing_item = None
         self.editing_column = None
         self._pending_selection: Optional[List[int]] = None
+        self.metadata_groups: List[Dict[str, List[str]]] = []
+        self._others_group_name = "others"
 
         self._create_widgets()
 
@@ -960,8 +969,11 @@ class MetadataEditor(ttk.Frame):
         # Create treeview for metadata
         columns = ("Key", "Value", "Unique Values")
         self.metadata_tree = ttk.Treeview(
-            metadata_frame, columns=columns, show="headings", height=10
+            metadata_frame, columns=columns, show="tree headings", height=10
         )
+
+        self.metadata_tree.heading("#0", text="Group")
+        self.metadata_tree.column("#0", width=180, anchor="w")
 
         for col in columns:
             self.metadata_tree.heading(col, text=col)
@@ -1148,6 +1160,54 @@ class MetadataEditor(ttk.Frame):
         self._populate_metadata()
         self._update_smiles_plot()
 
+    def set_metadata_groups(self, groups: List[Dict[str, Any]]):
+        """Update the configured metadata groups used for presentation order."""
+        cleaned_groups: List[Dict[str, List[str]]] = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            name = str(group.get("name", "")).strip()
+            keys_raw = group.get("keys", [])
+            if isinstance(keys_raw, list):
+                keys = [str(key).strip() for key in keys_raw if str(key).strip()]
+            elif isinstance(keys_raw, str):
+                keys = [part.strip() for part in keys_raw.split(",") if part.strip()]
+            else:
+                keys = []
+
+            if name:
+                cleaned_groups.append({"name": name, "keys": keys})
+
+        self.metadata_groups = cleaned_groups
+        self._populate_metadata()
+
+    def _prepare_metadata_row(
+        self,
+        key: str,
+        first_spectrum: Optional[Spectrum],
+        selected_spectra: List[Spectrum],
+    ) -> Tuple[str, str]:
+        """Create the value and unique summary strings for a metadata row."""
+        value = ""
+        if first_spectrum:
+            raw_value = first_spectrum.get_metadata_value(key)
+            value = raw_value if raw_value is not None else ""
+
+        unique_values = self._get_unique_values_for_selected_spectra(
+            key, selected_spectra
+        )
+
+        if len(unique_values) > 1:
+            unique_preview = "; ".join(
+                [f'"{v}"' if v else "<empty>" for v in unique_values[:5]]
+            )
+            if len(unique_values) > 5:
+                unique_preview += f" ... ({len(unique_values)} total)"
+        else:
+            unique_preview = ""
+
+        return value, unique_preview
+
     def _populate_metadata(self):
         """Populate the metadata table."""
         # Clear existing items
@@ -1159,7 +1219,6 @@ class MetadataEditor(ttk.Frame):
 
         # Get all metadata keys
         all_keys = self.parser.get_all_metadata_keys()
-
         # Get selected spectra objects
         selected_spectra = [
             s
@@ -1167,40 +1226,62 @@ class MetadataEditor(ttk.Frame):
             if s.spectrum_id in self.selected_spectrum_ids
         ]
 
-        for key in all_keys:
-            # Get value from first selected spectrum, treating None as empty string
-            value = ""
-            if self.selected_spectrum_ids:
-                first_spectrum = next(
-                    (
-                        s
-                        for s in self.parser.spectra
-                        if s.spectrum_id == self.selected_spectrum_ids[0]
-                    ),
-                    None,
-                )
-                if first_spectrum:
-                    raw_value = first_spectrum.get_metadata_value(key)
-                    value = raw_value if raw_value is not None else ""
-
-            # Get unique values for this key from only the selected spectra
-            unique_values = self._get_unique_values_for_selected_spectra(
-                key, selected_spectra
+        first_spectrum = None
+        if self.selected_spectrum_ids:
+            first_spectrum = next(
+                (
+                    s
+                    for s in self.parser.spectra
+                    if s.spectrum_id == self.selected_spectrum_ids[0]
+                ),
+                None,
             )
 
-            # Only show unique values if there are multiple different values
-            if len(unique_values) > 1:
-                # Format unique values for display
-                unique_str = "; ".join(
-                    [f'"{v}"' if v else "<empty>" for v in unique_values[:5]]
-                )
-                if len(unique_values) > 5:
-                    unique_str += f" ... ({len(unique_values)} total)"
-            else:
-                # Only one unique value, don't show the unique values column
-                unique_str = ""
+        remaining_keys = set(all_keys)
+        used_keys = set()
 
-            self.metadata_tree.insert("", "end", values=(key, value, unique_str))
+        # Insert keys according to configured groups
+        for group in self.metadata_groups:
+            group_name = group.get("name", "") or self._others_group_name
+            keys = group.get("keys", [])
+
+            parent_id = None
+            for key in keys:
+                key_str = str(key).strip()
+                if not key_str or key_str in used_keys:
+                    continue
+
+                value, unique_str = self._prepare_metadata_row(
+                    key_str, first_spectrum, selected_spectra
+                )
+
+                if parent_id is None:
+                    parent_id = self.metadata_tree.insert("", "end", text=group_name)
+                    self.metadata_tree.item(parent_id, open=True)
+
+                self.metadata_tree.insert(
+                    parent_id, "end", text="", values=(key_str, value, unique_str)
+                )
+                used_keys.add(key_str)
+                remaining_keys.discard(key_str)
+
+            # Show empty group even if keys not present to reflect configuration
+            if parent_id is None:
+                parent_id = self.metadata_tree.insert("", "end", text=group_name)
+                self.metadata_tree.item(parent_id, open=True)
+
+        if remaining_keys:
+            others_id = self.metadata_tree.insert(
+                "", "end", text=self._others_group_name
+            )
+            self.metadata_tree.item(others_id, open=True)
+            for key in sorted(remaining_keys):
+                value, unique_str = self._prepare_metadata_row(
+                    key, first_spectrum, selected_spectra
+                )
+                self.metadata_tree.insert(
+                    others_id, "end", text="", values=(key, value, unique_str)
+                )
 
     def _get_unique_values_for_selected_spectra(
         self, key: str, selected_spectra: List[Spectrum]
