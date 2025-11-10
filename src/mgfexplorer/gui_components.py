@@ -5577,6 +5577,248 @@ class FragmentAnnotationDialog:
         self.dialog.destroy()
 
 
+class CanonicalSmilesDialog:
+    """Dialog for displaying canonical SMILES conversion results."""
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.dialog = None
+        self.on_key_change = None
+        self.key_var: Optional[tk.StringVar] = None
+        self.summary_label: Optional[ttk.Label] = None
+        self.table_frame: Optional[ttk.Frame] = None
+        self._canvas: Optional[tk.Canvas] = None
+        self._table_window = None
+        self._last_successful_key: Optional[str] = None
+
+    def show(
+        self,
+        rows: List[Dict[str, Any]],
+        summary_text: Optional[str] = None,
+        initial_key: str = "smiles",
+        on_key_change=None,
+    ) -> None:
+        """Display the canonical SMILES conversion table."""
+        self.on_key_change = on_key_change
+        self._last_successful_key = initial_key
+
+        self.dialog = tk.Toplevel(self.parent)
+        self.dialog.title("Canonical SMILES Preview")
+        self.dialog.transient(self.parent)
+        self.dialog.grab_set()
+        self.dialog.resizable(True, True)
+        self.dialog.geometry("720x360")
+
+        main_frame = ttk.Frame(self.dialog, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        controls_frame = ttk.Frame(main_frame)
+        controls_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(controls_frame, text="SMILES metadata key:").pack(side="left")
+
+        self.key_var = tk.StringVar(value=initial_key)
+        key_entry = ttk.Entry(controls_frame, textvariable=self.key_var, width=24)
+        key_entry.pack(side="left", padx=(5, 0))
+        key_entry.bind("<Return>", self._apply_key_change)
+
+        ttk.Button(controls_frame, text="Apply", command=self._apply_key_change).pack(
+            side="left", padx=(5, 0)
+        )
+
+        self.summary_label = ttk.Label(
+            main_frame,
+            justify="left",
+            wraplength=600,
+        )
+        if summary_text:
+            self._update_summary(summary_text)
+
+        table_container = ttk.Frame(main_frame)
+        table_container.pack(fill="both", expand=True)
+
+        self._canvas = tk.Canvas(table_container, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(
+            table_container, orient="vertical", command=self._canvas.yview
+        )
+        self._canvas.configure(yscrollcommand=v_scroll.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+
+        self.table_frame = ttk.Frame(self._canvas)
+        self._table_window = self._canvas.create_window(
+            (0, 0), window=self.table_frame, anchor="nw"
+        )
+
+        def _configure_scrollregion(event):
+            if self._canvas:
+                self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+        def _resize_table(event):
+            if self._canvas and self._table_window is not None:
+                self._canvas.itemconfigure(self._table_window, width=event.width)
+
+        self.table_frame.bind("<Configure>", _configure_scrollregion)
+        table_container.bind("<Configure>", _resize_table)
+
+        def _on_mousewheel(event):
+            if self._canvas:
+                self._canvas.yview_scroll(-1 * int(event.delta / 120), "units")
+
+        self._canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.table_frame.bind("<MouseWheel>", _on_mousewheel)
+
+        self._populate_table(rows)
+
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+        ttk.Button(button_frame, text="Close", command=self.dialog.destroy).pack(
+            side="right"
+        )
+
+        key_entry.focus_set()
+        self._center_dialog()
+        self.dialog.wait_window()
+
+    def _populate_table(self, rows: List[Dict[str, Any]]) -> None:
+        if not self.table_frame:
+            return
+
+        for child in self.table_frame.winfo_children():
+            child.destroy()
+
+        headings = ["Original SMILES", "Canonical SMILES"]
+        header_bg = "#f0f0f0"
+        for col_index, heading in enumerate(headings):
+            header = tk.Label(
+                self.table_frame,
+                text=heading,
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+                padx=8,
+                pady=4,
+                bd=1,
+                relief="solid",
+                bg=header_bg,
+            )
+            header.grid(row=0, column=col_index, sticky="nsew")
+            self.table_frame.grid_columnconfigure(col_index, weight=1)
+
+        if not rows:
+            empty_label = tk.Label(
+                self.table_frame,
+                text="No SMILES values to display for the selected key.",
+                anchor="w",
+                justify="left",
+                wraplength=600,
+                padx=8,
+                pady=4,
+                bd=1,
+                relief="solid",
+                bg="white",
+            )
+            empty_label.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            return
+
+        default_bg = "white"
+        mismatch_bg = "#ffb3b3"
+
+        for row_index, row in enumerate(rows, start=1):
+            original_text = row.get("original", "")
+            canonical_value = row.get("canonical")
+            error_text = row.get("error")
+            canonical_text = (
+                canonical_value
+                if canonical_value is not None
+                else (error_text if error_text else "")
+            )
+            highlight_original = row.get("highlight", False)
+            highlight_canonical = row.get("highlight_canonical", highlight_original)
+
+            original_label = tk.Label(
+                self.table_frame,
+                text=original_text if original_text else "<empty>",
+                anchor="w",
+                justify="left",
+                wraplength=600,
+                padx=8,
+                pady=4,
+                bd=1,
+                relief="solid",
+                bg=mismatch_bg if highlight_original else default_bg,
+            )
+            original_label.grid(row=row_index, column=0, sticky="nsew")
+            self.table_frame.grid_rowconfigure(row_index, weight=0)
+
+            canonical_label = tk.Label(
+                self.table_frame,
+                text=canonical_text if canonical_text else "<empty>",
+                anchor="w",
+                justify="left",
+                wraplength=600,
+                padx=8,
+                pady=4,
+                bd=1,
+                relief="solid",
+                bg=mismatch_bg if highlight_canonical else default_bg,
+            )
+            canonical_label.grid(row=row_index, column=1, sticky="nsew")
+
+    def _update_summary(self, summary_text: Optional[str]) -> None:
+        if not self.summary_label:
+            return
+
+        if summary_text:
+            self.summary_label.config(text=summary_text)
+            if not self.summary_label.winfo_ismapped():
+                self.summary_label.pack(fill="x", pady=(0, 10))
+        else:
+            self.summary_label.config(text="")
+            if self.summary_label.winfo_ismapped():
+                self.summary_label.pack_forget()
+
+    def _apply_key_change(self, event=None):
+        if not self.on_key_change or not self.key_var:
+            return
+
+        key_value = self.key_var.get().strip()
+        if not key_value:
+            messagebox.showwarning(
+                "Canonical SMILES", "Please provide a metadata key for SMILES values."
+            )
+            if self._last_successful_key is not None:
+                self.key_var.set(self._last_successful_key)
+            return
+
+        result = self.on_key_change(key_value)
+        if not result:
+            if self._last_successful_key is not None:
+                self.key_var.set(self._last_successful_key)
+            return
+
+        if result.get("error"):
+            messagebox.showinfo("Canonical SMILES", result["error"])
+            if self._last_successful_key is not None:
+                self.key_var.set(self._last_successful_key)
+            return
+
+        self._last_successful_key = key_value
+        self._populate_table(result.get("rows", []))
+        self._update_summary(result.get("summary"))
+
+    def _center_dialog(self) -> None:
+        """Center the dialog on the screen."""
+        if not self.dialog:
+            return
+
+        self.dialog.update_idletasks()
+        width = self.dialog.winfo_width()
+        height = self.dialog.winfo_height()
+        x = (self.dialog.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.dialog.winfo_screenheight() // 2) - (height // 2)
+        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+
 class ProgressDialog:
     """Dialog for showing progress during long-running operations."""
 

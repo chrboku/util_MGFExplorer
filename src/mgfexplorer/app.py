@@ -7,7 +7,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
 import re
 import numpy as np
-from typing import List
+from typing import Any, Dict, List, Tuple
 from .mgf_parser import MGFParser, Spectrum
 from .config import load_config, save_config
 from .gui_components import (
@@ -20,6 +20,7 @@ from .gui_components import (
     SmartsFilterDialog,
     IntensityFilterDialog,
     FragmentAnnotationDialog,
+    CanonicalSmilesDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
     SpectrumPopupWindow,
@@ -124,6 +125,10 @@ class MGFExplorerApp:
         )
         edit_menu.add_command(
             label="Convert Keys to lowercase", command=self._keys_to_lowercase
+        )
+        edit_menu.add_command(
+            label="Canonicalize SMILES...",
+            command=self._canonicalize_smiles_metadata,
         )
         edit_menu.add_separator()
 
@@ -767,6 +772,175 @@ class MGFExplorerApp:
                 self.parser.rename_key_in_all_spectra(old_key, new_key)
 
         self._on_metadata_changed()
+
+    def _canonicalize_smiles_metadata(self):
+        """Canonicalize SMILES strings stored in metadata fields."""
+        if not self.parser or not self.parser.spectra:
+            messagebox.showwarning(
+                "Canonicalize SMILES",
+                "No data loaded. Please open an MGF file first.",
+            )
+            return
+
+        result = self._canonicalize_smiles_for_key("smiles")
+
+        if result.get("error"):
+            messagebox.showinfo("Canonicalize SMILES", result["error"])
+            self.status_var.set(result["error"])
+            return
+
+        dialog = CanonicalSmilesDialog(self.root)
+        dialog.show(
+            rows=result.get("rows", []),
+            summary_text=result.get("summary"),
+            initial_key="smiles",
+            on_key_change=self._handle_canonical_smiles_key_change,
+        )
+
+        status_message = result.get("status_message")
+        if status_message:
+            self.status_var.set(status_message)
+
+    def _handle_canonical_smiles_key_change(self, key: str):
+        """Handle metadata key changes triggered from the canonical SMILES dialog."""
+        result = self._canonicalize_smiles_for_key(key)
+        status_message = result.get("status_message")
+
+        if result.get("error"):
+            if result["error"]:
+                self.status_var.set(result["error"])
+            return result
+
+        if status_message:
+            self.status_var.set(status_message)
+
+        return result
+
+    def _canonicalize_smiles_for_key(self, smiles_key: str) -> Dict[str, Any]:
+        """Canonicalize SMILES strings for a specific metadata key."""
+        outcome: Dict[str, Any] = {
+            "rows": [],
+            "summary": "",
+            "status_message": "",
+            "error": None,
+        }
+
+        key_trimmed = smiles_key.strip()
+        if not key_trimmed:
+            outcome["error"] = "SMILES metadata key cannot be empty."
+            return outcome
+
+        if not RDKIT_AVAILABLE:
+            outcome["error"] = (
+                "RDKit is required to canonicalize SMILES strings, but it is not available."
+            )
+            return outcome
+
+        key_lower = key_trimmed.lower()
+        entries: List[Tuple[Spectrum, str, Any]] = []
+
+        for spectrum in self.parser.spectra:
+            for meta_key, value in spectrum.metadata.items():
+                if meta_key.lower() == key_lower:
+                    entries.append((spectrum, meta_key, value))
+
+        if not entries:
+            outcome["error"] = f"No metadata values found for key '{key_trimmed}'."
+            return outcome
+
+        occurrences_by_raw: Dict[str, List[Tuple[Spectrum, str]]] = {}
+        trimmed_map: Dict[str, str] = {}
+        order: List[str] = []
+
+        for spectrum, meta_key, raw_value in entries:
+            raw_str = "" if raw_value is None else str(raw_value)
+            if raw_str not in occurrences_by_raw:
+                occurrences_by_raw[raw_str] = []
+                trimmed_map[raw_str] = raw_str.strip()
+                order.append(raw_str)
+            occurrences_by_raw[raw_str].append((spectrum, meta_key))
+
+        rows_for_dialog: List[Dict[str, Any]] = []
+        unique_changed = 0
+        total_entries_updated = 0
+        total_failures = 0
+
+        for raw_value in order:
+            occurrences = occurrences_by_raw[raw_value]
+            trimmed_value = trimmed_map.get(raw_value, raw_value.strip())
+
+            canonical_value = None
+            error_message = None
+
+            if trimmed_value:
+                try:
+                    mol = Chem.MolFromSmiles(trimmed_value)
+                    if mol:
+                        canonical_value = Chem.MolToSmiles(mol, canonical=True)
+                    else:
+                        error_message = "Invalid SMILES string"
+                except Exception as exc:
+                    error_message = f"Error: {exc}"
+            else:
+                error_message = "Empty SMILES value"
+
+            highlight = False
+            if canonical_value is not None:
+                if canonical_value != trimmed_value:
+                    unique_changed += 1
+                    highlight = True
+                elif canonical_value != raw_value:
+                    highlight = True
+
+                for spectrum, meta_key in occurrences:
+                    current_value = spectrum.metadata.get(meta_key)
+                    if current_value != canonical_value:
+                        spectrum.metadata[meta_key] = canonical_value
+                        total_entries_updated += 1
+            else:
+                highlight = True
+                total_failures += 1
+
+            rows_for_dialog.append(
+                {
+                    "original": raw_value,
+                    "canonical": canonical_value,
+                    "error": error_message,
+                    "highlight": highlight,
+                    "highlight_canonical": highlight,
+                    "occurrences": len(occurrences),
+                }
+            )
+
+        if total_entries_updated > 0:
+            self._on_metadata_changed()
+
+        summary_lines = [
+            f"Metadata key: {key_trimmed}",
+            f"Unique SMILES processed: {len(rows_for_dialog)}",
+            f"Unique SMILES changed: {unique_changed}",
+            f"Metadata entries updated: {total_entries_updated}",
+        ]
+        if total_failures:
+            summary_lines.append(f"Failed conversions: {total_failures}")
+        outcome["summary"] = "\n".join(summary_lines)
+
+        if total_entries_updated > 0:
+            outcome["status_message"] = (
+                f"Canonicalized SMILES for key '{key_trimmed}' ({total_entries_updated} metadata entries updated)."
+            )
+        else:
+            outcome["status_message"] = (
+                f"Canonicalized SMILES for key '{key_trimmed}' (no updates required)."
+            )
+
+        if total_failures:
+            outcome["status_message"] += (
+                f" {total_failures} unique values could not be processed."
+            )
+
+        outcome["rows"] = rows_for_dialog
+        return outcome
 
     def _normalize_intensities(self, mode="max", scale=1.0):
         """
