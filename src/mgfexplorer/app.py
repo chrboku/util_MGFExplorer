@@ -105,6 +105,10 @@ class MGFExplorerApp:
             accelerator="Ctrl+E",
         )
         export_menu.add_command(
+            label="Export Filtered Spectra...",
+            command=self.export_filtered_spectra,
+        )
+        export_menu.add_command(
             label="Export Grouped Spectra...",
             command=self.export_grouped_spectra,
         )
@@ -1706,6 +1710,56 @@ class MGFExplorerApp:
             messagebox.showinfo(
                 "Export Complete",
                 f"Successfully exported {len(self.parser.spectra)} spectra to:\n{file_path}",
+            )
+
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export spectra:\n{str(e)}")
+            self.status_var.set("Export failed")
+
+    def export_filtered_spectra(self):
+        """Export only spectra matching the current filter to a new MGF file."""
+        if not self.parser.spectra:
+            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            return
+
+        # Get filtered spectrum IDs by checking each spectrum against the filter
+        filtered_spectrum_ids = [
+            spectrum.spectrum_id
+            for spectrum in self.parser.spectra
+            if self.spectrum_tree._spectrum_matches_filter(spectrum)
+        ]
+
+        if not filtered_spectrum_ids:
+            messagebox.showwarning(
+                "No Matching Spectra",
+                "No spectra match the current filter. Please adjust your filter or clear it to export spectra.",
+            )
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Filtered Spectra to MGF File",
+            defaultextension=".mgf",
+            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        )
+
+        if not file_path:
+            return
+
+        try:
+            self.status_var.set("Exporting filtered spectra...")
+            self.root.update()
+
+            # Export filtered spectra
+            self.parser.export_to_mgf(file_path, filtered_spectrum_ids)
+
+            # Update status
+            self.status_var.set(
+                f"Exported {len(filtered_spectrum_ids)} filtered spectra to {os.path.basename(file_path)}"
+            )
+
+            messagebox.showinfo(
+                "Export Complete",
+                f"Successfully exported {len(filtered_spectrum_ids)} filtered spectra to:\n{file_path}",
             )
 
         except Exception as e:
