@@ -5,9 +5,12 @@ Main application window for the MGF Explorer.
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import os
+import pathlib
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple
+from PIL import Image, ImageTk
+from ._version import __version__
 from .mgf_parser import MGFParser, Spectrum
 from .config import load_config, save_config
 from .gui_components import (
@@ -61,7 +64,7 @@ class MGFExplorerApp:
         else:
             self.root = tk.Tk()
 
-        self.root.title("MGF Explorer")
+        self.root.title(f"MGF Explorer v{__version__}")
         self.root.geometry("1400x900")
         self.root.minsize(1000, 700)
 
@@ -600,7 +603,7 @@ class MGFExplorerApp:
         # Update UI state
         self._set_components_enabled(False)
         self.status_var.set("Ready - Load MGF files to get started")
-        self.root.title("MGF Explorer")
+        self.root.title(f"MGF Explorer v{__version__}")
 
     def _on_spectrum_selection_changed(self, selected_spectrum_ids):
         """Handle spectrum selection changes with debouncing for performance."""
@@ -1114,7 +1117,7 @@ class MGFExplorerApp:
             ]:
                 if hasattr(component, "load_data"):
                     component.load_data(self.parser, [])
-            self.root.title("MGF Explorer")
+            self.root.title(f"MGF Explorer v{__version__}")
 
     def _calculate_average_spectra(self):
         """Calculate average spectrum per group."""
@@ -2192,18 +2195,48 @@ class MGFExplorerApp:
         dialog.show(self.parser, selected_ids)
 
     def show_about(self):
-        """Show about dialog."""
+        """Show about dialog with logo and version information."""
         drag_drop_status = (
-            "• Drag and drop MGF files to open\n"
+            "• Drag and drop MGF files to open"
             if DRAG_DROP_AVAILABLE
-            else "• Use File > Open to load MGF files\n"
+            else "• Use File > Open to load MGF files"
         )
 
-        messagebox.showinfo(
-            "About MGF Explorer",
-            "MGF Explorer v1.0\n\n"
-            "A tool for exploring and editing MGF (Mascot Generic Format) files.\n\n"
-            "Features:\n"
+        dlg = tk.Toplevel(self.root)
+        dlg.title("About MGF Explorer")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        # Logo
+        _pkg_dir = pathlib.Path(__file__).parent
+        logo_path = _pkg_dir / "logo.png"
+        if logo_path.exists():
+            try:
+                pil_img = Image.open(logo_path)
+                pil_img.thumbnail((120, 120), Image.LANCZOS)
+                self._about_logo = ImageTk.PhotoImage(pil_img)  # keep reference
+                tk.Label(dlg, image=self._about_logo, bg="#ffffff").pack(pady=(20, 8))
+            except Exception:
+                pass
+
+        tk.Label(
+            dlg,
+            text=f"MGF Explorer v{__version__}",
+            font=("Segoe UI", 14, "bold"),
+            bg="#ffffff",
+            fg="#202124",
+        ).pack()
+
+        tk.Label(
+            dlg,
+            text="A tool for exploring and editing MGF\n(Mascot Generic Format) files.",
+            font=("Segoe UI", 10),
+            bg="#ffffff",
+            fg="#5f6368",
+            justify="center",
+        ).pack(pady=(4, 12))
+
+        features = (
             "• Parse and display MS/MS spectra\n"
             "• Group spectra by metadata fields\n"
             "• Edit metadata values\n"
@@ -2212,8 +2245,27 @@ class MGFExplorerApp:
             "• Visualize spectra as stick charts\n"
             "• View ion data in tables\n"
             "• Display SMILES molecular structures\n"
-            f"{drag_drop_status}",
+            f"{drag_drop_status}"
         )
+        tk.Label(
+            dlg,
+            text=features,
+            font=("Segoe UI", 10),
+            bg="#ffffff",
+            fg="#202124",
+            justify="left",
+        ).pack(padx=24, anchor="w")
+
+        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=16, pady=12)
+
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=(0, 16))
+
+        dlg.configure(bg="#ffffff")
+        dlg.update_idletasks()
+        # Center over main window
+        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
 
     def run(self):
         """Start the application."""

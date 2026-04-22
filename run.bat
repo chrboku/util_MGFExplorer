@@ -1,0 +1,2 @@
+uv run mgfexplorer
+pause
