@@ -2,14 +2,25 @@
 Main application window for the MGF Explorer.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+import sys
+import matplotlib; matplotlib.use('QtAgg')
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter,
+    QTabWidget, QGroupBox, QPushButton, QLabel, QLineEdit, QComboBox,
+    QTreeWidget, QTreeWidgetItem, QListWidget, QCheckBox, QDoubleSpinBox,
+    QSpinBox, QProgressBar, QTextEdit, QDialog, QDialogButtonBox,
+    QFileDialog, QMessageBox, QInputDialog, QAbstractItemView, QApplication,
+    QRadioButton, QButtonGroup, QFrame, QScrollArea, QSizePolicy, QStatusBar,
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QActionGroup, QPixmap, QFont
 import os
 import pathlib
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple
-from PIL import Image, ImageTk
+from PIL import Image
+from io import BytesIO
 from ._version import __version__
 from .mgf_parser import MGFParser, Spectrum
 from .config import load_config, save_config
@@ -36,14 +47,6 @@ from .molecular_formula import (
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Try to import tkinterdnd2 for drag and drop support
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DRAG_DROP_AVAILABLE = True
-except ImportError:
-    DRAG_DROP_AVAILABLE = False
-
 # Try to import RDKit for SMARTS filtering
 try:
     from rdkit import Chem
@@ -54,225 +57,234 @@ except ImportError:
     RDKIT_AVAILABLE = False
 
 
-class MGFExplorerApp:
+class MGFExplorerApp(QMainWindow):
     """Main application class for the MGF Explorer."""
 
     def __init__(self):
-        # Initialize with drag and drop support if available
-        if DRAG_DROP_AVAILABLE:
-            self.root = TkinterDnD.Tk()
-        else:
-            self.root = tk.Tk()
+        super().__init__()
 
-        self.root.title(f"MGF Explorer v{__version__}")
-        self.root.geometry("1400x900")
-        self.root.minsize(1000, 700)
+        self.setWindowTitle(f"MGF Explorer v{__version__}")
+        self.resize(1400, 900)
+        self.setMinimumSize(1000, 700)
+        self.setAcceptDrops(True)
 
         self.parser = MGFParser()
         self.current_file = None
         self.used_prefixes = set()  # Track used prefixes to prevent conflicts
         self.config_data = load_config()
 
-        # Selection debouncing
-        self.selection_update_job = None
+        # Selection debouncing via QTimer
+        self._pending_selection_ids = []
         self.SELECTION_DELAY_MS = 300  # Wait 300ms before updating heavy components
+        self._selection_timer = QTimer()
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.timeout.connect(self._run_deferred_selection)
+
+        # Current spectrum naming scheme
+        self._current_naming_scheme = "Numbered"
 
         self._create_widgets()
         self._create_menu()
         self._apply_persistent_options()
-        self._setup_drag_drop()
 
         self._get_ppm_tolerance_for_mz_cache = {}
 
     def _create_menu(self):
         """Create the application menu."""
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
+        menubar = self.menuBar()
 
         # File menu
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(
-            label="Load MGF File(s)...", command=self.open_files, accelerator="Ctrl+O"
-        )
-        file_menu.add_separator()
-        file_menu.add_command(
-            label="Clear All Data", command=self.clear_data, accelerator="Ctrl+N"
-        )
-        file_menu.add_separator()
+        file_menu = menubar.addMenu("File")
 
-        export_menu = tk.Menu(file_menu, tearoff=0)
-        export_menu.add_command(
-            label="Export All Spectra...",
-            command=self.export_all_spectra,
-            accelerator="Ctrl+E",
-        )
-        export_menu.add_command(
-            label="Export Filtered Spectra...",
-            command=self.export_filtered_spectra,
-        )
-        export_menu.add_command(
-            label="Export Grouped Spectra...",
-            command=self.export_grouped_spectra,
-        )
-        file_menu.add_cascade(label="Export Spectra", menu=export_menu)
+        open_action = QAction("Load MGF File(s)...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.open_files)
+        file_menu.addAction(open_action)
 
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.addSeparator()
+
+        clear_action = QAction("Clear All Data", self)
+        clear_action.setShortcut("Ctrl+N")
+        clear_action.triggered.connect(self.clear_data)
+        file_menu.addAction(clear_action)
+
+        file_menu.addSeparator()
+
+        export_menu = file_menu.addMenu("Export Spectra")
+
+        export_all_action = QAction("Export All Spectra...", self)
+        export_all_action.setShortcut("Ctrl+E")
+        export_all_action.triggered.connect(self.export_all_spectra)
+        export_menu.addAction(export_all_action)
+
+        export_filtered_action = QAction("Export Filtered Spectra...", self)
+        export_filtered_action.triggered.connect(self.export_filtered_spectra)
+        export_menu.addAction(export_filtered_action)
+
+        export_grouped_action = QAction("Export Grouped Spectra...", self)
+        export_grouped_action.triggered.connect(self.export_grouped_spectra)
+        export_menu.addAction(export_grouped_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
         # Edit menu
-        edit_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
-        edit_menu.add_command(
-            label="Add New Key-Value Pair...", command=self._add_new_key_value
-        )
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase
-        )
-        edit_menu.add_command(
-            label="Convert Keys to lowercase", command=self._keys_to_lowercase
-        )
-        edit_menu.add_command(
-            label="Canonicalize SMILES...",
-            command=self._canonicalize_smiles_metadata,
-        )
-        edit_menu.add_separator()
+        edit_menu = menubar.addMenu("Edit")
+
+        add_kv_action = QAction("Add New Key-Value Pair...", self)
+        add_kv_action.triggered.connect(self._add_new_key_value)
+        edit_menu.addAction(add_kv_action)
+
+        edit_menu.addSeparator()
+
+        upper_action = QAction("Convert Keys to UPPERCASE", self)
+        upper_action.triggered.connect(self._keys_to_uppercase)
+        edit_menu.addAction(upper_action)
+
+        lower_action = QAction("Convert Keys to lowercase", self)
+        lower_action.triggered.connect(self._keys_to_lowercase)
+        edit_menu.addAction(lower_action)
+
+        smiles_action = QAction("Canonicalize SMILES...", self)
+        smiles_action.triggered.connect(self._canonicalize_smiles_metadata)
+        edit_menu.addAction(smiles_action)
+
+        edit_menu.addSeparator()
 
         # Intensity Normalization submenu
-        normalize_menu = tk.Menu(edit_menu, tearoff=0)
-        edit_menu.add_cascade(label="Intensity Normalization", menu=normalize_menu)
+        normalize_menu = edit_menu.addMenu("Intensity Normalization")
 
-        # Range submenus
-        range_01_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-1", menu=range_01_menu)
-        range_01_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 1.0),
-        )
-        range_01_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 1.0),
-        )
+        range_01_menu = normalize_menu.addMenu("Range 0-1")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 1.0))
+        range_01_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 1.0))
+        range_01_menu.addAction(a)
 
-        range_0100_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-100", menu=range_0100_menu)
-        range_0100_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 100.0),
-        )
-        range_0100_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 100.0),
-        )
+        range_0100_menu = normalize_menu.addMenu("Range 0-100")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 100.0))
+        range_0100_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 100.0))
+        range_0100_menu.addAction(a)
 
-        range_01000_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-1000", menu=range_01000_menu)
-        range_01000_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 1000.0),
-        )
-        range_01000_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 1000.0),
-        )
+        range_01000_menu = normalize_menu.addMenu("Range 0-1000")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 1000.0))
+        range_01000_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 1000.0))
+        range_01000_menu.addAction(a)
 
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Delete Selected Spectra", command=self._delete_selected_spectra
-        )
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Calculate Average Spectrum per Group",
-            command=self._calculate_average_spectra,
-        )
-        edit_menu.add_separator()
+        edit_menu.addSeparator()
 
-        # Regex Update submenu
-        regex_menu = tk.Menu(edit_menu, tearoff=0)
-        edit_menu.add_command(label="Regex Update", command=self._open_regex_editor)
+        delete_action = QAction("Delete Selected Spectra", self)
+        delete_action.triggered.connect(self._delete_selected_spectra)
+        edit_menu.addAction(delete_action)
+
+        edit_menu.addSeparator()
+
+        avg_action = QAction("Calculate Average Spectrum per Group", self)
+        avg_action.triggered.connect(self._calculate_average_spectra)
+        edit_menu.addAction(avg_action)
+
+        edit_menu.addSeparator()
+
+        regex_action = QAction("Regex Update", self)
+        regex_action.triggered.connect(self._open_regex_editor)
+        edit_menu.addAction(regex_action)
 
         # Filter menu
-        filter_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Filter", menu=filter_menu)
-        filter_menu.add_command(
-            label="SMARTS Substructure Filter...", command=self._open_smarts_filter
-        )
-        filter_menu.add_command(
-            label="Intensity Filter...", command=self._open_intensity_filter
-        )
+        filter_menu = menubar.addMenu("Filter")
+
+        smarts_action = QAction("SMARTS Substructure Filter...", self)
+        smarts_action.triggered.connect(self._open_smarts_filter)
+        filter_menu.addAction(smarts_action)
+
+        intensity_action = QAction("Intensity Filter...", self)
+        intensity_action.triggered.connect(self._open_intensity_filter)
+        filter_menu.addAction(intensity_action)
 
         # Fragment annotation menu
-        fragment_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Fragment annotation", menu=fragment_menu)
-        fragment_menu.add_command(
-            label="Generate subformulas", command=self._generate_subformulas
-        )
-        fragment_menu.add_separator()
-        fragment_menu.add_command(
-            label="Clear all annotations", command=self._clear_all_annotations
-        )
+        fragment_menu = menubar.addMenu("Fragment annotation")
+
+        subformula_action = QAction("Generate subformulas", self)
+        subformula_action.triggered.connect(self._generate_subformulas)
+        fragment_menu.addAction(subformula_action)
+
+        fragment_menu.addSeparator()
+
+        clear_ann_action = QAction("Clear all annotations", self)
+        clear_ann_action.triggered.connect(self._clear_all_annotations)
+        fragment_menu.addAction(clear_ann_action)
 
         # View menu
-        view_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu = menubar.addMenu("View")
 
-        # Spectrum Name submenu
-        spectrum_name_menu = tk.Menu(view_menu, tearoff=0)
-        view_menu.add_cascade(label="Spectrum Name", menu=spectrum_name_menu)
+        # Spectrum Name submenu with QActionGroup for exclusive radio behaviour
+        self.spectrum_name_menu = view_menu.addMenu("Spectrum Name")
+        self._spectrum_name_group = QActionGroup(self)
+        self._spectrum_name_group.setExclusive(True)
 
-        self.spectrum_name_var = tk.StringVar(value="Numbered")
-        spectrum_name_menu.add_radiobutton(
-            label="Numbered",
-            variable=self.spectrum_name_var,
-            value="Numbered",
-            command=self._update_spectrum_names,
+        numbered_action = QAction("Numbered", self, checkable=True)
+        numbered_action.setChecked(True)
+        self._spectrum_name_group.addAction(numbered_action)
+        self.spectrum_name_menu.addAction(numbered_action)
+        numbered_action.triggered.connect(
+            lambda checked, k="Numbered": self._update_spectrum_names_with(k)
         )
 
-        # Will be populated when data is loaded
-        self.spectrum_name_menu = spectrum_name_menu
+        view_menu.addSeparator()
 
-        view_menu.add_separator()
-        view_menu.add_command(
-            label="Fragment Distribution...", command=self._show_fragment_distribution
-        )
+        frag_dist_action = QAction("Fragment Distribution...", self)
+        frag_dist_action.triggered.connect(self._show_fragment_distribution)
+        view_menu.addAction(frag_dist_action)
 
         # Options menu
-        options_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Options", menu=options_menu)
-        options_menu.add_command(
-            label="Preferences...", command=self._open_options_dialog
-        )
+        options_menu = menubar.addMenu("Options")
+        prefs_action = QAction("Preferences...", self)
+        prefs_action.triggered.connect(self._open_options_dialog)
+        options_menu.addAction(prefs_action)
 
         # Help menu
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self.show_about)
-
-        # Bind keyboard shortcuts
-        self.root.bind("<Control-o>", lambda e: self.open_files())
-        self.root.bind("<Control-n>", lambda e: self.clear_data())
-        self.root.bind("<Control-e>", lambda e: self.export_all_spectra())
+        help_menu = menubar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
 
     def _setup_drag_drop(self):
-        """Set up drag and drop functionality for MGF files."""
-        if not DRAG_DROP_AVAILABLE:
-            # Add a note about drag and drop not being available
-            print(
-                "Note: Drag and drop support not available. Install tkinterdnd2 for this feature."
-            )
-            return
+        pass  # Handled via dragEnterEvent/dropEvent on QMainWindow
 
-        # Enable drag and drop for files
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind("<<Drop>>", self._on_file_drop)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith('.mgf'):
+                    event.acceptProposedAction()
+                    self.statusBar().showMessage("Drop MGF file to open...")
+                    return
+        event.ignore()
 
-        # Optional: Add visual feedback during drag
-        self.root.dnd_bind("<<DragEnter>>", self._on_drag_enter)
-        self.root.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+    def dragLeaveEvent(self, event):
+        self._restore_status()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith('.mgf'):
+                    try:
+                        self._process_dropped_file(file_path)
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Failed to process dropped file: {str(e)}")
+            event.acceptProposedAction()
+            self._restore_status()
 
     def _apply_persistent_options(self):
-        """Apply loaded configuration to UI components."""
         grouping_tags = self.config_data.get("default_grouping_tags", [])
         if hasattr(self, "spectrum_tree"):
             self.spectrum_tree.set_grouping_tags(grouping_tags)
@@ -283,7 +295,7 @@ class MGFExplorerApp:
 
     def _open_options_dialog(self):
         """Launch the options dialog and persist any updates."""
-        dialog = OptionsDialog(self.root, self.config_data)
+        dialog = OptionsDialog(self, self.config_data)
         if not dialog.result:
             return
 
@@ -292,32 +304,21 @@ class MGFExplorerApp:
         try:
             save_config(self.config_data)
         except Exception as exc:
-            messagebox.showerror(
-                "Save Options",
-                f"Failed to save options: {exc}",
-            )
+            QMessageBox.critical(self, "Save Options", f"Failed to save options: {exc}")
             return
 
         self._apply_persistent_options()
-
-        if hasattr(self, "status_var"):
-            self.status_var.set("Options updated")
+        self.statusBar().showMessage("Options updated")
 
     def _on_drag_enter(self, event):
-        """Handle drag enter event."""
-        self.status_var.set("Drop MGF file to open...")
+        self.statusBar().showMessage("Drop MGF file to open...")
 
     def _on_drag_leave(self, event):
-        """Handle drag leave event."""
         self._restore_status()
 
     def _on_file_drop(self, event):
-        """Handle file drop event."""
         try:
-            # Get the dropped files
-            files = event.data  # .split()
-
-            # files is '{}' or '{} {}'
+            files = event.data
             if "} {" in files:
                 files = files.split("} {")
                 for fi in range(len(files)):
@@ -325,112 +326,65 @@ class MGFExplorerApp:
                     files[fi] = files[fi].rstrip("}")
             else:
                 files = [files.strip().lstrip("{").rstrip("}")]
-
             if not files:
                 return
-
-            # Process the dropped file
             for file_path in files:
                 self._process_dropped_file(file_path)
-
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to process dropped file: {str(e)}")
             self._restore_status()
 
     def _process_dropped_file(self, file_path):
-        """Process a file that was dropped onto the window."""
-        try:
-            # Check if it's an MGF file
-            if not file_path.lower().endswith(".mgf"):
-                messagebox.showwarning(
-                    "Invalid File Type", "Please drop an MGF file (.mgf extension)."
-                )
-                return
-
-            # Check if file exists
-            if not os.path.exists(file_path):
-                messagebox.showerror(
-                    "File Not Found", f"The file does not exist:\n{file_path}"
-                )
-                return
-
-            # Load the file
-            self._load_mgf_file(file_path)
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+        if not file_path.lower().endswith(".mgf"):
+            QMessageBox.warning(self, "Invalid File Type", "Please drop an MGF file (.mgf extension).")
+            return
+        if not os.path.exists(file_path):
+            QMessageBox.critical(self, "File Not Found", f"The file does not exist:\n{file_path}")
+            return
+        self._load_mgf_file(file_path)
 
     def _restore_status(self):
-        """Restore the status bar to its normal state."""
         if self.current_file:
             filename = os.path.basename(self.current_file)
             spectrum_count = len(self.parser.spectra) if self.parser else 0
-            self.status_var.set(f"Loaded {spectrum_count} spectra from {filename}")
+            self.statusBar().showMessage(f"Loaded {spectrum_count} spectra from {filename}")
         else:
-            self.status_var.set("Ready - Open an MGF file to get started")
+            self.statusBar().showMessage("Ready - Open an MGF file to get started")
 
     def _load_mgf_file(self, file_path):
-        """Load an MGF file and append to existing data."""
         try:
-            # Show file loading options dialog
-            dialog = FileLoadingDialog(self.root, file_path, self.used_prefixes)
-
+            dialog = FileLoadingDialog(self, file_path, self.used_prefixes)
             if dialog.result is None:
-                # User cancelled
                 return
-
             loading_options = dialog.result
-
-            self.status_var.set("Loading file...")
-            self.root.update()
-
-            # Check if we have existing data to append to
+            self.statusBar().showMessage("Loading file...")
+            QApplication.processEvents()
             is_first_file = len(self.parser.spectra) == 0
-
             if is_first_file:
-                # First file - use parse_file which clears existing data
                 spectra = self.parser.parse_file(file_path)
             else:
-                # Additional file - use parse_and_append_file to add to existing data
-                # Calculate ID offset to avoid conflicts
                 id_offset = self._calculate_id_offset()
                 spectra = self.parser.parse_and_append_file(file_path, id_offset)
-
             if not spectra:
-                messagebox.showwarning("Warning", "No spectra found in the file.")
+                QMessageBox.warning(self, "Warning", "No spectra found in the file.")
                 return
-
-            # Apply loading options to newly loaded spectra only
             self._apply_loading_options(spectra, loading_options)
-
-            # Update current file reference (keep track of the most recent file)
             self.current_file = file_path
-
-            # Update components
             self.spectrum_tree.load_data(self.parser)
             self._update_spectrum_name_menu()
             self._set_components_enabled(True)
-
-            # Update status
             filename = os.path.basename(file_path)
             total_count = len(self.parser.spectra)
             new_count = len(spectra)
-
             if is_first_file:
-                self.status_var.set(f"Loaded {new_count} spectra from {filename}")
-                self.root.title(f"MGF Explorer - {filename}")
+                self.statusBar().showMessage(f"Loaded {new_count} spectra from {filename}")
+                self.setWindowTitle(f"MGF Explorer - {filename}")
             else:
-                self.status_var.set(
-                    f"Added {new_count} spectra from {filename}. Total: {total_count} spectra"
-                )
-                # Update title to show multiple files
-                self.root.title(
-                    f"MGF Explorer - {total_count} spectra from multiple files"
-                )
-
+                self.statusBar().showMessage(f"Added {new_count} spectra from {filename}. Total: {total_count} spectra")
+                self.setWindowTitle(f"MGF Explorer - {total_count} spectra from multiple files")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load file: {str(e)}")
-            self.status_var.set("Error loading file")
+            QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
+            self.statusBar().showMessage("Error loading file")
 
     def _calculate_id_offset(self):
         """Calculate ID offset for appending new spectra to avoid conflicts."""

@@ -1,8 +1,13 @@
-from .app import main as app_main
+import sys
+from PyQt6.QtWidgets import QApplication
+from .app import MGFExplorerApp
 
 
 def main():
-    app_main()
+    app = QApplication(sys.argv)
+    window = MGFExplorerApp()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
