@@ -6,9 +6,18 @@ import copy
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QPushButton, QLabel, QLineEdit, QListWidget, QDialogButtonBox,
-    QMessageBox, QWidget,
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QGroupBox,
+    QPushButton,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QDialogButtonBox,
+    QMessageBox,
+    QWidget,
 )
 from PyQt6.QtCore import Qt
 
@@ -44,7 +53,9 @@ class OptionsDialog(QDialog):
         tags_layout = QVBoxLayout(tags_group)
 
         tags_layout.addWidget(
-            QLabel("Comma-separated list applied to the grouping field when the app starts.")
+            QLabel(
+                "Comma-separated list applied to the grouping field when the app starts."
+            )
         )
 
         self.default_tags_edit = QLineEdit()
@@ -147,7 +158,9 @@ class OptionsDialog(QDialog):
         # Buttons --------------------------------------------------------------
         button_box = QDialogButtonBox()
         save_btn = button_box.addButton("Save", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_btn = button_box.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        cancel_btn = button_box.addButton(
+            "Cancel", QDialogButtonBox.ButtonRole.RejectRole
+        )
         save_btn.clicked.connect(self._on_save)
         cancel_btn.clicked.connect(self._on_cancel)
         main_layout.addWidget(button_box)
@@ -269,7 +282,9 @@ class OptionsDialog(QDialog):
     # ------------------------------------------------------------------
     def _add_key(self) -> None:
         if self._active_group_index is None:
-            QMessageBox.warning(self, "No Group Selected", "Select a group before adding keys.")
+            QMessageBox.warning(
+                self, "No Group Selected", "Select a group before adding keys."
+            )
             return
 
         key = self.new_key_edit.text().strip()
@@ -278,7 +293,9 @@ class OptionsDialog(QDialog):
 
         active_group = self._groups[self._active_group_index]
         if key in active_group["keys"]:
-            QMessageBox.information(self, "Duplicate Key", f"'{key}' is already in this group.")
+            QMessageBox.information(
+                self, "Duplicate Key", f"'{key}' is already in this group."
+            )
             return
 
         active_group["keys"].append(key)
@@ -326,7 +343,9 @@ class OptionsDialog(QDialog):
             ]
 
             if not name:
-                QMessageBox.critical(self, "Invalid Group", "Each group must have a name.")
+                QMessageBox.critical(
+                    self, "Invalid Group", "Each group must have a name."
+                )
                 return None
 
             if name in group_names:
@@ -360,4 +379,3 @@ class OptionsDialog(QDialog):
 
     def _on_cancel(self) -> None:
         self.reject()
-

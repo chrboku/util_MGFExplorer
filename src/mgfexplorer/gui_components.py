@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import matplotlib
+
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
@@ -19,20 +20,57 @@ from matplotlib.patches import FancyArrowPatch
 from matplotlib.widgets import RectangleSelector
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter,
-    QLabel, QLineEdit, QPushButton, QTreeWidget, QTreeWidgetItem,
-    QTabWidget, QDialog, QDialogButtonBox, QMessageBox, QScrollArea,
-    QFrame, QTextEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
-    QGroupBox, QRadioButton, QButtonGroup, QProgressBar, QApplication,
-    QAbstractItemView, QHeaderView, QSizePolicy, QMenu, QListWidget,
-    QListWidgetItem, QFileDialog,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QSplitter,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTabWidget,
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+    QScrollArea,
+    QFrame,
+    QTextEdit,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QComboBox,
+    QGroupBox,
+    QRadioButton,
+    QButtonGroup,
+    QProgressBar,
+    QApplication,
+    QAbstractItemView,
+    QHeaderView,
+    QSizePolicy,
+    QMenu,
+    QListWidget,
+    QListWidgetItem,
+    QFileDialog,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QSize, QPoint,
+    Qt,
+    QTimer,
+    QThread,
+    pyqtSignal,
+    QSize,
+    QPoint,
 )
 from PyQt6.QtGui import (
-    QFont, QPixmap, QImage, QCursor, QAction, QActionGroup,
-    QDoubleValidator, QIntValidator,
+    QFont,
+    QPixmap,
+    QImage,
+    QCursor,
+    QAction,
+    QActionGroup,
+    QDoubleValidator,
+    QIntValidator,
 )
 
 from .mgf_parser import MGFParser, Spectrum
@@ -40,6 +78,7 @@ from .mgf_parser import MGFParser, Spectrum
 # Natural sorting
 try:
     from natsort import natsorted
+
     NATSORT_AVAILABLE = True
 except ImportError:
     NATSORT_AVAILABLE = False
@@ -52,7 +91,9 @@ except ImportError:
                 int(c) if c.isdigit() else c.lower()
                 for c in re.split("([0-9]+)", str(text))
             ]
+
         return sorted(items, key=natural_key)
+
 
 # RDKit imports
 try:
@@ -60,6 +101,7 @@ try:
     from rdkit.Chem import Draw, rdMolDescriptors
     from rdkit.Chem.Draw import rdMolDraw2D
     from PIL import Image
+
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -81,6 +123,7 @@ class ToolTip:
 # ---------------------------------------------------------------------------
 # SpectrumTreeView
 # ---------------------------------------------------------------------------
+
 
 class SpectrumTreeView(QWidget):
     """Tree view for displaying spectra with grouping/filtering."""
@@ -108,7 +151,9 @@ class SpectrumTreeView(QWidget):
         self._tags_entry = QLineEdit()
         self._tags_entry.setPlaceholderText("Tag1, Tag2, …  (right-click for fields)")
         self._tags_entry.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._tags_entry.customContextMenuRequested.connect(self._show_tags_context_menu)
+        self._tags_entry.customContextMenuRequested.connect(
+            self._show_tags_context_menu
+        )
         self._tags_entry.textChanged.connect(self._on_tags_changed)
         tags_layout.addWidget(self._tags_entry)
         layout.addWidget(tags_box)
@@ -242,12 +287,14 @@ class SpectrumTreeView(QWidget):
     def select_spectra_by_ids(self, ids):
         self._block_selection_signal = True
         self._tree.clearSelection()
+
         def _visit(item):
             sid = item.data(0, Qt.ItemDataRole.UserRole)
             if sid in ids:
                 item.setSelected(True)
             for i in range(item.childCount()):
                 _visit(item.child(i))
+
         for i in range(self._tree.topLevelItemCount()):
             _visit(self._tree.topLevelItem(i))
         self._block_selection_signal = False
@@ -328,6 +375,7 @@ class SpectrumTreeView(QWidget):
 # MetadataEditor
 # ---------------------------------------------------------------------------
 
+
 class MetadataEditor(QWidget):
     """Component for viewing and editing spectrum metadata."""
 
@@ -384,8 +432,16 @@ class MetadataEditor(QWidget):
     def _show_smiles_message(self, msg: str):
         self._smiles_fig.clear()
         ax = self._smiles_fig.add_subplot(111)
-        ax.text(0.5, 0.5, msg, ha="center", va="center",
-                fontsize=9, wrap=True, transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.5,
+            msg,
+            ha="center",
+            va="center",
+            fontsize=9,
+            wrap=True,
+            transform=ax.transAxes,
+        )
         ax.axis("off")
         self._smiles_canvas.draw()
 
@@ -432,8 +488,11 @@ class MetadataEditor(QWidget):
             self._metadata_tree.blockSignals(False)
             return
 
-        spectra = [s for s in self.parser.spectra
-                   if s.spectrum_id in self.selected_spectrum_ids]
+        spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
 
         # Collect all keys and values
         all_keys = set()
@@ -467,7 +526,9 @@ class MetadataEditor(QWidget):
             item.setText(0, key)
             item.setData(0, Qt.ItemDataRole.UserRole, key)
             unique_vals = sorted(set(v for v in values if v))
-            display_val = values[0] if len(set(v for v in values if v)) <= 1 else "<multiple>"
+            display_val = (
+                values[0] if len(set(v for v in values if v)) <= 1 else "<multiple>"
+            )
             item.setText(1, display_val if display_val else "")
             item.setText(2, str(len(unique_vals)))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
@@ -491,7 +552,9 @@ class MetadataEditor(QWidget):
                     make_key_item(k, key_data[k], others_item)
             else:
                 for k in remaining:
-                    make_key_item(k, key_data[k], self._metadata_tree.invisibleRootItem())
+                    make_key_item(
+                        k, key_data[k], self._metadata_tree.invisibleRootItem()
+                    )
 
         self._metadata_tree.expandAll()
         self._metadata_tree.blockSignals(False)
@@ -503,7 +566,9 @@ class MetadataEditor(QWidget):
         smiles_keys = ["smiles", "SMILES", "Smiles", "smiles_code", "SMILES_CODE"]
         found = None
         for sid in self.selected_spectrum_ids:
-            spectrum = next((s for s in self.parser.spectra if s.spectrum_id == sid), None)
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == sid), None
+            )
             if not spectrum:
                 continue
             for k in smiles_keys:
@@ -561,8 +626,11 @@ class MetadataEditor(QWidget):
         value = item.text(1)
         if not self.parser or key is None:
             return
-        matching = [s.spectrum_id for s in self.parser.spectra
-                    if str(s.metadata.get(key, "")) == value]
+        matching = [
+            s.spectrum_id
+            for s in self.parser.spectra
+            if str(s.metadata.get(key, "")) == value
+        ]
         self._pending_selection = matching
         if self._on_metadata_changed_cb:
             self._on_metadata_changed_cb()
@@ -598,6 +666,7 @@ class MetadataEditor(QWidget):
 # AddKeyValueDialog
 # ---------------------------------------------------------------------------
 
+
 class AddKeyValueDialog(QDialog):
     """Dialog for adding a new key-value pair to spectra."""
 
@@ -630,9 +699,7 @@ class AddKeyValueDialog(QDialog):
         self._rb_selected = QRadioButton(
             f"Selected spectra ({len(self.selected_spectrum_ids)})"
         )
-        self._rb_all = QRadioButton(
-            f"All loaded spectra ({len(self.parser.spectra)})"
-        )
+        self._rb_all = QRadioButton(f"All loaded spectra ({len(self.parser.spectra)})")
         self._rb_selected.setChecked(True)
         scope_layout.addWidget(self._rb_selected)
         scope_layout.addWidget(self._rb_all)
@@ -656,7 +723,8 @@ class AddKeyValueDialog(QDialog):
         existing = self.parser.get_all_metadata_keys()
         if key in existing:
             ans = QMessageBox.question(
-                self, "Key Exists",
+                self,
+                "Key Exists",
                 f"Key '{key}' already exists. Update its value?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
@@ -679,6 +747,7 @@ class AddKeyValueDialog(QDialog):
 # ---------------------------------------------------------------------------
 # RegexEditorDialog
 # ---------------------------------------------------------------------------
+
 
 class RegexEditorDialog(QDialog):
     """Dialog for regex-based bulk metadata editing."""
@@ -809,6 +878,7 @@ class RegexEditorDialog(QDialog):
 # SpectrumVisualization
 # ---------------------------------------------------------------------------
 
+
 class SpectrumVisualization(QWidget):
     """Spectrum stick-plot visualization widget."""
 
@@ -889,8 +959,14 @@ class SpectrumVisualization(QWidget):
     def clear_plot(self):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        ax.text(0.5, 0.5, "No spectra loaded", ha="center", va="center",
-                transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.5,
+            "No spectra loaded",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         ax.axis("off")
         self.canvas.draw()
         self.parser = None
@@ -907,14 +983,21 @@ class SpectrumVisualization(QWidget):
         self.axes = []
         if not self.parser or not self.selected_spectrum_ids:
             ax = self.figure.add_subplot(111)
-            ax.text(0.5, 0.5, "No spectra selected", ha="center", va="center",
-                    transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No spectra selected",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.axis("off")
             self.canvas.draw()
             return
 
         selected_spectra = [
-            s for s in self.parser.spectra
+            s
+            for s in self.parser.spectra
             if s.spectrum_id in self.selected_spectrum_ids
         ]
         if not selected_spectra:
@@ -949,8 +1032,9 @@ class SpectrumVisualization(QWidget):
         for i, spectrum in enumerate(selected_spectra):
             ax = self.figure.add_subplot(n, 1, i + 1)
             self.axes.append(ax)
-            self._plot_single_spectrum(ax, spectrum, (global_mz_min, global_mz_max),
-                                       is_last=(i == n - 1))
+            self._plot_single_spectrum(
+                ax, spectrum, (global_mz_min, global_mz_max), is_last=(i == n - 1)
+            )
 
         if len(self.axes) > 1:
             self._setup_zoom_synchronization()
@@ -962,8 +1046,14 @@ class SpectrumVisualization(QWidget):
 
     def _plot_single_spectrum(self, ax, spectrum, mz_limits, is_last=True):
         if spectrum.ions.size == 0:
-            ax.text(0.5, 0.5, "No ion data", ha="center", va="center",
-                    transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No ion data",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             if mz_limits:
                 ax.set_xlim(mz_limits)
             return
@@ -978,10 +1068,19 @@ class SpectrumVisualization(QWidget):
         precursor = self._get_precursor_mass(spectrum)
         if precursor is not None:
             y_max = intensity.max() if len(intensity) > 0 else 1
-            ax.axvline(precursor, color="grey", linestyle="--",
-                       linewidth=1.5, alpha=0.7)
-            ax.text(precursor, y_max * 1.05, f"M: {precursor:.2f}",
-                    ha="center", va="bottom", fontsize=8, color="grey", rotation=90)
+            ax.axvline(
+                precursor, color="grey", linestyle="--", linewidth=1.5, alpha=0.7
+            )
+            ax.text(
+                precursor,
+                y_max * 1.05,
+                f"M: {precursor:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="grey",
+                rotation=90,
+            )
 
         if is_last:
             ax.set_xlabel("m/z")
@@ -1017,7 +1116,9 @@ class SpectrumVisualization(QWidget):
 
         ax = self.figure.add_subplot(111)
         self.axes.append(ax)
-        spectrum_colors = plt.cm.tab10(np.linspace(0, 1, min(len(selected_spectra), 10)))
+        spectrum_colors = plt.cm.tab10(
+            np.linspace(0, 1, min(len(selected_spectra), 10))
+        )
         all_fragments: Dict = {}
         spectrum_info: Dict = {}
 
@@ -1043,12 +1144,13 @@ class SpectrumVisualization(QWidget):
                 fragment_intensities.append((total, group_mz, frags))
 
         fragment_intensities.sort(key=lambda x: x[0], reverse=True)
-        top = fragment_intensities[:self._top_fragments_spin.value()]
+        top = fragment_intensities[: self._top_fragments_spin.value()]
 
         sorted_ids = list(spectrum_info.keys())
         try:
-            sorted_ids = natsorted(sorted_ids,
-                                   key=lambda sid: spectrum_info[sid]["label"])
+            sorted_ids = natsorted(
+                sorted_ids, key=lambda sid: spectrum_info[sid]["label"]
+            )
         except Exception:
             pass
 
@@ -1057,13 +1159,21 @@ class SpectrumVisualization(QWidget):
             x_vals = [x_positions[sid] for sid, _ in frags if sid in x_positions]
             y_vals = [r for sid, r in frags if sid in x_positions]
             if len(x_vals) > 1:
-                ax.plot(x_vals, y_vals, "o-", alpha=0.7, linewidth=1.5,
-                        label=f"m/z {group_mz:.2f}")
+                ax.plot(
+                    x_vals,
+                    y_vals,
+                    "o-",
+                    alpha=0.7,
+                    linewidth=1.5,
+                    label=f"m/z {group_mz:.2f}",
+                )
 
         ax.set_xticks(range(len(sorted_ids)))
         ax.set_xticklabels(
             [spectrum_info[sid]["label"] for sid in sorted_ids],
-            rotation=45, ha="right", fontsize=8
+            rotation=45,
+            ha="right",
+            fontsize=8,
         )
         ax.set_xlabel("Spectrum")
         ax.set_ylabel("Relative Intensity (sum-scaled)")
@@ -1117,14 +1227,16 @@ class SpectrumVisualization(QWidget):
         if not self.parser or not self.selected_spectrum_ids:
             QMessageBox.information(self, "No Data", "No spectra selected.")
             return
-        popup = SpectrumPopupWindow(self, self.parser, self.selected_spectrum_ids,
-                                    self.naming_scheme)
+        popup = SpectrumPopupWindow(
+            self, self.parser, self.selected_spectrum_ids, self.naming_scheme
+        )
         popup.show()
 
 
 # ---------------------------------------------------------------------------
 # IonDataTable
 # ---------------------------------------------------------------------------
+
 
 class IonDataTable(QWidget):
     """Tabbed ion data table."""
@@ -1157,14 +1269,19 @@ class IonDataTable(QWidget):
         self.notebook.clear()
         if not self.parser or not self.selected_spectrum_ids:
             return
-        spectra = [s for s in self.parser.spectra
-                   if s.spectrum_id in self.selected_spectrum_ids]
+        spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
         for spectrum in spectra:
             self._create_table_for_spectrum(spectrum)
 
     def _create_table_for_spectrum(self, spectrum: "Spectrum"):
         tree = QTreeWidget()
-        tree.setHeaderLabels(["Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations"])
+        tree.setHeaderLabels(
+            ["Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations"]
+        )
         tree.setColumnWidth(0, 70)
         tree.setColumnWidth(1, 110)
         tree.setColumnWidth(2, 110)
@@ -1198,7 +1315,7 @@ class IonDataTable(QWidget):
                 ann = spectrum.annotations.get(i, [])
                 if ann:
                     annotations = "; ".join(
-                        f"{a.get('formula','?')} [{a.get('ppm_error', 0):.1f}ppm]"
+                        f"{a.get('formula', '?')} [{a.get('ppm_error', 0):.1f}ppm]"
                         for a in ann
                     )
             item = QTreeWidgetItem()
@@ -1214,8 +1331,7 @@ class IonDataTable(QWidget):
         if self.spectrum_viz_callback is None:
             return
         selected_indices = [
-            item.data(0, Qt.ItemDataRole.UserRole)
-            for item in tree.selectedItems()
+            item.data(0, Qt.ItemDataRole.UserRole) for item in tree.selectedItems()
         ]
         self.spectrum_viz_callback(spectrum.spectrum_id, selected_indices)
 
@@ -1246,6 +1362,7 @@ class IonDataTable(QWidget):
 # ---------------------------------------------------------------------------
 # CosineSimilarityVisualization
 # ---------------------------------------------------------------------------
+
 
 class CosineSimilarityVisualization(QWidget):
     """Heatmap visualization of cosine similarity between spectra."""
@@ -1326,16 +1443,23 @@ class CosineSimilarityVisualization(QWidget):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         if n > self.MAX_SPECTRA_MANUAL:
-            msg = (f"Too many spectra ({n}).\n"
-                   f"Maximum: {self.MAX_SPECTRA_MANUAL}")
+            msg = f"Too many spectra ({n}).\nMaximum: {self.MAX_SPECTRA_MANUAL}"
             self._calc_btn.setEnabled(False)
         else:
-            msg = (f"Large selection ({n} spectra).\n"
-                   f'Click "Calculate" to proceed.')
+            msg = f'Large selection ({n} spectra).\nClick "Calculate" to proceed.'
             self._calc_btn.setEnabled(True)
-        ax.text(0.5, 0.5, msg, ha="center", va="center",
-                transform=ax.transAxes, color="orange", fontsize=11)
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(
+            0.5,
+            0.5,
+            msg,
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color="orange",
+            fontsize=11,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
         self.canvas.draw()
 
     def _on_tolerance_changed(self):
@@ -1346,9 +1470,12 @@ class CosineSimilarityVisualization(QWidget):
         if not self.parser or not self.selected_spectrum_ids:
             return
         if len(self.selected_spectrum_ids) > self.MAX_SPECTRA_MANUAL:
-            QMessageBox.warning(self, "Too Many Spectra",
-                                f"Cannot calculate for {len(self.selected_spectrum_ids)} spectra.\n"
-                                f"Maximum: {self.MAX_SPECTRA_MANUAL}")
+            QMessageBox.warning(
+                self,
+                "Too Many Spectra",
+                f"Cannot calculate for {len(self.selected_spectrum_ids)} spectra.\n"
+                f"Maximum: {self.MAX_SPECTRA_MANUAL}",
+            )
             return
         self._calculate_and_display_similarity()
 
@@ -1357,8 +1484,14 @@ class CosineSimilarityVisualization(QWidget):
         self._stats_text.clear()
         if not self.parser or len(self.selected_spectrum_ids) < 2:
             ax = self.figure.add_subplot(111)
-            ax.text(0.5, 0.5, "Select 2+ spectra for comparison",
-                    ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "Select 2+ spectra for comparison",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             self.canvas.draw()
             return
         if len(self.selected_spectrum_ids) > 10:
@@ -1371,9 +1504,17 @@ class CosineSimilarityVisualization(QWidget):
         self._cancel_btn.setEnabled(True)
         self._progress_label.setText("Calculating...")
         ax = self.figure.add_subplot(111)
-        ax.text(0.5, 0.5, "Calculating...\nPlease wait",
-                ha="center", va="center", transform=ax.transAxes, fontsize=12)
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(
+            0.5,
+            0.5,
+            "Calculating...\nPlease wait",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
         self.canvas.draw()
         self.cancel_calculation = False
         self._calculation_error = None
@@ -1386,8 +1527,11 @@ class CosineSimilarityVisualization(QWidget):
     def _calculate_similarity_threaded(self):
         try:
             tolerance = self._tolerance_spin.value()
-            spectra = [s for s in self.parser.spectra
-                       if s.spectrum_id in self.selected_spectrum_ids]
+            spectra = [
+                s
+                for s in self.parser.spectra
+                if s.spectrum_id in self.selected_spectrum_ids
+            ]
             n = len(spectra)
             if n < 2:
                 self.similarity_matrix = np.array([[1.0]] if n == 1 else [])
@@ -1415,7 +1559,7 @@ class CosineSimilarityVisualization(QWidget):
                             0,
                             lambda p=pct: self._progress_label.setText(
                                 f"Calculating... {p:.0f}%"
-                            )
+                            ),
                         )
             if not self.cancel_calculation:
                 self.similarity_matrix = sim_matrix
@@ -1455,9 +1599,17 @@ class CosineSimilarityVisualization(QWidget):
     def _show_calculation_error(self, msg: str):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        ax.text(0.5, 0.5, f"Error:\n{msg}", ha="center", va="center",
-                transform=ax.transAxes, color="red")
-        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(
+            0.5,
+            0.5,
+            f"Error:\n{msg}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color="red",
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
         self.canvas.draw()
 
     def _display_similarity_results(self):
@@ -1465,8 +1617,9 @@ class CosineSimilarityVisualization(QWidget):
             return
         self.figure.clear()
         ax = self.figure.add_subplot(111)
-        im = ax.imshow(self.similarity_matrix, cmap="viridis", vmin=0, vmax=1,
-                       aspect="equal")
+        im = ax.imshow(
+            self.similarity_matrix, cmap="viridis", vmin=0, vmax=1, aspect="equal"
+        )
         cbar = self.figure.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label("Cosine Similarity", rotation=270, labelpad=15)
         labels = [f"S{sid}" for sid in self.selected_spectrum_ids]
@@ -1478,8 +1631,15 @@ class CosineSimilarityVisualization(QWidget):
         if n <= 20:
             for i in range(n):
                 for j in range(n):
-                    ax.text(j, i, f"{self.similarity_matrix[i, j]:.3f}",
-                            ha="center", va="center", color="white", fontsize=8)
+                    ax.text(
+                        j,
+                        i,
+                        f"{self.similarity_matrix[i, j]:.3f}",
+                        ha="center",
+                        va="center",
+                        color="white",
+                        fontsize=8,
+                    )
         tol = self._tolerance_spin.value()
         ax.set_title(f"Similarity Matrix (tolerance: {tol:.2f})")
         self.figure.tight_layout()
@@ -1497,16 +1657,19 @@ class CosineSimilarityVisualization(QWidget):
         if len(sims) == 0:
             return
         pcts = np.percentile(sims, [0, 10, 25, 50, 75, 90, 100])
-        txt = (f"Pairwise Similarities (n={len(sims)}):\n"
-               f"Min: {pcts[0]:.4f}  10%: {pcts[1]:.4f}  25%: {pcts[2]:.4f}\n"
-               f"Median: {pcts[3]:.4f}  75%: {pcts[4]:.4f}  90%: {pcts[5]:.4f}\n"
-               f"Max: {pcts[6]:.4f}  Mean: {np.mean(sims):.4f}")
+        txt = (
+            f"Pairwise Similarities (n={len(sims)}):\n"
+            f"Min: {pcts[0]:.4f}  10%: {pcts[1]:.4f}  25%: {pcts[2]:.4f}\n"
+            f"Median: {pcts[3]:.4f}  75%: {pcts[4]:.4f}  90%: {pcts[5]:.4f}\n"
+            f"Max: {pcts[6]:.4f}  Mean: {np.mean(sims):.4f}"
+        )
         self._stats_text.setPlainText(txt)
 
 
 # ---------------------------------------------------------------------------
 # FileLoadingDialog
 # ---------------------------------------------------------------------------
+
 
 class FileLoadingDialog(QDialog):
     """Dialog for file loading options: database identifier and prefix."""
@@ -1524,9 +1687,7 @@ class FileLoadingDialog(QDialog):
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        lbl = QLabel(
-            f"Configure options for:\n'{self.file_to_load}'\n(* = required)"
-        )
+        lbl = QLabel(f"Configure options for:\n'{self.file_to_load}'\n(* = required)")
         layout.addWidget(lbl)
 
         db_box = QGroupBox("Database Information")
@@ -1589,6 +1750,7 @@ class FileLoadingDialog(QDialog):
 # ---------------------------------------------------------------------------
 # AverageSpectrumDialog
 # ---------------------------------------------------------------------------
+
 
 class AverageSpectrumDialog(QDialog):
     """Dialog for average spectrum parameters."""
@@ -1658,6 +1820,7 @@ class AverageSpectrumDialog(QDialog):
 # ---------------------------------------------------------------------------
 # SmartsFilterDialog
 # ---------------------------------------------------------------------------
+
 
 class SmartsFilterDialog:
     """SMARTS substructure filter dialog (non-modal)."""
@@ -1789,9 +1952,7 @@ class SmartsFilterDialog:
             self._unmatched_list.addItem(f"Spectrum {s.spectrum_id}")
         self._matched_group_label.setTitle(f"Matched ({len(self.matching_spectra)})")
         self._unmatched_group_label.setTitle(f"Unmatched ({len(unmatched)})")
-        self._status_lbl.setText(
-            f"Found {len(self.matching_spectra)} matching spectra"
-        )
+        self._status_lbl.setText(f"Found {len(self.matching_spectra)} matching spectra")
 
     def _apply_filter(self):
         pattern = self._smarts_edit.text().strip()
@@ -1808,6 +1969,7 @@ class SmartsFilterDialog:
 # ---------------------------------------------------------------------------
 # IntensityFilterDialog
 # ---------------------------------------------------------------------------
+
 
 class IntensityFilterDialog:
     """Intensity filter dialog (non-modal)."""
@@ -1901,6 +2063,7 @@ class IntensityFilterDialog:
 # ---------------------------------------------------------------------------
 # FragmentAnnotationDialog
 # ---------------------------------------------------------------------------
+
 
 class FragmentAnnotationDialog:
     """Dialog for fragment annotation configuration."""
@@ -2008,6 +2171,7 @@ class FragmentAnnotationDialog:
 # CanonicalSmilesDialog
 # ---------------------------------------------------------------------------
 
+
 class CanonicalSmilesDialog:
     """Non-modal dialog showing canonical SMILES results."""
 
@@ -2016,8 +2180,9 @@ class CanonicalSmilesDialog:
         self._window: Optional[QDialog] = None
         self._on_key_change = None
 
-    def show(self, rows, summary_text=None, initial_key: str = "smiles",
-             on_key_change=None):
+    def show(
+        self, rows, summary_text=None, initial_key: str = "smiles", on_key_change=None
+    ):
         self._on_key_change = on_key_change
         if self._window and not self._window.isHidden():
             self._window.close()
@@ -2045,8 +2210,9 @@ class CanonicalSmilesDialog:
 
         # Table
         self._table = QTreeWidget()
-        self._table.setHeaderLabels(["Spectrum ID", "Original SMILES",
-                                     "Canonical SMILES", "Error"])
+        self._table.setHeaderLabels(
+            ["Spectrum ID", "Original SMILES", "Canonical SMILES", "Error"]
+        )
         self._table.setColumnWidth(0, 100)
         self._table.setColumnWidth(1, 220)
         self._table.setColumnWidth(2, 220)
@@ -2081,11 +2247,13 @@ class CanonicalSmilesDialog:
 # ProgressDialog
 # ---------------------------------------------------------------------------
 
+
 class ProgressDialog:
     """Modal progress dialog."""
 
-    def __init__(self, parent, title: str = "Processing...",
-                 message: str = "Please wait..."):
+    def __init__(
+        self, parent, title: str = "Processing...", message: str = "Please wait..."
+    ):
         self.parent = parent
         self._title = title
         self._message = message
@@ -2137,6 +2305,7 @@ class ProgressDialog:
 # PPMDeviationPlotDialog
 # ---------------------------------------------------------------------------
 
+
 class PPMDeviationPlotDialog:
     """Dialog showing a PPM deviation scatter plot for annotated fragments."""
 
@@ -2177,8 +2346,9 @@ class PPMDeviationPlotDialog:
                 all_mz.append(mz)
                 all_ppm.append(ppm)
                 all_rank.append(rank)
-            sc = ax.scatter(all_mz, all_ppm, c=all_rank, cmap="coolwarm",
-                            alpha=0.7, s=20)
+            sc = ax.scatter(
+                all_mz, all_ppm, c=all_rank, cmap="coolwarm", alpha=0.7, s=20
+            )
             fig.colorbar(sc, ax=ax, label="Annotation Rank")
             ax.axhline(0, color="black", linestyle="--", linewidth=0.8)
             ax.set_xlabel("m/z")
@@ -2192,8 +2362,14 @@ class PPMDeviationPlotDialog:
                 f"Min={np.min(ppm_arr):.2f}  Max={np.max(ppm_arr):.2f}"
             )
         else:
-            ax.text(0.5, 0.5, "No annotated data available",
-                    ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No annotated data available",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.axis("off")
         canvas.draw()
         dialog.exec()
@@ -2202,6 +2378,7 @@ class PPMDeviationPlotDialog:
 # ---------------------------------------------------------------------------
 # SpectrumVisualizationPopup
 # ---------------------------------------------------------------------------
+
 
 class SpectrumVisualizationPopup(QWidget):
     """Simplified spectrum visualization for popup windows."""
@@ -2240,13 +2417,22 @@ class SpectrumVisualizationPopup(QWidget):
         self.axes = []
         if not self.parser or not self.selected_spectrum_ids:
             ax = self.figure.add_subplot(111)
-            ax.text(0.5, 0.5, "No spectra selected", ha="center", va="center",
-                    transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No spectra selected",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.axis("off")
             self.canvas.draw()
             return
-        spectra = [s for s in self.parser.spectra
-                   if s.spectrum_id in self.selected_spectrum_ids]
+        spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
         if not spectra:
             return
         original_count = len(spectra)
@@ -2272,8 +2458,14 @@ class SpectrumVisualizationPopup(QWidget):
                 if len(intensity) > 0:
                     ax.set_ylim(0, intensity.max() * 1.1)
             else:
-                ax.text(0.5, 0.5, "No ion data", ha="center", va="center",
-                        transform=ax.transAxes)
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No ion data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
             label = self._get_display_name(spectrum)
             ax.set_ylabel(f"{label}\nIntensity", fontsize=8)
             if i == n - 1:
@@ -2290,11 +2482,17 @@ class SpectrumVisualizationPopup(QWidget):
 # SpectrumPopupWindow
 # ---------------------------------------------------------------------------
 
+
 class SpectrumPopupWindow:
     """Non-modal popup window showing spectrum plot + metadata."""
 
-    def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List,
-                 naming_scheme: str = "Numbered"):
+    def __init__(
+        self,
+        parent,
+        parser: MGFParser,
+        selected_spectrum_ids: List,
+        naming_scheme: str = "Numbered",
+    ):
         self.parent = parent
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
@@ -2357,6 +2555,7 @@ class SpectrumPopupWindow:
 # ---------------------------------------------------------------------------
 # FragmentDistributionDialog
 # ---------------------------------------------------------------------------
+
 
 class FragmentDistributionDialog:
     """Dialog showing fragment distribution scatter plot with selection."""
@@ -2422,12 +2621,15 @@ class FragmentDistributionDialog:
             ax.scatter(all_mz, all_inten, alpha=0.5, s=10, c="blue")
             ax.set_xlabel("m/z")
             ax.set_ylabel("Intensity")
-            ax.set_title(f"Fragment Distribution ({len(all_mz)} fragments from "
-                         f"{len(spectra)} spectra)")
+            ax.set_title(
+                f"Fragment Distribution ({len(all_mz)} fragments from "
+                f"{len(spectra)} spectra)"
+            )
             ax.grid(True, alpha=0.3)
 
             # Rectangle selector
             self._selected_rect: Optional[Tuple] = None
+
             def on_select(eclick, erelease):
                 x1, x2 = sorted([eclick.xdata, erelease.xdata])
                 y1, y2 = sorted([eclick.ydata, erelease.ydata])
@@ -2441,22 +2643,35 @@ class FragmentDistributionDialog:
                         frags_tree.addTopLevelItem(item)
 
             selector = RectangleSelector(
-                ax, on_select, useblit=True,
-                button=[1], minspanx=5, minspany=5, spancoords="pixels",
-                interactive=True
+                ax,
+                on_select,
+                useblit=True,
+                button=[1],
+                minspanx=5,
+                minspany=5,
+                spancoords="pixels",
+                interactive=True,
             )
             canvas._selector = selector  # keep reference
 
             # Populate fragments tree
-            for mz, inten, sid in zip(all_mz[:500], all_inten[:500], all_spec_ids[:500]):
+            for mz, inten, sid in zip(
+                all_mz[:500], all_inten[:500], all_spec_ids[:500]
+            ):
                 item = QTreeWidgetItem()
                 item.setText(0, f"{mz:.4f}")
                 item.setText(1, f"{inten:.2f}")
                 item.setText(2, str(sid))
                 frags_tree.addTopLevelItem(item)
         else:
-            ax.text(0.5, 0.5, "No fragment data available",
-                    ha="center", va="center", transform=ax.transAxes)
+            ax.text(
+                0.5,
+                0.5,
+                "No fragment data available",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             ax.axis("off")
         canvas.draw()
 
