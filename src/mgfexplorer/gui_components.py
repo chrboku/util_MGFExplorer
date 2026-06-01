@@ -5,9 +5,8 @@ Rewritten for PyQt6 from tkinter.
 
 import re
 import threading
-import time
 import io
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -16,7 +15,6 @@ matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from matplotlib.patches import FancyArrowPatch
 from matplotlib.widgets import RectangleSelector
 
 from PyQt6.QtWidgets import (
@@ -34,8 +32,6 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QMessageBox,
-    QScrollArea,
-    QFrame,
     QTextEdit,
     QSpinBox,
     QDoubleSpinBox,
@@ -43,34 +39,19 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QGroupBox,
     QRadioButton,
-    QButtonGroup,
     QProgressBar,
     QApplication,
     QAbstractItemView,
-    QHeaderView,
-    QSizePolicy,
     QMenu,
     QListWidget,
-    QListWidgetItem,
-    QFileDialog,
 )
 from PyQt6.QtCore import (
     Qt,
     QTimer,
-    QThread,
-    pyqtSignal,
-    QSize,
-    QPoint,
 )
 from PyQt6.QtGui import (
     QFont,
-    QPixmap,
-    QImage,
     QCursor,
-    QAction,
-    QActionGroup,
-    QDoubleValidator,
-    QIntValidator,
 )
 
 from .mgf_parser import MGFParser, Spectrum
@@ -148,7 +129,7 @@ class SpectrumTreeView(QWidget):
         # Grouping tags
         tags_box = QGroupBox("Grouping Tags")
         tags_layout = QVBoxLayout(tags_box)
-        self._tags_entry = QLineEdit()
+        self._tags_entry = QLineEdit("ms_frag_mode, focus_ion_type, name")
         self._tags_entry.setPlaceholderText("Tag1, Tag2, …  (right-click for fields)")
         self._tags_entry.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tags_entry.customContextMenuRequested.connect(
@@ -242,23 +223,33 @@ class SpectrumTreeView(QWidget):
             item.setData(0, Qt.ItemDataRole.UserRole, spectrum.spectrum_id)
 
     def _populate_grouped(self, spectra):
-        groups: Dict[str, List] = {}
-        for spectrum in spectra:
-            key_parts = []
-            for tag in self.selected_grouping_tags:
-                val = spectrum.get_metadata_value(tag) or "N/A"
-                key_parts.append(str(val))
-            group_key = " | ".join(key_parts)
-            groups.setdefault(group_key, []).append(spectrum)
+        """Build a nested tree with one level per grouping tag."""
 
-        for group_name in natsorted(groups.keys()):
-            group_item = QTreeWidgetItem(self._tree)
-            group_item.setText(0, group_name)
-            group_item.setData(0, Qt.ItemDataRole.UserRole, None)
-            for spectrum in groups[group_name]:
-                child = QTreeWidgetItem(group_item)
-                child.setText(0, self._get_display_name(spectrum))
-                child.setData(0, Qt.ItemDataRole.UserRole, spectrum.spectrum_id)
+        def _build_nested(items, tags):
+            """Recursively bucket spectra by the first tag, then recurse."""
+            if not tags:
+                return items  # leaf: list of spectra
+            result: Dict[str, List] = {}
+            for s in items:
+                val = s.get_metadata_value(tags[0]) or "N/A"
+                result.setdefault(str(val), []).append(s)
+            return {k: _build_nested(v, tags[1:]) for k, v in result.items()}
+
+        def _populate_node(parent, data):
+            if isinstance(data, list):
+                for spectrum in data:
+                    child = QTreeWidgetItem(parent)
+                    child.setText(0, self._get_display_name(spectrum))
+                    child.setData(0, Qt.ItemDataRole.UserRole, spectrum.spectrum_id)
+            else:
+                for key in natsorted(data.keys()):
+                    group_item = QTreeWidgetItem(parent)
+                    group_item.setText(0, key)
+                    group_item.setData(0, Qt.ItemDataRole.UserRole, None)
+                    _populate_node(group_item, data[key])
+
+        nested = _build_nested(spectra, self.selected_grouping_tags)
+        _populate_node(self._tree, nested)
 
     def _get_display_name(self, spectrum) -> str:
         if self._naming_scheme == "Numbered":
@@ -379,9 +370,12 @@ class SpectrumTreeView(QWidget):
 class MetadataEditor(QWidget):
     """Component for viewing and editing spectrum metadata."""
 
-    def __init__(self, parent=None, on_metadata_changed=None):
+    def __init__(
+        self, parent=None, on_metadata_changed=None, on_set_spectrum_name=None
+    ):
         super().__init__(parent)
         self._on_metadata_changed_cb = on_metadata_changed
+        self._on_set_spectrum_name_cb = on_set_spectrum_name
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List = []
         self._pending_selection: Optional[List] = None
@@ -459,15 +453,10 @@ class MetadataEditor(QWidget):
             drawer.DrawMolecule(mol)
             drawer.FinishDrawing()
             png = drawer.GetDrawingText()
-            qimg = QImage.fromData(png)
-            pixmap = QPixmap.fromImage(qimg)
+            img = Image.open(io.BytesIO(png))
             self._smiles_fig.clear()
             ax = self._smiles_fig.add_subplot(111)
-            ax.imshow(
-                np.frombuffer(qimg.bits(), dtype=np.uint8).reshape(
-                    qimg.height(), qimg.width(), 4
-                )
-            )
+            ax.imshow(np.array(img))
             ax.axis("off")
             self._smiles_canvas.draw()
         except Exception as e:
@@ -641,7 +630,9 @@ class MetadataEditor(QWidget):
             self._on_metadata_changed_cb()
 
     def _set_as_spectrum_name(self, key: str):
-        if self._on_metadata_changed_cb:
+        if self._on_set_spectrum_name_cb:
+            self._on_set_spectrum_name_cb(key)
+        elif self._on_metadata_changed_cb:
             self._on_metadata_changed_cb()
 
     def set_metadata_groups(self, groups: List[Dict[str, List[str]]]):
@@ -890,6 +881,11 @@ class SpectrumVisualization(QWidget):
         self.naming_scheme: str = "Numbered"
         self.axes: List = []
         self._syncing_zoom = False
+        # hover/click state
+        self._ax_spectrum_map: Dict = {}  # {ax: spectrum}
+        self._hover_artists: List = []  # overlay artists to remove on next hover
+        self._pinned_ions: Dict = {}  # {spectrum_id: {ion_index: label}}
+        self._hover_callback = None  # (spectrum_id, ion_index|None) -> None
         self._create_widgets()
 
     def _create_widgets(self):
@@ -950,6 +946,8 @@ class SpectrumVisualization(QWidget):
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
         self.highlighted_ions = {}
+        self._pinned_ions = {}
+        self._hover_artists = []
         self._plot_spectra()
 
     def highlight_ions(self, spectrum_id, ion_indices: List[int]):
@@ -1028,10 +1026,12 @@ class SpectrumVisualization(QWidget):
             global_mz_min -= pad
             global_mz_max += pad
 
+        self._ax_spectrum_map = {}
         n = len(selected_spectra)
         for i, spectrum in enumerate(selected_spectra):
             ax = self.figure.add_subplot(n, 1, i + 1)
             self.axes.append(ax)
+            self._ax_spectrum_map[ax] = spectrum
             self._plot_single_spectrum(
                 ax, spectrum, (global_mz_min, global_mz_max), is_last=(i == n - 1)
             )
@@ -1042,6 +1042,7 @@ class SpectrumVisualization(QWidget):
             self.figure.suptitle(warning, fontsize=9, color="red", y=0.99)
         self.figure.tight_layout(pad=0.5, h_pad=0.2)
         self.figure.subplots_adjust(hspace=0.1)
+        self._connect_mouse_events()
         self.canvas.draw()
 
     def _plot_single_spectrum(self, ax, spectrum, mz_limits, is_last=True):
@@ -1060,10 +1061,33 @@ class SpectrumVisualization(QWidget):
         mz = spectrum.ions[:, 0]
         intensity = spectrum.ions[:, 1]
         highlighted = self.highlighted_ions.get(spectrum.spectrum_id, [])
+        pinned = self._pinned_ions.get(spectrum.spectrum_id, {})
         for i, (m, inten) in enumerate(zip(mz, intensity)):
-            color = "green" if i in highlighted else "blue"
-            lw = 2.0 if i in highlighted else 1.5
+            if i in pinned:
+                color = "darkorange"
+                lw = 2.5
+            elif i in highlighted:
+                color = "green"
+                lw = 2.0
+            else:
+                color = "blue"
+                lw = 1.5
             ax.vlines(m, 0, inten, colors=color, linewidth=lw)
+
+        # Draw pinned annotations
+        for idx, label in pinned.items():
+            m = mz[idx]
+            inten = intensity[idx]
+            ax.annotate(
+                label,
+                xy=(m, inten),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=7,
+                color="darkorange",
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", alpha=0.85),
+                zorder=5,
+            )
 
         precursor = self._get_precursor_mass(spectrum)
         if precursor is not None:
@@ -1232,6 +1256,154 @@ class SpectrumVisualization(QWidget):
         )
         popup.show()
 
+    # ------------------------------------------------------------------
+    # Hover / click interaction
+    # ------------------------------------------------------------------
+
+    def set_hover_callback(self, cb):
+        """Set callback invoked on hover: cb(spectrum_id, ion_index) or cb(None, None)."""
+        self._hover_callback = cb
+
+    def _connect_mouse_events(self):
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_click)
+
+    def _on_mouse_move(self, event):
+        if event.inaxes is None:
+            if self._hover_artists:
+                self._clear_hover_artists()
+                self.canvas.draw_idle()
+            if self._hover_callback:
+                self._hover_callback(None, None)
+            return
+
+        spectrum = self._ax_spectrum_map.get(event.inaxes)
+        if spectrum is None or spectrum.ions.size == 0:
+            return
+
+        ax = event.inaxes
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        max_inten = intensity.max() if len(intensity) > 0 else 1.0
+
+        # Find nearest fragment in display (pixel) space
+        try:
+            xy_data = np.column_stack([mz, intensity])
+            cursor_data = np.array([[event.xdata, event.ydata]])
+            xy_display = ax.transData.transform(xy_data)
+            cursor_display = ax.transData.transform(cursor_data)
+            distances = np.linalg.norm(xy_display - cursor_display, axis=1)
+            closest_idx = int(np.argmin(distances))
+            min_dist = distances[closest_idx]
+        except Exception:
+            return
+
+        self._clear_hover_artists()
+
+        PIXEL_THRESHOLD = 25
+        if min_dist <= PIXEL_THRESHOLD:
+            m = mz[closest_idx]
+            inten = intensity[closest_idx]
+            rel = inten / max_inten * 100
+            label = f"m/z {m:.4f}\n{rel:.1f}%"
+
+            # Overlay highlighted line
+            vline = ax.vlines(m, 0, inten, colors="red", linewidth=2.5, zorder=5)
+            # Annotation
+            ann = ax.annotate(
+                label,
+                xy=(m, inten),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=8,
+                color="red",
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", alpha=0.85),
+                zorder=6,
+            )
+            self._hover_artists = [vline, ann]
+            self.canvas.draw_idle()
+
+            if self._hover_callback:
+                self._hover_callback(spectrum.spectrum_id, closest_idx)
+        else:
+            self.canvas.draw_idle()
+            if self._hover_callback:
+                self._hover_callback(None, None)
+
+    def _on_mouse_click(self, event):
+        if event.button != 1 or event.inaxes is None:
+            return
+        spectrum = self._ax_spectrum_map.get(event.inaxes)
+        if spectrum is None or spectrum.ions.size == 0:
+            return
+
+        ax = event.inaxes
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        max_inten = intensity.max() if len(intensity) > 0 else 1.0
+
+        try:
+            xy_data = np.column_stack([mz, intensity])
+            cursor_data = np.array([[event.xdata, event.ydata]])
+            xy_display = ax.transData.transform(xy_data)
+            cursor_display = ax.transData.transform(cursor_data)
+            distances = np.linalg.norm(xy_display - cursor_display, axis=1)
+            closest_idx = int(np.argmin(distances))
+            min_dist = distances[closest_idx]
+        except Exception:
+            return
+
+        if min_dist > 25:
+            return
+
+        sid = spectrum.spectrum_id
+        pins = self._pinned_ions.setdefault(sid, {})
+        if closest_idx in pins:
+            del pins[closest_idx]
+        else:
+            m = mz[closest_idx]
+            rel = intensity[closest_idx] / max_inten * 100
+            pins[closest_idx] = f"m/z {m:.4f}\n({rel:.1f}%)"
+
+        # Redraw to reflect pinned state; preserve current xlim/ylim
+        xlims = {a: a.get_xlim() for a in self.axes}
+        ylims = {a: a.get_ylim() for a in self.axes}
+        self._plot_spectra()
+        for a in self.axes:
+            if a in xlims:
+                a.set_xlim(xlims[a])
+            if a in ylims:
+                a.set_ylim(ylims[a])
+        self.canvas.draw_idle()
+
+    def _clear_hover_artists(self):
+        for artist in self._hover_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._hover_artists = []
+
+
+# ---------------------------------------------------------------------------
+# Numeric-sort capable QTreeWidgetItem
+# ---------------------------------------------------------------------------
+
+
+class _NumericSortItem(QTreeWidgetItem):
+    """QTreeWidgetItem that sorts numeric columns as floats, not strings."""
+
+    _NUMERIC_COLS = {0, 1, 2, 3}  # Index, m/z, Intensity, Rel. Intensity %
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        if col in self._NUMERIC_COLS:
+            try:
+                return float(self.text(col)) < float(other.text(col))
+            except ValueError:
+                pass
+        return super().__lt__(other)
+
 
 # ---------------------------------------------------------------------------
 # IonDataTable
@@ -1246,6 +1418,7 @@ class IonDataTable(QWidget):
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List = []
         self.spectrum_viz_callback = None
+        self._block_hover_highlight = False
         self._create_widgets()
 
     def _create_widgets(self):
@@ -1311,14 +1484,17 @@ class IonDataTable(QWidget):
         for i, (m, inten) in enumerate(zip(mz, intensity)):
             rel = (inten / max_inten * 100) if max_inten > 0 else 0
             annotations = ""
-            if hasattr(spectrum, "annotations") and spectrum.annotations:
-                ann = spectrum.annotations.get(i, [])
+            if (
+                hasattr(spectrum, "fragment_annotations")
+                and spectrum.fragment_annotations
+            ):
+                ann = spectrum.fragment_annotations.get(i, [])
                 if ann:
                     annotations = "; ".join(
                         f"{a.get('formula', '?')} [{a.get('ppm_error', 0):.1f}ppm]"
                         for a in ann
                     )
-            item = QTreeWidgetItem()
+            item = _NumericSortItem()
             item.setData(0, Qt.ItemDataRole.UserRole, i)
             item.setText(0, str(i))
             item.setText(1, f"{m:.4f}")
@@ -1326,6 +1502,38 @@ class IonDataTable(QWidget):
             item.setText(3, f"{rel:.2f}")
             item.setText(4, annotations)
             tree.addTopLevelItem(item)
+
+    def highlight_hover_row(self, spectrum_id, ion_index):
+        """Temporarily highlight a row corresponding to a hovered fragment."""
+        if self._block_hover_highlight:
+            return
+        for tab_idx in range(self.notebook.count()):
+            tab_label = self.notebook.tabText(tab_idx)
+            # Tab label is "S {spectrum_id}"
+            try:
+                tab_sid = int(tab_label.split()[-1])
+            except (ValueError, IndexError):
+                tab_sid = None
+            tree = self.notebook.widget(tab_idx)
+            if not isinstance(tree, QTreeWidget):
+                continue
+            if spectrum_id is None or ion_index is None:
+                # Clear hover background
+                for j in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(j)
+                    for col in range(tree.columnCount()):
+                        item.setBackground(col, Qt.GlobalColor.transparent)
+            elif tab_sid == spectrum_id:
+                self.notebook.setCurrentIndex(tab_idx)
+                for j in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(j)
+                    idx = item.data(0, Qt.ItemDataRole.UserRole)
+                    for col in range(tree.columnCount()):
+                        if idx == ion_index:
+                            item.setBackground(col, Qt.GlobalColor.yellow)
+                            tree.scrollToItem(item)
+                        else:
+                            item.setBackground(col, Qt.GlobalColor.transparent)
 
     def _on_ion_selection(self, spectrum: "Spectrum", tree: QTreeWidget):
         if self.spectrum_viz_callback is None:
@@ -2089,7 +2297,7 @@ class FragmentAnnotationDialog:
         # Formula tags
         tags_box = QGroupBox("Formula Tags (comma-separated)")
         tags_layout = QVBoxLayout(tags_box)
-        self._formula_tags_edit = QLineEdit("H2O, CO, CO2, NH3")
+        self._formula_tags_edit = QLineEdit("formula")
         tags_layout.addWidget(self._formula_tags_edit)
         layout.addWidget(tags_box)
 

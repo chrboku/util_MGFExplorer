@@ -2,7 +2,6 @@
 Main application window for the MGF Explorer.
 """
 
-import sys
 import matplotlib
 
 matplotlib.use("QtAgg")
@@ -10,45 +9,21 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
-    QGridLayout,
     QSplitter,
-    QTabWidget,
-    QGroupBox,
     QPushButton,
     QLabel,
-    QLineEdit,
-    QComboBox,
-    QTreeWidget,
-    QTreeWidgetItem,
-    QListWidget,
-    QCheckBox,
-    QDoubleSpinBox,
-    QSpinBox,
-    QProgressBar,
-    QTextEdit,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QMessageBox,
-    QInputDialog,
-    QAbstractItemView,
     QApplication,
-    QRadioButton,
-    QButtonGroup,
-    QFrame,
-    QScrollArea,
-    QSizePolicy,
-    QStatusBar,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QPixmap, QFont
 import os
 import pathlib
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple
-from io import BytesIO
 from ._version import __version__
 from .mgf_parser import MGFParser, Spectrum
 from .config import load_config, save_config
@@ -65,13 +40,11 @@ from .gui_components import (
     CanonicalSmilesDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
-    SpectrumPopupWindow,
     FragmentDistributionDialog,
 )
 from .options_dialog import OptionsDialog
 from .molecular_formula import (
     FragmentAnnotator,
-    MolecularFormula,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -500,6 +473,9 @@ class MGFExplorerApp(QMainWindow):
         right_splitter = QSplitter(Qt.Orientation.Vertical)
         main_splitter.addWidget(right_splitter)
 
+        main_splitter.setCollapsible(0, False)
+        main_splitter.setCollapsible(1, False)
+
         metadata_frame = QWidget()
         metadata_layout = QVBoxLayout(metadata_frame)
         metadata_layout.setContentsMargins(0, 0, 0, 0)
@@ -507,6 +483,9 @@ class MGFExplorerApp(QMainWindow):
 
         bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
         right_splitter.addWidget(bottom_splitter)
+
+        right_splitter.setCollapsible(0, False)
+        right_splitter.setCollapsible(1, False)
 
         table_frame = QWidget()
         table_layout = QVBoxLayout(table_frame)
@@ -523,13 +502,19 @@ class MGFExplorerApp(QMainWindow):
         sim_layout.setContentsMargins(0, 0, 0, 0)
         bottom_splitter.addWidget(similarity_frame)
 
+        bottom_splitter.setCollapsible(0, False)
+        bottom_splitter.setCollapsible(1, False)
+        bottom_splitter.setCollapsible(2, False)
+
         self.spectrum_tree = SpectrumTreeView(
             left_frame, on_selection_changed=self._on_spectrum_selection_changed
         )
         left_layout.addWidget(self.spectrum_tree)
 
         self.metadata_editor = MetadataEditor(
-            metadata_frame, on_metadata_changed=self._on_metadata_changed
+            metadata_frame,
+            on_metadata_changed=self._on_metadata_changed,
+            on_set_spectrum_name=self._update_spectrum_names_with,
         )
         metadata_layout.addWidget(self.metadata_editor)
 
@@ -543,6 +528,7 @@ class MGFExplorerApp(QMainWindow):
         sim_layout.addWidget(self.similarity_viz)
 
         self.ion_table.set_spectrum_viz_callback(self._on_ion_selection_changed)
+        self.spectrum_viz.set_hover_callback(self._on_spectrum_hover)
 
         self.statusBar().showMessage("Ready - Open an MGF file to get started")
         self._set_components_enabled(False)
@@ -717,6 +703,11 @@ class MGFExplorerApp(QMainWindow):
         """Handle ion selection changes in the ion data table."""
         if self.spectrum_viz:
             self.spectrum_viz.highlight_ions(spectrum_id, selected_ion_indices)
+
+    def _on_spectrum_hover(self, spectrum_id, ion_index):
+        """Handle fragment hover from spectrum visualization."""
+        if hasattr(self, "ion_table") and self.ion_table:
+            self.ion_table.highlight_hover_row(spectrum_id, ion_index)
 
     def _add_new_key_value(self):
         """Add a new key-value pair via the Edit menu."""

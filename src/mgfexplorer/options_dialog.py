@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QWidget,
 )
-from PyQt6.QtCore import Qt
 
 
 class OptionsDialog(QDialog):
