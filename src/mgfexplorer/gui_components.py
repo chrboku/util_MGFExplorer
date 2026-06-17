@@ -52,9 +52,106 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFont,
     QCursor,
+    QColor,
 )
+from matplotlib.lines import Line2D
 
 from .mgf_parser import MGFParser, Spectrum
+
+
+# ---------------------------------------------------------------------------
+# Module-level cosine similarity helper (supports 3 matching methods)
+# ---------------------------------------------------------------------------
+
+
+def _compute_cosine_similarity_method(
+    spec_ref: "Spectrum",
+    spec_cmp: "Spectrum",
+    tolerance: float,
+    method: str = "standard",
+) -> float:
+    """Compute cosine similarity with selectable matching method.
+
+    method:
+        'standard'  – all fragments from both spectra (symmetric)
+        'forward'   – only reference fragments count toward denominator
+        'common'    – only matched (common) fragments are used
+    """
+    if spec_ref.ions.size == 0 or spec_cmp.ions.size == 0:
+        return 0.0
+
+    mz_ref = spec_ref.ions[:, 0].copy()
+    int_ref = spec_ref.ions[:, 1].copy()
+    mz_cmp = spec_cmp.ions[:, 0].copy()
+    int_cmp = spec_cmp.ions[:, 1].copy()
+
+    max_ref = int_ref.max()
+    max_cmp = int_cmp.max()
+    if max_ref == 0 or max_cmp == 0:
+        return 0.0
+    int_ref = int_ref / max_ref
+    int_cmp = int_cmp / max_cmp
+
+    # Greedy matching: each peak matched at most once
+    matched_ref_idx: List[int] = []
+    matched_cmp_idx: List[int] = []
+    used_cmp: set = set()
+
+    for i in range(len(mz_ref)):
+        best_j = None
+        best_dist = float("inf")
+        for j in range(len(mz_cmp)):
+            if j in used_cmp:
+                continue
+            dist = abs(float(mz_ref[i]) - float(mz_cmp[j]))
+            if dist <= tolerance and dist < best_dist:
+                best_dist = dist
+                best_j = j
+        if best_j is not None:
+            matched_ref_idx.append(i)
+            matched_cmp_idx.append(best_j)
+            used_cmp.add(best_j)
+
+    if method == "standard":
+        dot = sum(
+            float(int_ref[i]) * float(int_cmp[j])
+            for i, j in zip(matched_ref_idx, matched_cmp_idx)
+        )
+        norm_ref = float(np.sqrt(np.sum(int_ref**2)))
+        norm_cmp = float(np.sqrt(np.sum(int_cmp**2)))
+        if norm_ref == 0 or norm_cmp == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp)))
+
+    elif method == "forward":
+        dot = sum(
+            float(int_ref[i]) * float(int_cmp[j])
+            for i, j in zip(matched_ref_idx, matched_cmp_idx)
+        )
+        norm_ref = float(np.sqrt(np.sum(int_ref**2)))
+        norm_cmp_matched = (
+            float(np.sqrt(sum(float(int_cmp[j]) ** 2 for j in matched_cmp_idx)))
+            if matched_cmp_idx
+            else 0.0
+        )
+        if norm_ref == 0 or norm_cmp_matched == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp_matched)))
+
+    elif method == "common":
+        if not matched_ref_idx:
+            return 0.0
+        v_ref = np.array([float(int_ref[i]) for i in matched_ref_idx])
+        v_cmp = np.array([float(int_cmp[j]) for j in matched_cmp_idx])
+        dot = float(np.dot(v_ref, v_cmp))
+        norm_ref = float(np.linalg.norm(v_ref))
+        norm_cmp = float(np.linalg.norm(v_cmp))
+        if norm_ref == 0 or norm_cmp == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp)))
+
+    return 0.0
+
 
 # Natural sorting
 try:
@@ -106,16 +203,33 @@ class ToolTip:
 # ---------------------------------------------------------------------------
 
 
+# Grey shades per tree depth level (0 = darkest, last = white)
+_TREE_LEVEL_COLORS = [
+    QColor(200, 200, 200),  # level 0
+    QColor(220, 220, 220),  # level 1
+    QColor(238, 238, 238),  # level 2
+    QColor(255, 255, 255),  # level 3+ (white)
+]
+
+
 class SpectrumTreeView(QWidget):
     """Tree view for displaying spectra with grouping/filtering."""
 
-    def __init__(self, parent=None, on_selection_changed=None):
+    def __init__(
+        self,
+        parent=None,
+        on_selection_changed=None,
+        on_filter_similar_cb=None,
+    ):
         super().__init__(parent)
         self._on_selection_changed_cb = on_selection_changed
+        self._on_filter_similar_cb = on_filter_similar_cb
         self.parser: Optional[MGFParser] = None
         self.selected_grouping_tags: List[str] = []
         self._naming_scheme: str = "Numbered"
         self._filter_text: str = ""
+        self._similarity_visible_ids: Optional[set] = None  # None = no filter
+        self._similarity_reference_id = None  # highlighted reference spectrum
         self._filter_timer: QTimer = QTimer(self)
         self._filter_timer.setSingleShot(True)
         self._filter_timer.timeout.connect(self._apply_filter)
@@ -159,7 +273,10 @@ class SpectrumTreeView(QWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["Spectrum"])
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.setIndentation(10)
         self._tree.itemSelectionChanged.connect(self._on_tree_selection)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._show_tree_context_menu)
         tree_layout.addWidget(self._tree)
         layout.addWidget(tree_box, stretch=1)
 
@@ -192,11 +309,19 @@ class SpectrumTreeView(QWidget):
         self._filter_text = self._filter_entry.text().strip()
         self._populate_tree()
 
+    def set_filter_text(self, text: str):
+        """Programmatically set the filter text and repopulate the tree."""
+        self._filter_timer.stop()
+        self._filter_entry.setText(text)
+        self._filter_text = text
+        self._populate_tree()
+
     # ------------------------------------------------------------------
     def load_data(self, parser: MGFParser):
         self.parser = parser
         self._filter_entry.clear()
         self._filter_text = ""
+        self._similarity_visible_ids = None
         self._populate_tree()
 
     def _populate_tree(self):
@@ -215,6 +340,25 @@ class SpectrumTreeView(QWidget):
             self._populate_flat(spectra)
 
         self._tree.expandAll()
+        self._color_tree_levels()
+
+    def _color_tree_levels(self):
+        """Apply background colors based on item depth; highlight reference in yellow."""
+        ref_id = self._similarity_reference_id
+
+        def _visit(item: QTreeWidgetItem, depth: int):
+            sid = item.data(0, Qt.ItemDataRole.UserRole)
+            if ref_id is not None and sid == ref_id:
+                color = QColor(255, 230, 0)  # yellow for reference
+            else:
+                color = _TREE_LEVEL_COLORS[min(depth, len(_TREE_LEVEL_COLORS) - 1)]
+            for col in range(self._tree.columnCount()):
+                item.setBackground(col, color)
+            for i in range(item.childCount()):
+                _visit(item.child(i), depth + 1)
+
+        for i in range(self._tree.topLevelItemCount()):
+            _visit(self._tree.topLevelItem(i), 0)
 
     def _populate_flat(self, spectra):
         for spectrum in spectra:
@@ -319,7 +463,76 @@ class SpectrumTreeView(QWidget):
     def has_grouping(self) -> bool:
         return len(self.selected_grouping_tags) > 0
 
+    # ------------------------------------------------------------------
+    # Similarity filter
+    # ------------------------------------------------------------------
+
+    def set_similarity_filter(self, visible_ids: set, reference_id=None):
+        """Show only spectra whose IDs are in *visible_ids*."""
+        self._similarity_visible_ids = set(visible_ids)
+        self._similarity_reference_id = reference_id
+        self._populate_tree()
+
+    def clear_similarity_filter(self):
+        """Remove the similarity-based filter."""
+        self._similarity_visible_ids = None
+        self._similarity_reference_id = None
+        self._populate_tree()
+
+    def clear_all_filters(self):
+        """Remove both text filter and similarity filter, repopulate."""
+        self._filter_entry.clear()
+        self._filter_text = ""
+        self._similarity_visible_ids = None
+        self._similarity_reference_id = None
+        self._populate_tree()
+
+    def get_filtered_spectrum_ids(self) -> List:
+        """Return IDs of all spectra that currently pass the text filter."""
+        if not self.parser:
+            return []
+        return [
+            s.spectrum_id
+            for s in self.parser.spectra
+            if self._spectrum_matches_text_filter(s)
+        ]
+
+    # ------------------------------------------------------------------
+    # Right-click context menu on the tree
+    # ------------------------------------------------------------------
+
+    def _show_tree_context_menu(self, pos):
+        item = self._tree.itemAt(pos)
+        spectrum_id = None
+        if item is not None:
+            spectrum_id = item.data(0, Qt.ItemDataRole.UserRole)
+
+        menu = QMenu(self)
+
+        if spectrum_id is not None and self._on_filter_similar_cb is not None:
+            act_filter = menu.addAction("Filter similar spectra…")
+            act_filter.triggered.connect(
+                lambda: self._on_filter_similar_cb(spectrum_id)
+            )
+            menu.addSeparator()
+
+        act_show_all = menu.addAction("Show all spectra")
+        act_show_all.triggered.connect(self.clear_all_filters)
+
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+    # Filtering helpers
+    # ------------------------------------------------------------------
+
     def _spectrum_matches_filter(self, spectrum) -> bool:
+        """Return True if spectrum passes both text filter and similarity filter."""
+        if self._similarity_visible_ids is not None:
+            if spectrum.spectrum_id not in self._similarity_visible_ids:
+                return False
+        return self._spectrum_matches_text_filter(spectrum)
+
+    def _spectrum_matches_text_filter(self, spectrum) -> bool:
         if not self._filter_text:
             return True
         ft = self._filter_text
@@ -371,11 +584,16 @@ class MetadataEditor(QWidget):
     """Component for viewing and editing spectrum metadata."""
 
     def __init__(
-        self, parent=None, on_metadata_changed=None, on_set_spectrum_name=None
+        self,
+        parent=None,
+        on_metadata_changed=None,
+        on_set_spectrum_name=None,
+        on_filter_by_value=None,
     ):
         super().__init__(parent)
         self._on_metadata_changed_cb = on_metadata_changed
         self._on_set_spectrum_name_cb = on_set_spectrum_name
+        self._on_filter_by_value_cb = on_filter_by_value
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List = []
         self._pending_selection: Optional[List] = None
@@ -553,7 +771,9 @@ class MetadataEditor(QWidget):
             self._show_smiles_message("No spectra selected")
             return
         smiles_keys = ["smiles", "SMILES", "Smiles", "smiles_code", "SMILES_CODE"]
-        found = None
+        # Collect unique SMILES (preserving order) across selected spectra, up to 9
+        seen: set = set()
+        unique_smiles: List[str] = []
         for sid in self.selected_spectrum_ids:
             spectrum = next(
                 (s for s in self.parser.spectra if s.spectrum_id == sid), None
@@ -562,15 +782,63 @@ class MetadataEditor(QWidget):
                 continue
             for k in smiles_keys:
                 v = spectrum.get_metadata_value(k)
-                if v and v.strip():
-                    found = v.strip()
-                    break
-            if found:
+                if v and v.strip() and v.strip() not in seen:
+                    seen.add(v.strip())
+                    unique_smiles.append(v.strip())
+            if len(unique_smiles) >= 9:
                 break
-        if found:
-            self._plot_smiles(found)
+        if unique_smiles:
+            self._plot_smiles_grid(unique_smiles[:9])
         else:
             self._show_smiles_message("No SMILES data found")
+
+    def _plot_smiles_grid(self, smiles_list: List[str]):
+        if not RDKIT_AVAILABLE:
+            self._show_smiles_message("RDKit not available")
+            return
+        n = len(smiles_list)
+        # Determine grid size (up to 3×3)
+        cols = min(n, 3)
+        rows = (n + cols - 1) // cols
+        cell_px = 200
+        self._smiles_fig.clear()
+        self._smiles_fig.set_size_inches(cols * (cell_px / 80), rows * (cell_px / 80))
+        for idx, smiles_code in enumerate(smiles_list):
+            ax = self._smiles_fig.add_subplot(rows, cols, idx + 1)
+            try:
+                mol = Chem.MolFromSmiles(smiles_code)
+                if mol is None:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "Invalid\nSMILES",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        transform=ax.transAxes,
+                    )
+                else:
+                    drawer = rdMolDraw2D.MolDraw2DCairo(cell_px, cell_px)
+                    drawer.drawOptions().addStereoAnnotation = True
+                    drawer.DrawMolecule(mol)
+                    drawer.FinishDrawing()
+                    png = drawer.GetDrawingText()
+                    img = Image.open(io.BytesIO(png))
+                    ax.imshow(np.array(img))
+            except Exception as e:
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"Error:\n{e}",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    transform=ax.transAxes,
+                    wrap=True,
+                )
+            ax.axis("off")
+        self._smiles_fig.tight_layout(pad=0.2)
+        self._smiles_canvas.draw()
 
     def _on_double_click(self, item: QTreeWidgetItem, column: int):
         if item.data(0, Qt.ItemDataRole.UserRole) is None:
@@ -600,11 +868,14 @@ class MetadataEditor(QWidget):
             return
         menu = QMenu(self)
         act_select = menu.addAction("Select by value")
+        act_filter = menu.addAction("Filter by value")
         act_group = menu.addAction("Add as grouping tag")
         act_name = menu.addAction("Set as spectrum name")
         action = menu.exec(self._metadata_tree.viewport().mapToGlobal(pos))
         if action == act_select:
             self._select_by_value(item)
+        elif action == act_filter:
+            self._filter_by_value(item)
         elif action == act_group:
             self._add_as_grouping_tag(key)
         elif action == act_name:
@@ -623,6 +894,15 @@ class MetadataEditor(QWidget):
         self._pending_selection = matching
         if self._on_metadata_changed_cb:
             self._on_metadata_changed_cb()
+
+    def _filter_by_value(self, item: QTreeWidgetItem):
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        value = item.text(1)
+        if key is None:
+            return
+        filter_text = f"$${key}:{value}"
+        if self._on_filter_by_value_cb:
+            self._on_filter_by_value_cb(filter_text)
 
     def _add_as_grouping_tag(self, key: str):
         # Try to notify main app callback
@@ -1022,9 +1302,9 @@ class SpectrumVisualization(QWidget):
             global_mz_min, global_mz_max = 0, 1000
         else:
             rng = global_mz_max - global_mz_min
-            pad = rng * 0.02
-            global_mz_min -= pad
-            global_mz_max += pad
+            pad = max(rng * 0.02, 5.0)
+            global_mz_min = max(0.0, global_mz_min - pad)
+            global_mz_max = global_mz_max + pad
 
         self._ax_spectrum_map = {}
         n = len(selected_spectra)
@@ -1092,19 +1372,29 @@ class SpectrumVisualization(QWidget):
         precursor = self._get_precursor_mass(spectrum)
         if precursor is not None:
             y_max = intensity.max() if len(intensity) > 0 else 1
-            ax.axvline(
-                precursor, color="grey", linestyle="--", linewidth=1.5, alpha=0.7
+            # Only draw the precursor line if it falls inside the x-axis window
+            x_lo = (
+                mz_limits[0] if mz_limits else (mz.min() * 0.95 if len(mz) > 0 else 0)
             )
-            ax.text(
-                precursor,
-                y_max * 1.05,
-                f"M: {precursor:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                color="grey",
-                rotation=90,
+            x_hi = (
+                mz_limits[1]
+                if mz_limits
+                else (mz.max() * 1.05 if len(mz) > 0 else 1000)
             )
+            if x_lo <= precursor <= x_hi:
+                ax.axvline(
+                    precursor, color="grey", linestyle="--", linewidth=1.5, alpha=0.7
+                )
+                ax.text(
+                    precursor,
+                    y_max * 1.05,
+                    f"M: {precursor:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="grey",
+                    rotation=90,
+                )
 
         if is_last:
             ax.set_xlabel("m/z")
@@ -1114,10 +1404,12 @@ class SpectrumVisualization(QWidget):
         label = self._get_spectrum_display_name(spectrum)
         ax.set_ylabel(f"{label}\nIntensity", fontsize=9)
         ax.grid(True, alpha=0.3)
+        # Always enforce x limits so all subplots share the same full-width range
         if mz_limits:
             ax.set_xlim(mz_limits)
         elif len(mz) > 0:
-            ax.set_xlim(mz.min() * 0.95, mz.max() * 1.05)
+            pad = max((mz.max() - mz.min()) * 0.02, 5.0)
+            ax.set_xlim(max(0.0, mz.min() - pad), mz.max() + pad)
         if len(intensity) > 0:
             ax.set_ylim(0, intensity.max() * 1.1)
 
@@ -1702,10 +1994,117 @@ class CosineSimilarityVisualization(QWidget):
             )
             self.canvas.draw()
             return
+
+        # Special case: exactly 2 spectra → mirror plot
+        if len(self.selected_spectrum_ids) == 2:
+            specs = [
+                s
+                for s in self.parser.spectra
+                if s.spectrum_id in self.selected_spectrum_ids
+            ]
+            if len(specs) == 2:
+                self._display_mirror_plot(specs[0], specs[1])
+                return
+
         if len(self.selected_spectrum_ids) > 10:
             self._start_threaded_calculation()
         else:
             self._calculate_similarity_direct()
+
+    def _display_mirror_plot(self, spec1, spec2):
+        """Show a mirror plot for exactly two spectra with matched/unmatched fragment coloring."""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        tol = self._tolerance_spin.value()
+
+        # Cosine similarity
+        sim = self.parser.calculate_cosine_similarity(spec1, spec2, tol)
+
+        def _norm_ions(ions):
+            if ions.size == 0:
+                return np.array([]), np.array([])
+            mz = ions[:, 0].copy()
+            inten = ions[:, 1].copy()
+            max_i = inten.max()
+            if max_i > 0:
+                inten = inten / max_i
+            return mz, inten
+
+        mz1, int1 = _norm_ions(spec1.ions)
+        mz2, int2 = _norm_ions(spec2.ions)
+
+        # Greedy matching
+        matched1: set = set()
+        matched2: set = set()
+        used2: set = set()
+        for i in range(len(mz1)):
+            best_j = None
+            best_dist = float("inf")
+            for j in range(len(mz2)):
+                if j in used2:
+                    continue
+                dist = abs(float(mz1[i]) - float(mz2[j]))
+                if dist <= tol and dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+            if best_j is not None:
+                matched1.add(i)
+                matched2.add(best_j)
+                used2.add(best_j)
+
+        # Plot spectrum 1 (positive, top)
+        for i, (m, inten) in enumerate(zip(mz1, int1)):
+            color = "steelblue" if i in matched1 else "firebrick"
+            ax.vlines(float(m), 0, float(inten), colors=color, linewidth=1.5)
+
+        # Plot spectrum 2 (negative, bottom)
+        for j, (m, inten) in enumerate(zip(mz2, int2)):
+            color = "steelblue" if j in matched2 else "firebrick"
+            ax.vlines(float(m), 0, -float(inten), colors=color, linewidth=1.5)
+
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("m/z")
+        ax.set_ylabel("Relative Intensity")
+
+        name1 = f"Spectrum {spec1.spectrum_id}"
+        name2 = f"Spectrum {spec2.spectrum_id}"
+        ax.set_title(
+            f"Mirror Plot: {name1}  ↑  /  ↓  {name2}\nCosine Similarity: {sim:.4f}",
+            fontsize=10,
+        )
+
+        # Fix y-axis tick labels to show absolute values
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([f"{abs(v):.1f}" for v in yticks])
+
+        # Spectrum name annotations
+        ax.text(
+            0.01, 0.98, name1, transform=ax.transAxes, va="top", ha="left", fontsize=8
+        )
+        ax.text(
+            0.01,
+            0.02,
+            name2,
+            transform=ax.transAxes,
+            va="bottom",
+            ha="left",
+            fontsize=8,
+        )
+
+        legend_elements = [
+            Line2D([0], [0], color="steelblue", linewidth=2, label="Matched"),
+            Line2D([0], [0], color="firebrick", linewidth=2, label="Unmatched"),
+        ]
+        ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        self.figure.tight_layout()
+        self.canvas.draw()
+        self._stats_text.setPlainText(
+            f"Mirror Plot: {name1} vs {name2}  |  Cosine Similarity: {sim:.4f}"
+            f"  |  Tolerance: {tol:.3f} Da"
+            f"  |  Matched fragments: {len(matched1)}"
+            f" / spec1={len(mz1)}, spec2={len(mz2)}"
+        )
 
     def _start_threaded_calculation(self):
         self._calc_btn.setEnabled(False)
@@ -2276,23 +2675,52 @@ class IntensityFilterDialog:
 class FragmentAnnotationDialog:
     """Dialog for fragment annotation configuration."""
 
-    def __init__(self, parent, callback=None, spectra=None):
+    def __init__(
+        self,
+        parent,
+        callback=None,
+        spectra=None,
+        selected_ids: Optional[List] = None,
+        filtered_ids: Optional[List] = None,
+    ):
         self.parent = parent
         self.callback = callback
         self.spectra = spectra or []
+        self._selected_ids: List = selected_ids or []
+        self._filtered_ids: List = filtered_ids or []
         self.result = None
         self._window: Optional[QDialog] = None
 
     def show(self):
         self._window = QDialog(self.parent)
         self._window.setWindowTitle("Fragment Annotation")
-        self._window.resize(600, 500)
+        self._window.resize(600, 560)
         self._build_ui()
         self._window.exec()
         return self.result
 
     def _build_ui(self):
         layout = QVBoxLayout(self._window)
+
+        # Scope selection
+        scope_box = QGroupBox("Calculate for")
+        scope_layout = QVBoxLayout(scope_box)
+        self._rb_all = QRadioButton(f"All spectra ({len(self.spectra)})")
+        self._rb_selected = QRadioButton(
+            f"Selected spectra ({len(self._selected_ids)})"
+        )
+        self._rb_filtered = QRadioButton(
+            f"Filtered spectra ({len(self._filtered_ids)})"
+        )
+        self._rb_all.setChecked(True)
+        if not self._selected_ids:
+            self._rb_selected.setEnabled(False)
+        if not self._filtered_ids:
+            self._rb_filtered.setEnabled(False)
+        scope_layout.addWidget(self._rb_all)
+        scope_layout.addWidget(self._rb_selected)
+        scope_layout.addWidget(self._rb_filtered)
+        layout.addWidget(scope_box)
 
         # Formula tags
         tags_box = QGroupBox("Formula Tags (comma-separated)")
@@ -2369,6 +2797,15 @@ class FragmentAnnotationDialog:
             "additional_elements": additional_elements,
             "ppm_function_points": ppm_points,
             "max_workers": self._workers_spin.value(),
+            "scope": (
+                "selected"
+                if self._rb_selected.isChecked()
+                else "filtered"
+                if self._rb_filtered.isChecked()
+                else "all"
+            ),
+            "selected_ids": list(self._selected_ids),
+            "filtered_ids": list(self._filtered_ids),
         }
         if self.callback:
             self.callback(self.result)
@@ -2902,3 +3339,125 @@ class FragmentDistributionDialog:
 
         remove_btn.clicked.connect(_remove_selected)
         self._window.exec()
+
+
+# ---------------------------------------------------------------------------
+# SimilarSpectraFilterDialog
+# ---------------------------------------------------------------------------
+
+
+class SimilarSpectraFilterDialog(QDialog):
+    """Dialog for filtering tree-view to spectra similar to a reference spectrum."""
+
+    _METHOD_LABELS = [
+        ("standard", "All fragments (standard cosine)"),
+        ("forward", "Forward match (reference fragments only)"),
+        ("common", "Common fragments only"),
+    ]
+
+    def __init__(
+        self,
+        parent,
+        parser: MGFParser,
+        reference_spectrum_id,
+        all_spectra_ids: List,
+    ):
+        super().__init__(parent)
+        self.parser = parser
+        self.reference_spectrum_id = reference_spectrum_id
+        self.all_spectra_ids = all_spectra_ids
+        self.result = None
+        self.setWindowTitle("Filter Similar Spectra")
+        self.resize(620, 520)
+        self._build_ui()
+        self.exec()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        ref_spectrum = next(
+            (
+                s
+                for s in self.parser.spectra
+                if s.spectrum_id == self.reference_spectrum_id
+            ),
+            None,
+        )
+
+        # Metadata matching table
+        meta_box = QGroupBox(
+            "Metadata fields that must be identical to the reference spectrum"
+        )
+        meta_layout = QVBoxLayout(meta_box)
+        self._meta_table = QTreeWidget()
+        self._meta_table.setHeaderLabels(
+            ["Metadata Key", "Reference Value", "Must Match"]
+        )
+        self._meta_table.setColumnWidth(0, 180)
+        self._meta_table.setColumnWidth(1, 220)
+        self._meta_table.setColumnWidth(2, 80)
+        self._meta_table.setAlternatingRowColors(True)
+
+        if ref_spectrum:
+            for key in sorted(ref_spectrum.metadata.keys()):
+                value = ref_spectrum.metadata.get(key, "")
+                item = QTreeWidgetItem(self._meta_table)
+                item.setText(0, key)
+                item.setText(1, str(value) if value is not None else "")
+                cb = QCheckBox()
+                self._meta_table.setItemWidget(item, 2, cb)
+
+        meta_layout.addWidget(self._meta_table)
+        layout.addWidget(meta_box)
+
+        # Similarity settings
+        sim_box = QGroupBox("Similarity Settings")
+        sim_grid = QGridLayout(sim_box)
+
+        sim_grid.addWidget(QLabel("Similarity threshold:"), 0, 0)
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setRange(0.0, 1.0)
+        self._threshold_spin.setValue(0.7)
+        self._threshold_spin.setDecimals(3)
+        self._threshold_spin.setSingleStep(0.05)
+        sim_grid.addWidget(self._threshold_spin, 0, 1)
+
+        sim_grid.addWidget(QLabel("m/z tolerance (Da):"), 1, 0)
+        self._tol_spin = QDoubleSpinBox()
+        self._tol_spin.setRange(0.001, 2.0)
+        self._tol_spin.setValue(0.02)
+        self._tol_spin.setDecimals(3)
+        sim_grid.addWidget(self._tol_spin, 1, 1)
+
+        sim_grid.addWidget(QLabel("Matching method:"), 2, 0)
+        self._method_combo = QComboBox()
+        for _key, label in self._METHOD_LABELS:
+            self._method_combo.addItem(label)
+        sim_grid.addWidget(self._method_combo, 2, 1)
+
+        layout.addWidget(sim_box)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def _on_ok(self):
+        selected_keys: List[str] = []
+        for i in range(self._meta_table.topLevelItemCount()):
+            item = self._meta_table.topLevelItem(i)
+            cb = self._meta_table.itemWidget(item, 2)
+            if isinstance(cb, QCheckBox) and cb.isChecked():
+                selected_keys.append(item.text(0))
+
+        method_key = self._METHOD_LABELS[self._method_combo.currentIndex()][0]
+
+        self.result = {
+            "metadata_keys": selected_keys,
+            "threshold": self._threshold_spin.value(),
+            "tolerance": self._tol_spin.value(),
+            "method": method_key,
+        }
+        self.accept()

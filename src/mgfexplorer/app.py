@@ -41,6 +41,8 @@ from .gui_components import (
     ProgressDialog,
     PPMDeviationPlotDialog,
     FragmentDistributionDialog,
+    SimilarSpectraFilterDialog,
+    _compute_cosine_similarity_method,
 )
 from .options_dialog import OptionsDialog
 from .molecular_formula import (
@@ -507,7 +509,9 @@ class MGFExplorerApp(QMainWindow):
         bottom_splitter.setCollapsible(2, False)
 
         self.spectrum_tree = SpectrumTreeView(
-            left_frame, on_selection_changed=self._on_spectrum_selection_changed
+            left_frame,
+            on_selection_changed=self._on_spectrum_selection_changed,
+            on_filter_similar_cb=self._filter_similar_spectra,
         )
         left_layout.addWidget(self.spectrum_tree)
 
@@ -515,6 +519,7 @@ class MGFExplorerApp(QMainWindow):
             metadata_frame,
             on_metadata_changed=self._on_metadata_changed,
             on_set_spectrum_name=self._update_spectrum_names_with,
+            on_filter_by_value=self._apply_metadata_filter,
         )
         metadata_layout.addWidget(self.metadata_editor)
 
@@ -1808,6 +1813,10 @@ class MGFExplorerApp(QMainWindow):
             self, self.parser.spectra, self._apply_smarts_filter
         )
 
+    def _apply_metadata_filter(self, filter_text: str):
+        """Set the spectrum tree filter to the given text (called from metadata context menu)."""
+        self.spectrum_tree.set_filter_text(filter_text)
+
     def _apply_smarts_filter(self, matching_spectra):
         """Apply SMARTS filter by keeping only matching spectra."""
         if not matching_spectra:
@@ -1858,6 +1867,60 @@ class MGFExplorerApp(QMainWindow):
             f"Intensity filter applied - {total_fragments} total fragments remaining"
         )
 
+    def _filter_similar_spectra(self, reference_spectrum_id):
+        """Show similarity filter dialog and apply result to the tree view."""
+        if not self.parser or not self.parser.spectra:
+            return
+
+        all_ids = [s.spectrum_id for s in self.parser.spectra]
+        dialog = SimilarSpectraFilterDialog(
+            self, self.parser, reference_spectrum_id, all_ids
+        )
+        if dialog.result is None:
+            return
+
+        cfg = dialog.result
+        ref_spectrum = next(
+            (s for s in self.parser.spectra if s.spectrum_id == reference_spectrum_id),
+            None,
+        )
+        if ref_spectrum is None:
+            return
+
+        self.statusBar().showMessage("Computing similarity filter…")
+        QApplication.processEvents()
+
+        visible_ids: set = {reference_spectrum_id}
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id == reference_spectrum_id:
+                continue
+
+            # Metadata matching
+            meta_match = True
+            for key in cfg["metadata_keys"]:
+                ref_val = str(ref_spectrum.metadata.get(key, ""))
+                cmp_val = str(spectrum.metadata.get(key, ""))
+                if ref_val != cmp_val:
+                    meta_match = False
+                    break
+            if not meta_match:
+                continue
+
+            # Similarity check
+            sim = _compute_cosine_similarity_method(
+                ref_spectrum, spectrum, cfg["tolerance"], cfg["method"]
+            )
+            if sim >= cfg["threshold"]:
+                visible_ids.add(spectrum.spectrum_id)
+
+        self.spectrum_tree.set_similarity_filter(
+            visible_ids, reference_id=reference_spectrum_id
+        )
+        self.statusBar().showMessage(
+            f"Similarity filter applied: {len(visible_ids)} spectra shown "
+            f"(threshold={cfg['threshold']:.3f}, method={cfg['method']})"
+        )
+
     def _generate_subformulas(self):
         """Open fragment annotation dialog and generate subformulas."""
         if not self.parser.spectra:
@@ -1866,19 +1929,42 @@ class MGFExplorerApp(QMainWindow):
             )
             return
 
+        selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+        filtered_ids = self.spectrum_tree.get_filtered_spectrum_ids()
+
         # Open fragment annotation dialog
-        dialog = FragmentAnnotationDialog(self, spectra=self.parser.spectra)
+        dialog = FragmentAnnotationDialog(
+            self,
+            spectra=self.parser.spectra,
+            selected_ids=selected_ids,
+            filtered_ids=filtered_ids,
+        )
         config = dialog.show()
 
         if config is None:  # User cancelled
             return
+
+        # Determine which spectra to annotate based on scope
+        scope = config.get("scope", "all")
+        if scope == "selected":
+            target_id_set = set(config.get("selected_ids", []))
+            spectra_to_annotate = [
+                s for s in self.parser.spectra if s.spectrum_id in target_id_set
+            ]
+        elif scope == "filtered":
+            target_id_set = set(config.get("filtered_ids", []))
+            spectra_to_annotate = [
+                s for s in self.parser.spectra if s.spectrum_id in target_id_set
+            ]
+        else:
+            spectra_to_annotate = list(self.parser.spectra)
 
         # Clear PPM tolerance cache to ensure new tolerance function is used
         self._get_ppm_tolerance_for_mz_cache.clear()
 
         # Count spectra with formulas first
         spectra_with_formulas = []
-        for spectrum in self.parser.spectra:
+        for spectrum in spectra_to_annotate:
             formula = self._extract_formula_from_spectrum(
                 spectrum, config["formula_tags"]
             )
