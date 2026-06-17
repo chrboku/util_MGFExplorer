@@ -2,14 +2,28 @@
 Main application window for the MGF Explorer.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+import matplotlib
+
+matplotlib.use("QtAgg")
+from PyQt6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QSplitter,
+    QPushButton,
+    QLabel,
+    QDialog,
+    QFileDialog,
+    QMessageBox,
+    QApplication,
+)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction, QActionGroup, QPixmap, QFont
 import os
 import pathlib
 import re
 import numpy as np
 from typing import Any, Dict, List, Tuple
-from PIL import Image, ImageTk
 from ._version import __version__
 from .mgf_parser import MGFParser, Spectrum
 from .config import load_config, save_config
@@ -26,23 +40,15 @@ from .gui_components import (
     CanonicalSmilesDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
-    SpectrumPopupWindow,
     FragmentDistributionDialog,
+    SimilarSpectraFilterDialog,
+    _compute_cosine_similarity_method,
 )
 from .options_dialog import OptionsDialog
 from .molecular_formula import (
     FragmentAnnotator,
-    MolecularFormula,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Try to import tkinterdnd2 for drag and drop support
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-
-    DRAG_DROP_AVAILABLE = True
-except ImportError:
-    DRAG_DROP_AVAILABLE = False
 
 # Try to import RDKit for SMARTS filtering
 try:
@@ -54,225 +60,236 @@ except ImportError:
     RDKIT_AVAILABLE = False
 
 
-class MGFExplorerApp:
+class MGFExplorerApp(QMainWindow):
     """Main application class for the MGF Explorer."""
 
     def __init__(self):
-        # Initialize with drag and drop support if available
-        if DRAG_DROP_AVAILABLE:
-            self.root = TkinterDnD.Tk()
-        else:
-            self.root = tk.Tk()
+        super().__init__()
 
-        self.root.title(f"MGF Explorer v{__version__}")
-        self.root.geometry("1400x900")
-        self.root.minsize(1000, 700)
+        self.setWindowTitle(f"MGF Explorer v{__version__}")
+        self.resize(1400, 900)
+        self.setMinimumSize(1000, 700)
+        self.setAcceptDrops(True)
 
         self.parser = MGFParser()
         self.current_file = None
         self.used_prefixes = set()  # Track used prefixes to prevent conflicts
         self.config_data = load_config()
 
-        # Selection debouncing
-        self.selection_update_job = None
+        # Selection debouncing via QTimer
+        self._pending_selection_ids = []
         self.SELECTION_DELAY_MS = 300  # Wait 300ms before updating heavy components
+        self._selection_timer = QTimer()
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.timeout.connect(self._run_deferred_selection)
+
+        # Current spectrum naming scheme
+        self._current_naming_scheme = "Numbered"
 
         self._create_widgets()
         self._create_menu()
         self._apply_persistent_options()
-        self._setup_drag_drop()
 
         self._get_ppm_tolerance_for_mz_cache = {}
 
     def _create_menu(self):
         """Create the application menu."""
-        menubar = tk.Menu(self.root)
-        self.root.config(menu=menubar)
+        menubar = self.menuBar()
 
         # File menu
-        file_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(
-            label="Load MGF File(s)...", command=self.open_files, accelerator="Ctrl+O"
-        )
-        file_menu.add_separator()
-        file_menu.add_command(
-            label="Clear All Data", command=self.clear_data, accelerator="Ctrl+N"
-        )
-        file_menu.add_separator()
+        file_menu = menubar.addMenu("File")
 
-        export_menu = tk.Menu(file_menu, tearoff=0)
-        export_menu.add_command(
-            label="Export All Spectra...",
-            command=self.export_all_spectra,
-            accelerator="Ctrl+E",
-        )
-        export_menu.add_command(
-            label="Export Filtered Spectra...",
-            command=self.export_filtered_spectra,
-        )
-        export_menu.add_command(
-            label="Export Grouped Spectra...",
-            command=self.export_grouped_spectra,
-        )
-        file_menu.add_cascade(label="Export Spectra", menu=export_menu)
+        open_action = QAction("Load MGF File(s)...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.open_files)
+        file_menu.addAction(open_action)
 
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.addSeparator()
+
+        clear_action = QAction("Clear All Data", self)
+        clear_action.setShortcut("Ctrl+N")
+        clear_action.triggered.connect(self.clear_data)
+        file_menu.addAction(clear_action)
+
+        file_menu.addSeparator()
+
+        export_menu = file_menu.addMenu("Export Spectra")
+
+        export_all_action = QAction("Export All Spectra...", self)
+        export_all_action.setShortcut("Ctrl+E")
+        export_all_action.triggered.connect(self.export_all_spectra)
+        export_menu.addAction(export_all_action)
+
+        export_filtered_action = QAction("Export Filtered Spectra...", self)
+        export_filtered_action.triggered.connect(self.export_filtered_spectra)
+        export_menu.addAction(export_filtered_action)
+
+        export_grouped_action = QAction("Export Grouped Spectra...", self)
+        export_grouped_action.triggered.connect(self.export_grouped_spectra)
+        export_menu.addAction(export_grouped_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
         # Edit menu
-        edit_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Edit", menu=edit_menu)
-        edit_menu.add_command(
-            label="Add New Key-Value Pair...", command=self._add_new_key_value
-        )
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Convert Keys to UPPERCASE", command=self._keys_to_uppercase
-        )
-        edit_menu.add_command(
-            label="Convert Keys to lowercase", command=self._keys_to_lowercase
-        )
-        edit_menu.add_command(
-            label="Canonicalize SMILES...",
-            command=self._canonicalize_smiles_metadata,
-        )
-        edit_menu.add_separator()
+        edit_menu = menubar.addMenu("Edit")
+
+        add_kv_action = QAction("Add New Key-Value Pair...", self)
+        add_kv_action.triggered.connect(self._add_new_key_value)
+        edit_menu.addAction(add_kv_action)
+
+        edit_menu.addSeparator()
+
+        upper_action = QAction("Convert Keys to UPPERCASE", self)
+        upper_action.triggered.connect(self._keys_to_uppercase)
+        edit_menu.addAction(upper_action)
+
+        lower_action = QAction("Convert Keys to lowercase", self)
+        lower_action.triggered.connect(self._keys_to_lowercase)
+        edit_menu.addAction(lower_action)
+
+        smiles_action = QAction("Canonicalize SMILES...", self)
+        smiles_action.triggered.connect(self._canonicalize_smiles_metadata)
+        edit_menu.addAction(smiles_action)
+
+        edit_menu.addSeparator()
 
         # Intensity Normalization submenu
-        normalize_menu = tk.Menu(edit_menu, tearoff=0)
-        edit_menu.add_cascade(label="Intensity Normalization", menu=normalize_menu)
+        normalize_menu = edit_menu.addMenu("Intensity Normalization")
 
-        # Range submenus
-        range_01_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-1", menu=range_01_menu)
-        range_01_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 1.0),
-        )
-        range_01_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 1.0),
-        )
+        range_01_menu = normalize_menu.addMenu("Range 0-1")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 1.0))
+        range_01_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 1.0))
+        range_01_menu.addAction(a)
 
-        range_0100_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-100", menu=range_0100_menu)
-        range_0100_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 100.0),
-        )
-        range_0100_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 100.0),
-        )
+        range_0100_menu = normalize_menu.addMenu("Range 0-100")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 100.0))
+        range_0100_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 100.0))
+        range_0100_menu.addAction(a)
 
-        range_01000_menu = tk.Menu(normalize_menu, tearoff=0)
-        normalize_menu.add_cascade(label="Range 0-1000", menu=range_01000_menu)
-        range_01000_menu.add_command(
-            label="Relative to most abundant signal",
-            command=lambda: self._normalize_intensities("max", 1000.0),
-        )
-        range_01000_menu.add_command(
-            label="Relative to total sum of all signals",
-            command=lambda: self._normalize_intensities("sum", 1000.0),
-        )
+        range_01000_menu = normalize_menu.addMenu("Range 0-1000")
+        a = QAction("Relative to most abundant signal", self)
+        a.triggered.connect(lambda: self._normalize_intensities("max", 1000.0))
+        range_01000_menu.addAction(a)
+        a = QAction("Relative to total sum of all signals", self)
+        a.triggered.connect(lambda: self._normalize_intensities("sum", 1000.0))
+        range_01000_menu.addAction(a)
 
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Delete Selected Spectra", command=self._delete_selected_spectra
-        )
-        edit_menu.add_separator()
-        edit_menu.add_command(
-            label="Calculate Average Spectrum per Group",
-            command=self._calculate_average_spectra,
-        )
-        edit_menu.add_separator()
+        edit_menu.addSeparator()
 
-        # Regex Update submenu
-        regex_menu = tk.Menu(edit_menu, tearoff=0)
-        edit_menu.add_command(label="Regex Update", command=self._open_regex_editor)
+        delete_action = QAction("Delete Selected Spectra", self)
+        delete_action.triggered.connect(self._delete_selected_spectra)
+        edit_menu.addAction(delete_action)
+
+        edit_menu.addSeparator()
+
+        avg_action = QAction("Calculate Average Spectrum per Group", self)
+        avg_action.triggered.connect(self._calculate_average_spectra)
+        edit_menu.addAction(avg_action)
+
+        edit_menu.addSeparator()
+
+        regex_action = QAction("Regex Update", self)
+        regex_action.triggered.connect(self._open_regex_editor)
+        edit_menu.addAction(regex_action)
 
         # Filter menu
-        filter_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Filter", menu=filter_menu)
-        filter_menu.add_command(
-            label="SMARTS Substructure Filter...", command=self._open_smarts_filter
-        )
-        filter_menu.add_command(
-            label="Intensity Filter...", command=self._open_intensity_filter
-        )
+        filter_menu = menubar.addMenu("Filter")
+
+        smarts_action = QAction("SMARTS Substructure Filter...", self)
+        smarts_action.triggered.connect(self._open_smarts_filter)
+        filter_menu.addAction(smarts_action)
+
+        intensity_action = QAction("Intensity Filter...", self)
+        intensity_action.triggered.connect(self._open_intensity_filter)
+        filter_menu.addAction(intensity_action)
 
         # Fragment annotation menu
-        fragment_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Fragment annotation", menu=fragment_menu)
-        fragment_menu.add_command(
-            label="Generate subformulas", command=self._generate_subformulas
-        )
-        fragment_menu.add_separator()
-        fragment_menu.add_command(
-            label="Clear all annotations", command=self._clear_all_annotations
-        )
+        fragment_menu = menubar.addMenu("Fragment annotation")
+
+        subformula_action = QAction("Generate subformulas", self)
+        subformula_action.triggered.connect(self._generate_subformulas)
+        fragment_menu.addAction(subformula_action)
+
+        fragment_menu.addSeparator()
+
+        clear_ann_action = QAction("Clear all annotations", self)
+        clear_ann_action.triggered.connect(self._clear_all_annotations)
+        fragment_menu.addAction(clear_ann_action)
 
         # View menu
-        view_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu = menubar.addMenu("View")
 
-        # Spectrum Name submenu
-        spectrum_name_menu = tk.Menu(view_menu, tearoff=0)
-        view_menu.add_cascade(label="Spectrum Name", menu=spectrum_name_menu)
+        # Spectrum Name submenu with QActionGroup for exclusive radio behaviour
+        self.spectrum_name_menu = view_menu.addMenu("Spectrum Name")
+        self._spectrum_name_group = QActionGroup(self)
+        self._spectrum_name_group.setExclusive(True)
 
-        self.spectrum_name_var = tk.StringVar(value="Numbered")
-        spectrum_name_menu.add_radiobutton(
-            label="Numbered",
-            variable=self.spectrum_name_var,
-            value="Numbered",
-            command=self._update_spectrum_names,
+        numbered_action = QAction("Numbered", self, checkable=True)
+        numbered_action.setChecked(True)
+        self._spectrum_name_group.addAction(numbered_action)
+        self.spectrum_name_menu.addAction(numbered_action)
+        numbered_action.triggered.connect(
+            lambda checked, k="Numbered": self._update_spectrum_names_with(k)
         )
 
-        # Will be populated when data is loaded
-        self.spectrum_name_menu = spectrum_name_menu
+        view_menu.addSeparator()
 
-        view_menu.add_separator()
-        view_menu.add_command(
-            label="Fragment Distribution...", command=self._show_fragment_distribution
-        )
+        frag_dist_action = QAction("Fragment Distribution...", self)
+        frag_dist_action.triggered.connect(self._show_fragment_distribution)
+        view_menu.addAction(frag_dist_action)
 
         # Options menu
-        options_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Options", menu=options_menu)
-        options_menu.add_command(
-            label="Preferences...", command=self._open_options_dialog
-        )
+        options_menu = menubar.addMenu("Options")
+        prefs_action = QAction("Preferences...", self)
+        prefs_action.triggered.connect(self._open_options_dialog)
+        options_menu.addAction(prefs_action)
 
         # Help menu
-        help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self.show_about)
-
-        # Bind keyboard shortcuts
-        self.root.bind("<Control-o>", lambda e: self.open_files())
-        self.root.bind("<Control-n>", lambda e: self.clear_data())
-        self.root.bind("<Control-e>", lambda e: self.export_all_spectra())
+        help_menu = menubar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
 
     def _setup_drag_drop(self):
-        """Set up drag and drop functionality for MGF files."""
-        if not DRAG_DROP_AVAILABLE:
-            # Add a note about drag and drop not being available
-            print(
-                "Note: Drag and drop support not available. Install tkinterdnd2 for this feature."
-            )
-            return
+        pass  # Handled via dragEnterEvent/dropEvent on QMainWindow
 
-        # Enable drag and drop for files
-        self.root.drop_target_register(DND_FILES)
-        self.root.dnd_bind("<<Drop>>", self._on_file_drop)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.toLocalFile().lower().endswith(".mgf"):
+                    event.acceptProposedAction()
+                    self.statusBar().showMessage("Drop MGF file to open...")
+                    return
+        event.ignore()
 
-        # Optional: Add visual feedback during drag
-        self.root.dnd_bind("<<DragEnter>>", self._on_drag_enter)
-        self.root.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+    def dragLeaveEvent(self, event):
+        self._restore_status()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if file_path.lower().endswith(".mgf"):
+                    try:
+                        self._process_dropped_file(file_path)
+                    except Exception as e:
+                        QMessageBox.critical(
+                            self, "Error", f"Failed to process dropped file: {str(e)}"
+                        )
+            event.acceptProposedAction()
+            self._restore_status()
 
     def _apply_persistent_options(self):
-        """Apply loaded configuration to UI components."""
         grouping_tags = self.config_data.get("default_grouping_tags", [])
         if hasattr(self, "spectrum_tree"):
             self.spectrum_tree.set_grouping_tags(grouping_tags)
@@ -283,7 +300,7 @@ class MGFExplorerApp:
 
     def _open_options_dialog(self):
         """Launch the options dialog and persist any updates."""
-        dialog = OptionsDialog(self.root, self.config_data)
+        dialog = OptionsDialog(self, self.config_data)
         if not dialog.result:
             return
 
@@ -292,32 +309,21 @@ class MGFExplorerApp:
         try:
             save_config(self.config_data)
         except Exception as exc:
-            messagebox.showerror(
-                "Save Options",
-                f"Failed to save options: {exc}",
-            )
+            QMessageBox.critical(self, "Save Options", f"Failed to save options: {exc}")
             return
 
         self._apply_persistent_options()
-
-        if hasattr(self, "status_var"):
-            self.status_var.set("Options updated")
+        self.statusBar().showMessage("Options updated")
 
     def _on_drag_enter(self, event):
-        """Handle drag enter event."""
-        self.status_var.set("Drop MGF file to open...")
+        self.statusBar().showMessage("Drop MGF file to open...")
 
     def _on_drag_leave(self, event):
-        """Handle drag leave event."""
         self._restore_status()
 
     def _on_file_drop(self, event):
-        """Handle file drop event."""
         try:
-            # Get the dropped files
-            files = event.data  # .split()
-
-            # files is '{}' or '{} {}'
+            files = event.data
             if "} {" in files:
                 files = files.split("} {")
                 for fi in range(len(files)):
@@ -325,112 +331,79 @@ class MGFExplorerApp:
                     files[fi] = files[fi].rstrip("}")
             else:
                 files = [files.strip().lstrip("{").rstrip("}")]
-
             if not files:
                 return
-
-            # Process the dropped file
             for file_path in files:
                 self._process_dropped_file(file_path)
-
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to process dropped file: {str(e)}"
+            )
             self._restore_status()
 
     def _process_dropped_file(self, file_path):
-        """Process a file that was dropped onto the window."""
-        try:
-            # Check if it's an MGF file
-            if not file_path.lower().endswith(".mgf"):
-                messagebox.showwarning(
-                    "Invalid File Type", "Please drop an MGF file (.mgf extension)."
-                )
-                return
-
-            # Check if file exists
-            if not os.path.exists(file_path):
-                messagebox.showerror(
-                    "File Not Found", f"The file does not exist:\n{file_path}"
-                )
-                return
-
-            # Load the file
-            self._load_mgf_file(file_path)
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to process dropped file: {str(e)}")
+        if not file_path.lower().endswith(".mgf"):
+            QMessageBox.warning(
+                self, "Invalid File Type", "Please drop an MGF file (.mgf extension)."
+            )
+            return
+        if not os.path.exists(file_path):
+            QMessageBox.critical(
+                self, "File Not Found", f"The file does not exist:\n{file_path}"
+            )
+            return
+        self._load_mgf_file(file_path)
 
     def _restore_status(self):
-        """Restore the status bar to its normal state."""
         if self.current_file:
             filename = os.path.basename(self.current_file)
             spectrum_count = len(self.parser.spectra) if self.parser else 0
-            self.status_var.set(f"Loaded {spectrum_count} spectra from {filename}")
+            self.statusBar().showMessage(
+                f"Loaded {spectrum_count} spectra from {filename}"
+            )
         else:
-            self.status_var.set("Ready - Open an MGF file to get started")
+            self.statusBar().showMessage("Ready - Open an MGF file to get started")
 
     def _load_mgf_file(self, file_path):
-        """Load an MGF file and append to existing data."""
         try:
-            # Show file loading options dialog
-            dialog = FileLoadingDialog(self.root, file_path, self.used_prefixes)
-
+            dialog = FileLoadingDialog(self, file_path, self.used_prefixes)
             if dialog.result is None:
-                # User cancelled
                 return
-
             loading_options = dialog.result
-
-            self.status_var.set("Loading file...")
-            self.root.update()
-
-            # Check if we have existing data to append to
+            self.statusBar().showMessage("Loading file...")
+            QApplication.processEvents()
             is_first_file = len(self.parser.spectra) == 0
-
             if is_first_file:
-                # First file - use parse_file which clears existing data
                 spectra = self.parser.parse_file(file_path)
             else:
-                # Additional file - use parse_and_append_file to add to existing data
-                # Calculate ID offset to avoid conflicts
                 id_offset = self._calculate_id_offset()
                 spectra = self.parser.parse_and_append_file(file_path, id_offset)
-
             if not spectra:
-                messagebox.showwarning("Warning", "No spectra found in the file.")
+                QMessageBox.warning(self, "Warning", "No spectra found in the file.")
                 return
-
-            # Apply loading options to newly loaded spectra only
             self._apply_loading_options(spectra, loading_options)
-
-            # Update current file reference (keep track of the most recent file)
             self.current_file = file_path
-
-            # Update components
             self.spectrum_tree.load_data(self.parser)
             self._update_spectrum_name_menu()
             self._set_components_enabled(True)
-
-            # Update status
             filename = os.path.basename(file_path)
             total_count = len(self.parser.spectra)
             new_count = len(spectra)
-
             if is_first_file:
-                self.status_var.set(f"Loaded {new_count} spectra from {filename}")
-                self.root.title(f"MGF Explorer - {filename}")
+                self.statusBar().showMessage(
+                    f"Loaded {new_count} spectra from {filename}"
+                )
+                self.setWindowTitle(f"MGF Explorer - {filename}")
             else:
-                self.status_var.set(
+                self.statusBar().showMessage(
                     f"Added {new_count} spectra from {filename}. Total: {total_count} spectra"
                 )
-                # Update title to show multiple files
-                self.root.title(
+                self.setWindowTitle(
                     f"MGF Explorer - {total_count} spectra from multiple files"
                 )
-
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to load file: {str(e)}")
-            self.status_var.set("Error loading file")
+            QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
+            self.statusBar().showMessage("Error loading file")
 
     def _calculate_id_offset(self):
         """Calculate ID offset for appending new spectra to avoid conflicts."""
@@ -486,73 +459,84 @@ class MGFExplorerApp:
 
     def _create_widgets(self):
         """Create the main application widgets."""
-        # Main container
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(5, 5, 5, 5)
 
-        # Create paned windows for layout
-        # Main horizontal split
-        main_paned = ttk.PanedWindow(main_frame, orient="horizontal")
-        main_paned.pack(fill="both", expand=True)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(main_splitter)
 
-        # Left panel (spectrum tree)
-        left_frame = ttk.Frame(main_paned, width=300)
-        main_paned.add(left_frame, weight=1)
+        left_frame = QWidget()
+        left_layout = QVBoxLayout(left_frame)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        main_splitter.addWidget(left_frame)
 
-        # Right panel (metadata and visualization)
-        right_paned = ttk.PanedWindow(main_paned, orient="vertical")
-        main_paned.add(right_paned, weight=3)
+        right_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.addWidget(right_splitter)
 
-        # Top right (metadata editor)
-        metadata_frame = ttk.Frame(right_paned, height=300)
-        right_paned.add(metadata_frame, weight=1)
+        main_splitter.setCollapsible(0, False)
+        main_splitter.setCollapsible(1, False)
 
-        # Bottom right (visualization and tables)
-        bottom_paned = ttk.PanedWindow(right_paned, orient="horizontal")
-        right_paned.add(bottom_paned, weight=2)
+        metadata_frame = QWidget()
+        metadata_layout = QVBoxLayout(metadata_frame)
+        metadata_layout.setContentsMargins(0, 0, 0, 0)
+        right_splitter.addWidget(metadata_frame)
 
-        # Bottom left (ion data table)
-        table_frame = ttk.Frame(bottom_paned, width=300)
-        bottom_paned.add(table_frame, weight=1)
+        bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+        right_splitter.addWidget(bottom_splitter)
 
-        # Bottom center (spectrum visualization)
-        viz_frame = ttk.Frame(bottom_paned, width=500)
-        bottom_paned.add(viz_frame, weight=2)
+        right_splitter.setCollapsible(0, False)
+        right_splitter.setCollapsible(1, False)
 
-        # Bottom right (cosine similarity)
-        similarity_frame = ttk.Frame(bottom_paned, width=400)
-        bottom_paned.add(similarity_frame, weight=1)
+        table_frame = QWidget()
+        table_layout = QVBoxLayout(table_frame)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_splitter.addWidget(table_frame)
 
-        # Create components
+        viz_frame = QWidget()
+        viz_layout = QVBoxLayout(viz_frame)
+        viz_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_splitter.addWidget(viz_frame)
+
+        similarity_frame = QWidget()
+        sim_layout = QVBoxLayout(similarity_frame)
+        sim_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_splitter.addWidget(similarity_frame)
+
+        bottom_splitter.setCollapsible(0, False)
+        bottom_splitter.setCollapsible(1, False)
+        bottom_splitter.setCollapsible(2, False)
+
         self.spectrum_tree = SpectrumTreeView(
-            left_frame, on_selection_changed=self._on_spectrum_selection_changed
+            left_frame,
+            on_selection_changed=self._on_spectrum_selection_changed,
+            on_filter_similar_cb=self._filter_similar_spectra,
         )
-        self.spectrum_tree.pack(fill="both", expand=True)
+        left_layout.addWidget(self.spectrum_tree)
 
         self.metadata_editor = MetadataEditor(
-            metadata_frame, on_metadata_changed=self._on_metadata_changed
+            metadata_frame,
+            on_metadata_changed=self._on_metadata_changed,
+            on_set_spectrum_name=self._update_spectrum_names_with,
+            on_filter_by_value=self._apply_metadata_filter,
+            on_add_grouping_tag=self._add_grouping_tag,
         )
-        self.metadata_editor.pack(fill="both", expand=True)
+        metadata_layout.addWidget(self.metadata_editor)
 
         self.ion_table = IonDataTable(table_frame)
-        self.ion_table.pack(fill="both", expand=True)
+        table_layout.addWidget(self.ion_table)
 
         self.spectrum_viz = SpectrumVisualization(viz_frame)
-        self.spectrum_viz.pack(fill="both", expand=True)
+        viz_layout.addWidget(self.spectrum_viz)
 
         self.similarity_viz = CosineSimilarityVisualization(similarity_frame)
-        self.similarity_viz.pack(fill="both", expand=True)
+        sim_layout.addWidget(self.similarity_viz)
 
-        # Set up communication between ion table and spectrum visualization
         self.ion_table.set_spectrum_viz_callback(self._on_ion_selection_changed)
+        self.spectrum_viz.set_hover_callback(self._on_spectrum_hover)
 
-        # Status bar
-        self.status_var = tk.StringVar()
-        self.status_var.set("Ready - Open an MGF file to get started")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken")
-        status_bar.pack(side="bottom", fill="x")
-
-        # Initial state
+        self.statusBar().showMessage("Ready - Open an MGF file to get started")
         self._set_components_enabled(False)
 
     def _set_components_enabled(self, enabled: bool):
@@ -565,9 +549,11 @@ class MGFExplorerApp:
 
     def open_files(self):
         """Open and parse one or more MGF files."""
-        file_paths = filedialog.askopenfilenames(
-            title="Load MGF File(s)",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Load MGF File(s)",
+            "",
+            "MGF files (*.mgf);;All files (*.*)",
         )
 
         if not file_paths:
@@ -580,10 +566,13 @@ class MGFExplorerApp:
     def clear_data(self):
         """Clear all loaded data."""
         if self.parser.spectra:
-            result = messagebox.askyesno(
-                "Clear Data",
-                f"This will clear all {len(self.parser.spectra)} loaded spectra. Continue?",
-                icon="warning",
+            result = (
+                QMessageBox.question(
+                    self,
+                    "Clear Data",
+                    f"This will clear all {len(self.parser.spectra)} loaded spectra. Continue?",
+                )
+                == QMessageBox.StandardButton.Yes
             )
             if not result:
                 return
@@ -602,33 +591,35 @@ class MGFExplorerApp:
 
         # Update UI state
         self._set_components_enabled(False)
-        self.status_var.set("Ready - Load MGF files to get started")
-        self.root.title(f"MGF Explorer v{__version__}")
+        self.statusBar().showMessage("Ready - Load MGF files to get started")
+        self.setWindowTitle(f"MGF Explorer v{__version__}")
 
     def _on_spectrum_selection_changed(self, selected_spectrum_ids):
         """Handle spectrum selection changes with debouncing for performance."""
-        # Cancel any pending update
-        if self.selection_update_job:
-            self.root.after_cancel(self.selection_update_job)
+        self._pending_selection_ids = selected_spectrum_ids
 
-        # Update status immediately for responsiveness
         if not selected_spectrum_ids:
-            self.status_var.set(f"Ready - {len(self.parser.spectra)} spectra loaded")
+            self.statusBar().showMessage(
+                f"Ready - {len(self.parser.spectra)} spectra loaded"
+            )
+        elif len(selected_spectrum_ids) == 1:
+            self.statusBar().showMessage(
+                f"Selected spectrum {selected_spectrum_ids[0]}"
+            )
         else:
-            if len(selected_spectrum_ids) == 1:
-                self.status_var.set(f"Selected spectrum {selected_spectrum_ids[0]}")
-            else:
-                self.status_var.set(f"Selected {len(selected_spectrum_ids)} spectra")
+            self.statusBar().showMessage(
+                f"Selected {len(selected_spectrum_ids)} spectra"
+            )
 
-        # Schedule the heavy update with debouncing
-        self.selection_update_job = self.root.after(
-            self.SELECTION_DELAY_MS,
-            lambda: self._update_components_with_selection(selected_spectrum_ids),
-        )
+        self._selection_timer.stop()
+        self._selection_timer.start(self.SELECTION_DELAY_MS)
+
+    def _run_deferred_selection(self):
+        """Run deferred selection update after timer fires."""
+        self._update_components_with_selection(self._pending_selection_ids)
 
     def _update_components_with_selection(self, selected_spectrum_ids):
         """Update all components with the selected spectra."""
-        self.selection_update_job = None
 
         if not selected_spectrum_ids:
             # Clear all displays
@@ -649,7 +640,7 @@ class MGFExplorerApp:
                 self.similarity_viz.load_data(self.parser, [])
 
                 # Update status with performance warning
-                self.status_var.set(
+                self.statusBar().showMessage(
                     f"Selected {len(selected_spectrum_ids)} spectra "
                     f"(detailed views disabled for performance)"
                 )
@@ -664,7 +655,7 @@ class MGFExplorerApp:
                 self.similarity_viz.load_data(self.parser, [])
 
                 # Update status to reflect the limitation
-                self.status_var.set(
+                self.statusBar().showMessage(
                     f"Selected {len(selected_spectrum_ids)} spectra "
                     f"(showing details for first 10, similarity disabled)"
                 )
@@ -679,7 +670,7 @@ class MGFExplorerApp:
                 self.similarity_viz.load_data(self.parser, selected_spectrum_ids)
 
                 # Update status to reflect the limitation
-                self.status_var.set(
+                self.statusBar().showMessage(
                     f"Selected {len(selected_spectrum_ids)} spectra "
                     f"(showing details for first 10)"
                 )
@@ -719,31 +710,39 @@ class MGFExplorerApp:
         if self.spectrum_viz:
             self.spectrum_viz.highlight_ions(spectrum_id, selected_ion_indices)
 
+    def _on_spectrum_hover(self, spectrum_id, ion_index):
+        """Handle fragment hover from spectrum visualization."""
+        if hasattr(self, "ion_table") and self.ion_table:
+            self.ion_table.highlight_hover_row(spectrum_id, ion_index)
+
     def _add_new_key_value(self):
         """Add a new key-value pair via the Edit menu."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
         selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
         from .gui_components import AddKeyValueDialog
 
-        dialog = AddKeyValueDialog(self.root, self.parser, selected_ids)
+        dialog = AddKeyValueDialog(self, self.parser, selected_ids)
         if dialog.result:
             self._on_metadata_changed()
 
     def _keys_to_uppercase(self):
         """Convert all key names to uppercase via the Edit menu."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
-        if not messagebox.askyesno(
-            "Convert Keys", "Convert all key names to UPPERCASE?"
+        if (
+            QMessageBox.question(
+                self, "Convert Keys", "Convert all key names to UPPERCASE?"
+            )
+            != QMessageBox.StandardButton.Yes
         ):
             return
 
@@ -760,13 +759,16 @@ class MGFExplorerApp:
     def _keys_to_lowercase(self):
         """Convert all key names to lowercase via the Edit menu."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
-        if not messagebox.askyesno(
-            "Convert Keys", "Convert all key names to lowercase?"
+        if (
+            QMessageBox.question(
+                self, "Convert Keys", "Convert all key names to lowercase?"
+            )
+            != QMessageBox.StandardButton.Yes
         ):
             return
 
@@ -783,7 +785,8 @@ class MGFExplorerApp:
     def _canonicalize_smiles_metadata(self):
         """Canonicalize SMILES strings stored in metadata fields."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "Canonicalize SMILES",
                 "No data loaded. Please open an MGF file first.",
             )
@@ -792,11 +795,11 @@ class MGFExplorerApp:
         result = self._canonicalize_smiles_for_key("smiles")
 
         if result.get("error"):
-            messagebox.showinfo("Canonicalize SMILES", result["error"])
-            self.status_var.set(result["error"])
+            QMessageBox.information(self, "Canonicalize SMILES", result["error"])
+            self.statusBar().showMessage(result["error"])
             return
 
-        dialog = CanonicalSmilesDialog(self.root)
+        dialog = CanonicalSmilesDialog(self)
         dialog.show(
             rows=result.get("rows", []),
             summary_text=result.get("summary"),
@@ -806,7 +809,7 @@ class MGFExplorerApp:
 
         status_message = result.get("status_message")
         if status_message:
-            self.status_var.set(status_message)
+            self.statusBar().showMessage(status_message)
 
     def _handle_canonical_smiles_key_change(self, key: str):
         """Handle metadata key changes triggered from the canonical SMILES dialog."""
@@ -815,11 +818,11 @@ class MGFExplorerApp:
 
         if result.get("error"):
             if result["error"]:
-                self.status_var.set(result["error"])
+                self.statusBar().showMessage(result["error"])
             return result
 
         if status_message:
-            self.status_var.set(status_message)
+            self.statusBar().showMessage(status_message)
 
         return result
 
@@ -958,8 +961,8 @@ class MGFExplorerApp:
             scale: target scale (1.0 for 0-1, 100.0 for 0-100, 1000.0 for 0-1000)
         """
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
@@ -970,17 +973,21 @@ class MGFExplorerApp:
         range_text = f"0-{int(scale)}" if scale != 1.0 else "0-1"
 
         # Ask for confirmation
-        if not messagebox.askyesno(
-            "Intensity Normalization",
-            f"Normalize intensities in all spectra to range {range_text}, "
-            f"relative to {mode_text}?\n\n"
-            "This will modify the intensity values and cannot be undone.",
+        if (
+            QMessageBox.question(
+                self,
+                "Intensity Normalization",
+                f"Normalize intensities in all spectra to range {range_text}, "
+                f"relative to {mode_text}?\n\n"
+                "This will modify the intensity values and cannot be undone.",
+            )
+            != QMessageBox.StandardButton.Yes
         ):
             return
 
         try:
-            self.status_var.set("Normalizing intensities...")
-            self.root.update()
+            self.statusBar().showMessage("Normalizing intensities...")
+            QApplication.processEvents()
 
             # Normalize all spectra
             self.parser.normalize_intensities(mode=mode, scale=scale)
@@ -988,89 +995,92 @@ class MGFExplorerApp:
             # Update visualization and data
             self._on_metadata_changed()
 
-            self.status_var.set(
+            self.statusBar().showMessage(
                 f"Normalized intensities in {len(self.parser.spectra)} spectra"
             )
 
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Normalization Complete",
                 f"Successfully normalized intensities in {len(self.parser.spectra)} spectra "
                 f"to range {range_text}, relative to {mode_text}.",
             )
 
         except Exception as e:
-            messagebox.showerror(
-                "Normalization Error", f"Failed to normalize intensities:\n{str(e)}"
+            QMessageBox.critical(
+                self,
+                "Normalization Error",
+                f"Failed to normalize intensities:\n{str(e)}",
             )
-            self.status_var.set("Normalization failed")
+            self.statusBar().showMessage("Normalization failed")
 
     def _update_spectrum_name_menu(self):
         """Update the spectrum name menu with available metadata fields."""
         if not self.parser:
             return
 
-        # Clear existing field options (keep "Numbered")
-        menu = self.spectrum_name_menu
+        # Remove all actions except "Numbered" (first action)
+        actions = self._spectrum_name_group.actions()
+        for action in actions[1:]:
+            self._spectrum_name_group.removeAction(action)
+            self.spectrum_name_menu.removeAction(action)
 
-        # Remove all items except "Numbered"
-        last_index = menu.index("end")
-        if last_index is not None and last_index > 0:
-            menu.delete(1, last_index)
-
-        # Add separator
-        menu.add_separator()
-
-        # Add metadata fields as options
+        # Add separator + metadata keys
+        self.spectrum_name_menu.addSeparator()
         all_keys = self.parser.get_all_metadata_keys()
-        for key in all_keys:
-            menu.add_radiobutton(
-                label=key,
-                variable=self.spectrum_name_var,
-                value=key,
-                command=self._update_spectrum_names,
+        for key in sorted(all_keys):
+            action = QAction(key, self, checkable=True)
+            action.triggered.connect(
+                lambda checked, k=key: self._update_spectrum_names_with(k)
             )
+            self._spectrum_name_group.addAction(action)
+            self.spectrum_name_menu.addAction(action)
+            if self._current_naming_scheme == key:
+                action.setChecked(True)
+
+    def _update_spectrum_names_with(self, key: str):
+        """Update spectrum display names using the given metadata key."""
+        self._current_naming_scheme = key
+        self.spectrum_tree.set_naming_scheme(key)
+        if hasattr(self, "spectrum_viz") and self.spectrum_viz:
+            self.spectrum_viz.set_naming_scheme(key)
+        if hasattr(self, "ion_table") and self.ion_table:
+            self.ion_table.set_naming_scheme(key)
+        if hasattr(self, "similarity_viz") and self.similarity_viz:
+            self.similarity_viz.set_naming_scheme(key)
+        self.spectrum_tree.load_data(self.parser)
 
     def _update_spectrum_names(self):
-        """Update how spectrum names are displayed."""
+        """Update how spectrum names are displayed (legacy, used internally)."""
         if not self.parser:
             return
-
-        # Set the naming scheme in the spectrum tree
-        naming_scheme = self.spectrum_name_var.get()
-        self.spectrum_tree.set_naming_scheme(naming_scheme)
-
-        # Set the naming scheme in the spectrum visualization
-        if hasattr(self, "spectrum_viz") and self.spectrum_viz:
-            self.spectrum_viz.set_naming_scheme(naming_scheme)
-
-        # Refresh the tree to show updated names
-        self.spectrum_tree.load_data(self.parser)
+        self._update_spectrum_names_with(self._current_naming_scheme)
 
     def _open_regex_editor(self):
         """Open the regex editor dialog."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
         from .gui_components import RegexEditorDialog
 
-        dialog = RegexEditorDialog(self.root, self.parser)
+        dialog = RegexEditorDialog(self, self.parser)
         if dialog.changes_made:
             self._on_metadata_changed()
 
     def _delete_selected_spectra(self):
         """Delete the currently selected spectra."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
         selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
         if not selected_ids:
-            messagebox.showwarning("Warning", "No spectra selected.")
+            QMessageBox.warning(self, "Warning", "No spectra selected.")
             return
 
         # Confirmation dialog
@@ -1083,7 +1093,10 @@ class MGFExplorerApp:
             f"Remaining spectra: {total_spectra - num_selected}"
         )
 
-        if not messagebox.askyesno("Confirm Delete", message, icon="warning"):
+        if (
+            QMessageBox.question(self, "Confirm Delete", message)
+            != QMessageBox.StandardButton.Yes
+        ):
             return
 
         # Remove selected spectra
@@ -1093,7 +1106,7 @@ class MGFExplorerApp:
 
         # Update the status
         remaining_count = len(self.parser.spectra)
-        self.status_var.set(
+        self.statusBar().showMessage(
             f"Deleted {num_selected} spectra. {remaining_count} remaining."
         )
 
@@ -1117,27 +1130,27 @@ class MGFExplorerApp:
             ]:
                 if hasattr(component, "load_data"):
                     component.load_data(self.parser, [])
-            self.root.title(f"MGF Explorer v{__version__}")
+            self.setWindowTitle(f"MGF Explorer v{__version__}")
 
     def _calculate_average_spectra(self):
         """Calculate average spectrum per group."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showwarning(
-                "Warning", "No data loaded. Please open an MGF file first."
+            QMessageBox.warning(
+                self, "Warning", "No data loaded. Please open an MGF file first."
             )
             return
 
         # Check if grouping is applied
         if not self.spectrum_tree.selected_grouping_tags:
-            messagebox.showwarning(
-                "Warning", "No grouping applied. Please set grouping tags first."
+            QMessageBox.warning(
+                self, "Warning", "No grouping applied. Please set grouping tags first."
             )
             return
 
         # Show parameter dialog
         from .gui_components import AverageSpectrumDialog
 
-        dialog = AverageSpectrumDialog(self.root)
+        dialog = AverageSpectrumDialog(self)
         if not dialog.result:
             return
 
@@ -1152,7 +1165,7 @@ class MGFExplorerApp:
             grouped_spectra = self._get_grouped_spectra_for_averaging()
 
             if not grouped_spectra:
-                messagebox.showwarning("Warning", "No groups found to average.")
+                QMessageBox.warning(self, "Warning", "No groups found to average.")
                 return
 
             # Calculate average spectra
@@ -1178,22 +1191,23 @@ class MGFExplorerApp:
                 message = f"Created {len(new_spectra)} average spectra from {total_groups} groups."
                 if single_spectrum_groups > 0:
                     message += f"\nSkipped {single_spectrum_groups} groups with only one spectrum."
-                messagebox.showinfo("Success", message)
+                QMessageBox.information(self, "Success", message)
             else:
                 if single_spectrum_groups == total_groups:
-                    messagebox.showinfo(
+                    QMessageBox.information(
+                        self,
                         "No Averages Created",
                         f"All {total_groups} groups contain only one spectrum each.\n"
                         "No average spectra were created.",
                     )
                 else:
-                    messagebox.showwarning(
-                        "Warning", "No average spectra could be created."
+                    QMessageBox.warning(
+                        self, "Warning", "No average spectra could be created."
                     )
 
         except Exception as e:
-            messagebox.showerror(
-                "Error", f"Failed to calculate average spectra: {str(e)}"
+            QMessageBox.critical(
+                self, "Error", f"Failed to calculate average spectra: {str(e)}"
             )
 
     def _get_grouped_spectra_for_averaging(self):
@@ -1549,27 +1563,29 @@ class MGFExplorerApp:
     def export_grouped_spectra(self):
         """Export spectra into separate MGF files for each active group."""
         if not self.parser.spectra:
-            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            QMessageBox.warning(self, "Warning", "No spectra loaded to export.")
             return
 
         if not self.spectrum_tree.has_grouping():
-            messagebox.showwarning(
-                "No Grouping", "Please configure grouping tags before exporting."
+            QMessageBox.warning(
+                self, "No Grouping", "Please configure grouping tags before exporting."
             )
             return
 
         grouping_structure = self.spectrum_tree.get_current_grouping_structure()
         if not grouping_structure:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "No Groups",
                 "No groups available for export with the current grouping or filter.",
             )
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export Grouped Spectra",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Grouped Spectra",
+            "",
+            "MGF files (*.mgf);;All files (*.*)",
         )
 
         if not file_path:
@@ -1600,7 +1616,8 @@ class MGFExplorerApp:
         collect_groups(grouping_structure, [])
 
         if not groups:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "No Groups",
                 "No grouped spectra available for export with the current grouping or filter.",
             )
@@ -1621,8 +1638,8 @@ class MGFExplorerApp:
         total_spectra = 0
 
         try:
-            self.status_var.set("Exporting grouped spectra...")
-            self.root.update_idletasks()
+            self.statusBar().showMessage("Exporting grouped spectra...")
+            QApplication.processEvents()
 
             for path_components, spectra in groups:
                 if not spectra:
@@ -1661,68 +1678,74 @@ class MGFExplorerApp:
                 total_spectra += len(spectra)
 
             if total_files == 0:
-                messagebox.showwarning(
+                QMessageBox.warning(
+                    self,
                     "No Groups",
                     "No grouped spectra available for export with the current grouping or filter.",
                 )
-                self.status_var.set("No grouped spectra exported")
+                self.statusBar().showMessage("No grouped spectra exported")
                 return
 
-            self.status_var.set(
+            self.statusBar().showMessage(
                 f"Exported {total_spectra} spectra into {total_files} grouped file(s)"
             )
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Export Complete",
                 f"Exported {total_spectra} spectra into {total_files} file(s).\n"
                 f"Files saved to: {base_dir}",
             )
 
         except Exception as e:
-            messagebox.showerror(
-                "Export Error", f"Failed to export grouped spectra:\n{str(e)}"
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to export grouped spectra:\n{str(e)}"
             )
-            self.status_var.set("Export failed")
+            self.statusBar().showMessage("Export failed")
 
     def export_all_spectra(self):
         """Export all spectra to a new MGF file."""
         if not self.parser.spectra:
-            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            QMessageBox.warning(self, "Warning", "No spectra loaded to export.")
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export All Spectra to MGF File",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export All Spectra to MGF File",
+            "",
+            "MGF files (*.mgf);;All files (*.*)",
         )
 
         if not file_path:
             return
 
         try:
-            self.status_var.set("Exporting spectra...")
-            self.root.update()
+            self.statusBar().showMessage("Exporting spectra...")
+            QApplication.processEvents()
 
             # Export all spectra
             self.parser.export_to_mgf(file_path)
 
             # Update status
-            self.status_var.set(
+            self.statusBar().showMessage(
                 f"Exported {len(self.parser.spectra)} spectra to {os.path.basename(file_path)}"
             )
 
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Export Complete",
                 f"Successfully exported {len(self.parser.spectra)} spectra to:\n{file_path}",
             )
 
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export spectra:\n{str(e)}")
-            self.status_var.set("Export failed")
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to export spectra:\n{str(e)}"
+            )
+            self.statusBar().showMessage("Export failed")
 
     def export_filtered_spectra(self):
         """Export only spectra matching the current filter to a new MGF file."""
         if not self.parser.spectra:
-            messagebox.showwarning("Warning", "No spectra loaded to export.")
+            QMessageBox.warning(self, "Warning", "No spectra loaded to export.")
             return
 
         # Get filtered spectrum IDs by checking each spectrum against the filter
@@ -1733,66 +1756,85 @@ class MGFExplorerApp:
         ]
 
         if not filtered_spectrum_ids:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "No Matching Spectra",
                 "No spectra match the current filter. Please adjust your filter or clear it to export spectra.",
             )
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export Filtered Spectra to MGF File",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Filtered Spectra to MGF File",
+            "",
+            "MGF files (*.mgf);;All files (*.*)",
         )
 
         if not file_path:
             return
 
         try:
-            self.status_var.set("Exporting filtered spectra...")
-            self.root.update()
+            self.statusBar().showMessage("Exporting filtered spectra...")
+            QApplication.processEvents()
 
             # Export filtered spectra
             self.parser.export_to_mgf(file_path, filtered_spectrum_ids)
 
             # Update status
-            self.status_var.set(
+            self.statusBar().showMessage(
                 f"Exported {len(filtered_spectrum_ids)} filtered spectra to {os.path.basename(file_path)}"
             )
 
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Export Complete",
                 f"Successfully exported {len(filtered_spectrum_ids)} filtered spectra to:\n{file_path}",
             )
 
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export spectra:\n{str(e)}")
-            self.status_var.set("Export failed")
+            QMessageBox.critical(
+                self, "Export Error", f"Failed to export spectra:\n{str(e)}"
+            )
+            self.statusBar().showMessage("Export failed")
 
     def _open_smarts_filter(self):
         """Open SMARTS substructure filter dialog."""
         if not RDKIT_AVAILABLE:
-            messagebox.showerror(
+            QMessageBox.critical(
+                self,
                 "RDKit Not Available",
                 "RDKit is required for SMARTS filtering. Please install rdkit-pypi.",
             )
             return
 
         if not self.parser.spectra:
-            messagebox.showwarning(
-                "No Data", "Please load MGF data before using SMARTS filtering."
+            QMessageBox.warning(
+                self, "No Data", "Please load MGF data before using SMARTS filtering."
             )
             return
 
         # Create SMARTS filter dialog
         dialog = SmartsFilterDialog(
-            self.root, self.parser.spectra, self._apply_smarts_filter
+            self, self.parser.spectra, self._apply_smarts_filter
         )
+
+    def _apply_metadata_filter(self, filter_text: str):
+        """Set the spectrum tree filter to the given text (called from metadata context menu)."""
+        self.spectrum_tree.set_filter_text(filter_text)
+
+    def _add_grouping_tag(self, key: str):
+        """Add a metadata key as a grouping tag to the spectrum tree."""
+        current_tags = self.spectrum_tree.get_grouping_tags()
+        if key not in current_tags:
+            current_tags.append(key)
+            self.spectrum_tree.set_grouping_tags(current_tags)
 
     def _apply_smarts_filter(self, matching_spectra):
         """Apply SMARTS filter by keeping only matching spectra."""
         if not matching_spectra:
-            messagebox.showinfo("No Matches", "No spectra matched the SMARTS pattern.")
+            QMessageBox.information(
+                self, "No Matches", "No spectra matched the SMARTS pattern."
+            )
             return
 
         # Replace the spectra list with only matching ones
@@ -1804,21 +1846,23 @@ class MGFExplorerApp:
         self.spectrum_viz.clear_plot()
 
         # Update status
-        self.status_var.set(
+        self.statusBar().showMessage(
             f"SMARTS filter applied - {len(matching_spectra)} spectra remaining"
         )
 
     def _open_intensity_filter(self):
         """Open intensity filter dialog."""
         if not self.parser.spectra:
-            messagebox.showwarning(
-                "No Data", "Please load MGF data before using intensity filtering."
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "Please load MGF data before using intensity filtering.",
             )
             return
 
         # Create intensity filter dialog
         dialog = IntensityFilterDialog(
-            self.root, self.parser.spectra, self._apply_intensity_filter
+            self, self.parser.spectra, self._apply_intensity_filter
         )
 
     def _apply_intensity_filter(self):
@@ -1831,31 +1875,108 @@ class MGFExplorerApp:
 
         # Update status
         total_fragments = sum(len(spectrum.ions) for spectrum in self.parser.spectra)
-        self.status_var.set(
+        self.statusBar().showMessage(
             f"Intensity filter applied - {total_fragments} total fragments remaining"
+        )
+
+    def _filter_similar_spectra(self, reference_spectrum_id):
+        """Show similarity filter dialog and apply result to the tree view."""
+        if not self.parser or not self.parser.spectra:
+            return
+
+        all_ids = [s.spectrum_id for s in self.parser.spectra]
+        dialog = SimilarSpectraFilterDialog(
+            self, self.parser, reference_spectrum_id, all_ids
+        )
+        if dialog.result is None:
+            return
+
+        cfg = dialog.result
+        ref_spectrum = next(
+            (s for s in self.parser.spectra if s.spectrum_id == reference_spectrum_id),
+            None,
+        )
+        if ref_spectrum is None:
+            return
+
+        self.statusBar().showMessage("Computing similarity filter…")
+        QApplication.processEvents()
+
+        visible_ids: set = {reference_spectrum_id}
+        for spectrum in self.parser.spectra:
+            if spectrum.spectrum_id == reference_spectrum_id:
+                continue
+
+            # Metadata matching
+            meta_match = True
+            for key in cfg["metadata_keys"]:
+                ref_val = str(ref_spectrum.metadata.get(key, ""))
+                cmp_val = str(spectrum.metadata.get(key, ""))
+                if ref_val != cmp_val:
+                    meta_match = False
+                    break
+            if not meta_match:
+                continue
+
+            # Similarity check
+            sim = _compute_cosine_similarity_method(
+                ref_spectrum, spectrum, cfg["tolerance"], cfg["method"]
+            )
+            if sim >= cfg["threshold"]:
+                visible_ids.add(spectrum.spectrum_id)
+
+        self.spectrum_tree.set_similarity_filter(
+            visible_ids, reference_id=reference_spectrum_id
+        )
+        self.statusBar().showMessage(
+            f"Similarity filter applied: {len(visible_ids)} spectra shown "
+            f"(threshold={cfg['threshold']:.3f}, method={cfg['method']})"
         )
 
     def _generate_subformulas(self):
         """Open fragment annotation dialog and generate subformulas."""
         if not self.parser.spectra:
-            messagebox.showwarning(
-                "No Data", "Please load MGF data before generating subformulas."
+            QMessageBox.warning(
+                self, "No Data", "Please load MGF data before generating subformulas."
             )
             return
 
+        selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
+        filtered_ids = self.spectrum_tree.get_filtered_spectrum_ids()
+
         # Open fragment annotation dialog
-        dialog = FragmentAnnotationDialog(self.root, spectra=self.parser.spectra)
+        dialog = FragmentAnnotationDialog(
+            self,
+            spectra=self.parser.spectra,
+            selected_ids=selected_ids,
+            filtered_ids=filtered_ids,
+        )
         config = dialog.show()
 
         if config is None:  # User cancelled
             return
+
+        # Determine which spectra to annotate based on scope
+        scope = config.get("scope", "all")
+        if scope == "selected":
+            target_id_set = set(config.get("selected_ids", []))
+            spectra_to_annotate = [
+                s for s in self.parser.spectra if s.spectrum_id in target_id_set
+            ]
+        elif scope == "filtered":
+            target_id_set = set(config.get("filtered_ids", []))
+            spectra_to_annotate = [
+                s for s in self.parser.spectra if s.spectrum_id in target_id_set
+            ]
+        else:
+            spectra_to_annotate = list(self.parser.spectra)
 
         # Clear PPM tolerance cache to ensure new tolerance function is used
         self._get_ppm_tolerance_for_mz_cache.clear()
 
         # Count spectra with formulas first
         spectra_with_formulas = []
-        for spectrum in self.parser.spectra:
+        for spectrum in spectra_to_annotate:
             formula = self._extract_formula_from_spectrum(
                 spectrum, config["formula_tags"]
             )
@@ -1863,7 +1984,8 @@ class MGFExplorerApp:
                 spectra_with_formulas.append((spectrum, formula))
 
         if not spectra_with_formulas:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "No Formulas Found",
                 "No molecular formulas found in the specified metadata tags.\n"
                 f"Searched tags: {', '.join(config['formula_tags'])}",
@@ -1875,7 +1997,7 @@ class MGFExplorerApp:
 
         # Show progress dialog
         progress_dialog = ProgressDialog(
-            self.root,
+            self,
             title="Fragment Annotation",
             message=f"Generating subformulas for fragments ({max_workers} threads)...",
         )
@@ -1983,7 +2105,7 @@ class MGFExplorerApp:
 
                         # Periodically allow the UI to process events
                         if processed_count % 5 == 0:
-                            self.root.update()
+                            QApplication.processEvents()
 
                 finally:
                     # If cancelled while futures still running, attempt to shut down promptly
@@ -1997,9 +2119,9 @@ class MGFExplorerApp:
             progress_dialog.close()
 
             if progress_dialog.is_cancelled():
-                self.status_var.set("Subformula generation cancelled")
-                messagebox.showinfo(
-                    "Cancelled", "Fragment annotation was cancelled by user."
+                self.statusBar().showMessage("Subformula generation cancelled")
+                QMessageBox.information(
+                    self, "Cancelled", "Fragment annotation was cancelled by user."
                 )
                 return
 
@@ -2011,23 +2133,25 @@ class MGFExplorerApp:
                 selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
                 self.ion_table.load_data(self.parser, selected_ids)
 
-            self.status_var.set(
+            self.statusBar().showMessage(
                 f"Subformula generation completed for {processed_count} spectra"
             )
 
             # Show PPM deviation plot if there are annotations
             if all_annotations:
                 try:
-                    plot_dialog = PPMDeviationPlotDialog(self.root)
+                    plot_dialog = PPMDeviationPlotDialog(self)
                     plot_dialog.show(all_annotations)
                 except Exception as e:
                     # If plot fails, just show a warning but don't stop the process
-                    messagebox.showwarning(
+                    QMessageBox.warning(
+                        self,
                         "Plot Warning",
                         f"Could not display PPM deviation plot:\n{str(e)}",
                     )
 
-            messagebox.showinfo(
+            QMessageBox.information(
+                self,
                 "Annotation Complete",
                 f"Fragment annotation completed successfully.\n"
                 f"Processed {processed_count} spectra with molecular formulas.\n"
@@ -2036,16 +2160,16 @@ class MGFExplorerApp:
 
         except Exception as e:
             progress_dialog.close()
-            messagebox.showerror(
-                "Annotation Error", f"Failed to generate subformulas:\n{str(e)}"
+            QMessageBox.critical(
+                self, "Annotation Error", f"Failed to generate subformulas:\n{str(e)}"
             )
-            self.status_var.set("Subformula generation failed")
+            self.statusBar().showMessage("Subformula generation failed")
 
     def _clear_all_annotations(self):
         """Clear all fragment annotations from all spectra."""
         if not self.parser.spectra:
-            messagebox.showwarning(
-                "No Data", "Please load MGF data before clearing annotations."
+            QMessageBox.warning(
+                self, "No Data", "Please load MGF data before clearing annotations."
             )
             return
 
@@ -2057,18 +2181,21 @@ class MGFExplorerApp:
         ]
 
         if not spectra_with_annotations:
-            messagebox.showinfo(
-                "No Annotations", "No fragment annotations found to clear."
+            QMessageBox.information(
+                self, "No Annotations", "No fragment annotations found to clear."
             )
             return
 
         # Ask for confirmation
-        result = messagebox.askyesno(
-            "Clear All Annotations",
-            f"Are you sure you want to clear all fragment annotations?\n\n"
-            f"This will remove annotations from {len(spectra_with_annotations)} "
-            f"spectra and cannot be undone.",
-            icon="warning",
+        result = (
+            QMessageBox.question(
+                self,
+                "Clear All Annotations",
+                f"Are you sure you want to clear all fragment annotations?\n\n"
+                f"This will remove annotations from {len(spectra_with_annotations)} "
+                f"spectra and cannot be undone.",
+            )
+            == QMessageBox.StandardButton.Yes
         )
 
         if not result:
@@ -2089,9 +2216,12 @@ class MGFExplorerApp:
             selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
             self.ion_table.load_data(self.parser, selected_ids)
 
-        self.status_var.set(f"Cleared annotations from {cleared_count} spectra")
+        self.statusBar().showMessage(
+            f"Cleared annotations from {cleared_count} spectra"
+        )
 
-        messagebox.showinfo(
+        QMessageBox.information(
+            self,
             "Annotations Cleared",
             f"Successfully cleared fragment annotations from {cleared_count} spectra.",
         )
@@ -2183,58 +2313,52 @@ class MGFExplorerApp:
     def _show_fragment_distribution(self):
         """Show the fragment distribution dialog."""
         if not self.parser or not self.parser.spectra:
-            messagebox.showinfo(
-                "No Data", "No spectra loaded. Please load an MGF file first."
+            QMessageBox.information(
+                self, "No Data", "No spectra loaded. Please load an MGF file first."
             )
             return
 
         # Get currently selected spectrum IDs
         selected_ids = self.spectrum_tree.get_selected_spectrum_ids()
 
-        dialog = FragmentDistributionDialog(self.root)
+        dialog = FragmentDistributionDialog(self)
         dialog.show(self.parser, selected_ids)
 
     def show_about(self):
         """Show about dialog with logo and version information."""
-        drag_drop_status = (
-            "• Drag and drop MGF files to open"
-            if DRAG_DROP_AVAILABLE
-            else "• Use File > Open to load MGF files"
-        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("About MGF Explorer")
+        dlg.setFixedWidth(400)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(8)
 
-        dlg = tk.Toplevel(self.root)
-        dlg.title("About MGF Explorer")
-        dlg.resizable(False, False)
-        dlg.grab_set()
-
-        # Logo
         _pkg_dir = pathlib.Path(__file__).parent
         logo_path = _pkg_dir / "logo.png"
         if logo_path.exists():
             try:
-                pil_img = Image.open(logo_path)
-                pil_img.thumbnail((120, 120), Image.LANCZOS)
-                self._about_logo = ImageTk.PhotoImage(pil_img)  # keep reference
-                tk.Label(dlg, image=self._about_logo, bg="#ffffff").pack(pady=(20, 8))
+                pixmap = QPixmap(str(logo_path)).scaled(
+                    120,
+                    120,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                logo_label = QLabel()
+                logo_label.setPixmap(pixmap)
+                logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(logo_label)
             except Exception:
                 pass
 
-        tk.Label(
-            dlg,
-            text=f"MGF Explorer v{__version__}",
-            font=("Segoe UI", 14, "bold"),
-            bg="#ffffff",
-            fg="#202124",
-        ).pack()
+        title_lbl = QLabel(f"MGF Explorer v{__version__}")
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_lbl.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        layout.addWidget(title_lbl)
 
-        tk.Label(
-            dlg,
-            text="A tool for exploring and editing MGF\n(Mascot Generic Format) files.",
-            font=("Segoe UI", 10),
-            bg="#ffffff",
-            fg="#5f6368",
-            justify="center",
-        ).pack(pady=(4, 12))
+        desc_lbl = QLabel(
+            "A tool for exploring and editing MGF\n(Mascot Generic Format) files."
+        )
+        desc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(desc_lbl)
 
         features = (
             "• Parse and display MS/MS spectra\n"
@@ -2245,31 +2369,20 @@ class MGFExplorerApp:
             "• Visualize spectra as stick charts\n"
             "• View ion data in tables\n"
             "• Display SMILES molecular structures\n"
-            f"{drag_drop_status}"
+            "• Drag and drop MGF files to open"
         )
-        tk.Label(
-            dlg,
-            text=features,
-            font=("Segoe UI", 10),
-            bg="#ffffff",
-            fg="#202124",
-            justify="left",
-        ).pack(padx=24, anchor="w")
+        feat_lbl = QLabel(features)
+        layout.addWidget(feat_lbl)
 
-        ttk.Separator(dlg, orient="horizontal").pack(fill="x", padx=16, pady=12)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
 
-        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=(0, 16))
-
-        dlg.configure(bg="#ffffff")
-        dlg.update_idletasks()
-        # Center over main window
-        x = self.root.winfo_x() + (self.root.winfo_width() - dlg.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
-        dlg.geometry(f"+{x}+{y}")
+        dlg.exec()
 
     def run(self):
         """Start the application."""
-        self.root.mainloop()
+        self.show()
 
 
 def main():

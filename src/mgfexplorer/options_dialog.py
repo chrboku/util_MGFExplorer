@@ -3,144 +3,166 @@
 from __future__ import annotations
 
 import copy
-import tkinter as tk
-from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional
 
+from PyQt6.QtWidgets import (
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QGroupBox,
+    QPushButton,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QDialogButtonBox,
+    QMessageBox,
+    QWidget,
+)
 
-class OptionsDialog:
+
+class OptionsDialog(QDialog):
     """Dialog for editing persistent application options."""
 
-    def __init__(self, parent: tk.Misc, initial_config: Dict[str, Any]):
-        self.parent = parent
+    def __init__(self, parent, initial_config: Dict[str, Any]):
+        super().__init__(parent)
         self.initial_config = copy.deepcopy(initial_config)
         self.result: Optional[Dict[str, Any]] = None
 
         self._groups: List[Dict[str, Any]] = []
         self._active_group_index: Optional[int] = None
 
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Options")
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        self.dialog.protocol("WM_DELETE_WINDOW", self._on_cancel)
-
-        # Centre dialog relative to parent
-        self.dialog.geometry(
-            "+%d+%d"
-            % (
-                parent.winfo_rootx() + 60,
-                parent.winfo_rooty() + 60,
-            )
-        )
+        self.setWindowTitle("Options")
+        self.setModal(True)
+        self.resize(600, 500)
 
         self._build_ui()
         self._load_initial_state()
-        self.dialog.wait_window()
+        self.exec()
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        main_frame = ttk.Frame(self.dialog, padding=12)
-        main_frame.pack(fill="both", expand=True)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
 
         # Default grouping tags ------------------------------------------------
-        tags_frame = ttk.LabelFrame(main_frame, text="Default Grouping Tags", padding=8)
-        tags_frame.pack(fill="x", expand=False, pady=(0, 10))
+        tags_group = QGroupBox("Default Grouping Tags")
+        tags_layout = QVBoxLayout(tags_group)
 
-        ttk.Label(
-            tags_frame,
-            text="Comma-separated list applied to the grouping field when the app starts.",
-        ).pack(anchor="w", pady=(0, 4))
+        tags_layout.addWidget(
+            QLabel(
+                "Comma-separated list applied to the grouping field when the app starts."
+            )
+        )
 
-        self.default_tags_var = tk.StringVar()
-        tags_entry = ttk.Entry(tags_frame, textvariable=self.default_tags_var)
-        tags_entry.pack(fill="x")
+        self.default_tags_edit = QLineEdit()
+        tags_layout.addWidget(self.default_tags_edit)
+        main_layout.addWidget(tags_group)
 
         # Metadata groups ------------------------------------------------------
-        groups_frame = ttk.LabelFrame(main_frame, text="Metadata Groups", padding=8)
-        groups_frame.pack(fill="both", expand=True)
+        groups_group = QGroupBox("Metadata Groups")
+        groups_layout = QVBoxLayout(groups_group)
 
-        container = ttk.Frame(groups_frame)
-        container.pack(fill="both", expand=True)
+        container = QWidget()
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
 
         # Left side: list of groups
-        left_frame = ttk.Frame(container)
-        left_frame.pack(side="left", fill="y", padx=(0, 8))
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 8, 0)
 
-        self.group_listbox = tk.Listbox(left_frame, height=10, exportselection=False)
-        self.group_listbox.pack(fill="y", expand=True)
-        self.group_listbox.bind("<<ListboxSelect>>", self._on_group_selection)
+        self.group_list = QListWidget()
+        self.group_list.setFixedWidth(180)
+        left_layout.addWidget(self.group_list)
+        self.group_list.currentRowChanged.connect(self._on_group_selection)
 
-        group_buttons = ttk.Frame(left_frame)
-        group_buttons.pack(fill="x", pady=(6, 0))
+        group_buttons_widget = QWidget()
+        group_buttons_layout = QGridLayout(group_buttons_widget)
+        group_buttons_layout.setContentsMargins(0, 0, 0, 0)
 
-        ttk.Button(group_buttons, text="Add", command=self._add_group).grid(
-            row=0, column=0, padx=2
-        )
-        ttk.Button(group_buttons, text="Remove", command=self._remove_group).grid(
-            row=0, column=1, padx=2
-        )
-        ttk.Button(group_buttons, text="Up", command=lambda: self._move_group(-1)).grid(
-            row=0, column=2, padx=2
-        )
-        ttk.Button(
-            group_buttons, text="Down", command=lambda: self._move_group(1)
-        ).grid(row=0, column=3, padx=2)
+        add_group_btn = QPushButton("Add")
+        add_group_btn.clicked.connect(self._add_group)
+        group_buttons_layout.addWidget(add_group_btn, 0, 0)
+
+        remove_group_btn = QPushButton("Remove")
+        remove_group_btn.clicked.connect(self._remove_group)
+        group_buttons_layout.addWidget(remove_group_btn, 0, 1)
+
+        up_group_btn = QPushButton("Up")
+        up_group_btn.clicked.connect(lambda: self._move_group(-1))
+        group_buttons_layout.addWidget(up_group_btn, 0, 2)
+
+        down_group_btn = QPushButton("Down")
+        down_group_btn.clicked.connect(lambda: self._move_group(1))
+        group_buttons_layout.addWidget(down_group_btn, 0, 3)
+
+        left_layout.addWidget(group_buttons_widget)
+        container_layout.addWidget(left_widget)
 
         # Right side: group detail editor
-        detail_frame = ttk.Frame(container)
-        detail_frame.pack(side="left", fill="both", expand=True)
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
 
-        name_frame = ttk.Frame(detail_frame)
-        name_frame.pack(fill="x")
+        name_widget = QWidget()
+        name_layout = QVBoxLayout(name_widget)
+        name_layout.setContentsMargins(0, 0, 0, 0)
+        name_layout.addWidget(QLabel("Group Name:"))
+        self.group_name_entry = QLineEdit()
+        self.group_name_entry.textChanged.connect(self._on_group_name_change)
+        name_layout.addWidget(self.group_name_entry)
+        detail_layout.addWidget(name_widget)
 
-        ttk.Label(name_frame, text="Group Name:").pack(anchor="w")
-        self.group_name_var = tk.StringVar()
-        self.group_name_var.trace_add("write", self._on_group_name_change)
-        self.group_name_entry = ttk.Entry(name_frame, textvariable=self.group_name_var)
-        self.group_name_entry.pack(fill="x", pady=(0, 8))
+        keys_widget = QWidget()
+        keys_layout = QVBoxLayout(keys_widget)
+        keys_layout.setContentsMargins(0, 0, 0, 0)
+        keys_layout.addWidget(QLabel("Keys in this group (order preserved):"))
+        self.keys_list = QListWidget()
+        keys_layout.addWidget(self.keys_list)
 
-        keys_frame = ttk.Frame(detail_frame)
-        keys_frame.pack(fill="both", expand=True)
+        key_controls_widget = QWidget()
+        key_controls_layout = QGridLayout(key_controls_widget)
+        key_controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        ttk.Label(keys_frame, text="Keys in this group (order preserved):").pack(
-            anchor="w"
-        )
+        self.new_key_edit = QLineEdit()
+        self.new_key_edit.setFixedWidth(140)
+        key_controls_layout.addWidget(self.new_key_edit, 0, 0)
 
-        self.keys_listbox = tk.Listbox(keys_frame, height=10, exportselection=False)
-        self.keys_listbox.pack(fill="both", expand=True)
+        add_key_btn = QPushButton("Add")
+        add_key_btn.clicked.connect(self._add_key)
+        key_controls_layout.addWidget(add_key_btn, 0, 1)
 
-        key_controls = ttk.Frame(keys_frame)
-        key_controls.pack(fill="x", pady=(6, 0))
+        remove_key_btn = QPushButton("Remove")
+        remove_key_btn.clicked.connect(self._remove_key)
+        key_controls_layout.addWidget(remove_key_btn, 0, 2)
 
-        self.new_key_var = tk.StringVar()
-        ttk.Entry(key_controls, textvariable=self.new_key_var, width=20).grid(
-            row=0, column=0, padx=2
-        )
-        ttk.Button(key_controls, text="Add", command=self._add_key).grid(
-            row=0, column=1, padx=2
-        )
-        ttk.Button(key_controls, text="Remove", command=self._remove_key).grid(
-            row=0, column=2, padx=2
-        )
-        ttk.Button(key_controls, text="Up", command=lambda: self._move_key(-1)).grid(
-            row=0, column=3, padx=2
-        )
-        ttk.Button(key_controls, text="Down", command=lambda: self._move_key(1)).grid(
-            row=0, column=4, padx=2
-        )
+        up_key_btn = QPushButton("Up")
+        up_key_btn.clicked.connect(lambda: self._move_key(-1))
+        key_controls_layout.addWidget(up_key_btn, 0, 3)
+
+        down_key_btn = QPushButton("Down")
+        down_key_btn.clicked.connect(lambda: self._move_key(1))
+        key_controls_layout.addWidget(down_key_btn, 0, 4)
+
+        keys_layout.addWidget(key_controls_widget)
+        detail_layout.addWidget(keys_widget)
+        container_layout.addWidget(detail_widget, stretch=1)
+
+        groups_layout.addWidget(container)
+        main_layout.addWidget(groups_group, stretch=1)
 
         # Buttons --------------------------------------------------------------
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(12, 0))
-
-        ttk.Button(button_frame, text="Cancel", command=self._on_cancel).pack(
-            side="right", padx=(5, 0)
+        button_box = QDialogButtonBox()
+        save_btn = button_box.addButton("Save", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = button_box.addButton(
+            "Cancel", QDialogButtonBox.ButtonRole.RejectRole
         )
-        ttk.Button(button_frame, text="Save", command=self._on_save).pack(side="right")
+        save_btn.clicked.connect(self._on_save)
+        cancel_btn.clicked.connect(self._on_cancel)
+        main_layout.addWidget(button_box)
 
         self._update_detail_state(False)
 
@@ -149,7 +171,7 @@ class OptionsDialog:
     # ------------------------------------------------------------------
     def _load_initial_state(self) -> None:
         tags = ", ".join(self.initial_config.get("default_grouping_tags", []))
-        self.default_tags_var.set(tags)
+        self.default_tags_edit.setText(tags)
 
         groups = self.initial_config.get("metadata_groups", [])
         if isinstance(groups, list):
@@ -166,44 +188,44 @@ class OptionsDialog:
 
         self._refresh_group_listbox()
         if self._groups:
-            self.group_listbox.selection_set(0)
-            self._on_group_selection()
+            self.group_list.setCurrentRow(0)
 
     def _refresh_group_listbox(self) -> None:
-        self.group_listbox.delete(0, tk.END)
+        self.group_list.blockSignals(True)
+        self.group_list.clear()
         for group in self._groups:
             display_name = group["name"] or "(unnamed group)"
-            self.group_listbox.insert(tk.END, display_name)
+            self.group_list.addItem(display_name)
+        self.group_list.blockSignals(False)
 
     def _update_detail_state(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        widgets = [
-            self.group_name_entry,
-            self.keys_listbox,
-        ]
-        for widget in widgets:
-            widget.configure(state=state)
+        self.group_name_entry.setEnabled(enabled)
+        self.keys_list.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Group operations
     # ------------------------------------------------------------------
-    def _on_group_selection(self, event: Optional[tk.Event] = None) -> None:
-        if not self.group_listbox.curselection():
+    def _on_group_selection(self, row: int) -> None:
+        if row < 0:
             self._active_group_index = None
             self._update_detail_state(False)
-            self.group_name_var.set("")
-            self.keys_listbox.delete(0, tk.END)
+            self.group_name_entry.blockSignals(True)
+            self.group_name_entry.setText("")
+            self.group_name_entry.blockSignals(False)
+            self.keys_list.clear()
             return
 
-        self._active_group_index = int(self.group_listbox.curselection()[0])
+        self._active_group_index = row
         self._update_detail_state(True)
 
         active_group = self._groups[self._active_group_index]
-        self.group_name_var.set(active_group["name"])
+        self.group_name_entry.blockSignals(True)
+        self.group_name_entry.setText(active_group["name"])
+        self.group_name_entry.blockSignals(False)
 
-        self.keys_listbox.delete(0, tk.END)
+        self.keys_list.clear()
         for key in active_group["keys"]:
-            self.keys_listbox.insert(tk.END, key)
+            self.keys_list.addItem(key)
 
     def _add_group(self) -> None:
         new_index = len(self._groups) + 1
@@ -212,10 +234,7 @@ class OptionsDialog:
         self._groups.append({"name": proposed_name, "keys": []})
         self._refresh_group_listbox()
         last_index = len(self._groups) - 1
-        self.group_listbox.selection_clear(0, tk.END)
-        self.group_listbox.selection_set(last_index)
-        self.group_listbox.see(last_index)
-        self._on_group_selection()
+        self.group_list.setCurrentRow(last_index)
 
     def _remove_group(self) -> None:
         if self._active_group_index is None:
@@ -224,11 +243,14 @@ class OptionsDialog:
         self._refresh_group_listbox()
         if self._groups:
             new_index = min(self._active_group_index, len(self._groups) - 1)
-            self.group_listbox.selection_set(new_index)
-            self._on_group_selection()
+            self.group_list.setCurrentRow(new_index)
         else:
-            self.group_listbox.selection_clear(0, tk.END)
-            self._on_group_selection()
+            self._active_group_index = None
+            self._update_detail_state(False)
+            self.group_name_entry.blockSignals(True)
+            self.group_name_entry.setText("")
+            self.group_name_entry.blockSignals(False)
+            self.keys_list.clear()
 
     def _move_group(self, delta: int) -> None:
         if self._active_group_index is None:
@@ -241,69 +263,71 @@ class OptionsDialog:
             self._groups[self._active_group_index],
         )
         self._refresh_group_listbox()
-        self.group_listbox.selection_set(new_index)
-        self.group_listbox.see(new_index)
+        self.group_list.setCurrentRow(new_index)
         self._active_group_index = new_index
-        self._on_group_selection()
 
-    def _on_group_name_change(self, *_: Any) -> None:
+    def _on_group_name_change(self, text: str) -> None:
         if self._active_group_index is None:
             return
-        name = self.group_name_var.get().strip()
+        name = text.strip()
         self._groups[self._active_group_index]["name"] = name
         self._refresh_group_listbox()
-        self.group_listbox.selection_set(self._active_group_index)
+        self.group_list.blockSignals(True)
+        self.group_list.setCurrentRow(self._active_group_index)
+        self.group_list.blockSignals(False)
 
     # ------------------------------------------------------------------
     # Key operations
     # ------------------------------------------------------------------
     def _add_key(self) -> None:
         if self._active_group_index is None:
-            messagebox.showwarning(
-                "No Group Selected", "Select a group before adding keys."
+            QMessageBox.warning(
+                self, "No Group Selected", "Select a group before adding keys."
             )
             return
 
-        key = self.new_key_var.get().strip()
+        key = self.new_key_edit.text().strip()
         if not key:
             return
 
         active_group = self._groups[self._active_group_index]
         if key in active_group["keys"]:
-            messagebox.showinfo("Duplicate Key", f"'{key}' is already in this group.")
+            QMessageBox.information(
+                self, "Duplicate Key", f"'{key}' is already in this group."
+            )
             return
 
         active_group["keys"].append(key)
-        self.keys_listbox.insert(tk.END, key)
-        self.keys_listbox.selection_clear(0, tk.END)
-        self.keys_listbox.selection_set(tk.END)
-        self.new_key_var.set("")
+        self.keys_list.addItem(key)
+        self.keys_list.setCurrentRow(self.keys_list.count() - 1)
+        self.new_key_edit.setText("")
 
     def _remove_key(self) -> None:
         if self._active_group_index is None:
             return
-        selection = self.keys_listbox.curselection()
-        if not selection:
+        row = self.keys_list.currentRow()
+        if row < 0:
             return
-        index = int(selection[0])
-        del self._groups[self._active_group_index]["keys"][index]
-        self.keys_listbox.delete(index)
+        del self._groups[self._active_group_index]["keys"][row]
+        self.keys_list.takeItem(row)
 
     def _move_key(self, delta: int) -> None:
         if self._active_group_index is None:
             return
-        selection = self.keys_listbox.curselection()
-        if not selection:
+        row = self.keys_list.currentRow()
+        if row < 0:
             return
-        index = int(selection[0])
-        new_index = index + delta
+        new_index = row + delta
         keys = self._groups[self._active_group_index]["keys"]
         if new_index < 0 or new_index >= len(keys):
             return
-        keys[index], keys[new_index] = keys[new_index], keys[index]
-        self._on_group_selection()
-        self.keys_listbox.selection_set(new_index)
-        self.keys_listbox.see(new_index)
+        keys[row], keys[new_index] = keys[new_index], keys[row]
+        # Refresh keys display preserving selection
+        saved_group = self._active_group_index
+        self.keys_list.clear()
+        for key in keys:
+            self.keys_list.addItem(key)
+        self.keys_list.setCurrentRow(new_index)
 
     # ------------------------------------------------------------------
     # Dialog result handling
@@ -318,11 +342,14 @@ class OptionsDialog:
             ]
 
             if not name:
-                messagebox.showerror("Invalid Group", "Each group must have a name.")
+                QMessageBox.critical(
+                    self, "Invalid Group", "Each group must have a name."
+                )
                 return None
 
             if name in group_names:
-                messagebox.showerror(
+                QMessageBox.critical(
+                    self,
                     "Duplicate Group",
                     f"There are multiple groups named '{name}'. Please use unique names.",
                 )
@@ -333,7 +360,7 @@ class OptionsDialog:
 
         tags = [
             part.strip()
-            for part in self.default_tags_var.get().split(",")
+            for part in self.default_tags_edit.text().split(",")
             if part.strip()
         ]
 
@@ -347,7 +374,7 @@ class OptionsDialog:
         if collected is None:
             return
         self.result = collected
-        self.dialog.destroy()
+        self.accept()
 
     def _on_cancel(self) -> None:
-        self.dialog.destroy()
+        self.reject()

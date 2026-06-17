@@ -1,20 +1,181 @@
 """
 GUI components for the MGF Explorer application.
+Rewritten for PyQt6 from tkinter.
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
-from typing import List, Dict, Any, Optional, Tuple
 import re
 import threading
-import time
+import io
+from typing import List, Dict, Optional, Tuple
+
+import numpy as np
+import matplotlib
+
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.figure import Figure
+from matplotlib.widgets import RectangleSelector
+
+from PyQt6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QSplitter,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTabWidget,
+    QDialog,
+    QDialogButtonBox,
+    QMessageBox,
+    QTextEdit,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
+    QComboBox,
+    QGroupBox,
+    QRadioButton,
+    QProgressBar,
+    QApplication,
+    QAbstractItemView,
+    QMenu,
+    QListWidget,
+)
+from PyQt6.QtCore import (
+    Qt,
+    QTimer,
+)
+from PyQt6.QtGui import (
+    QFont,
+    QCursor,
+    QColor,
+)
+from matplotlib.lines import Line2D
+
 from .mgf_parser import MGFParser, Spectrum
 
-# Natural sorting for spectrum names
+
+# ---------------------------------------------------------------------------
+# Module-level cosine similarity helper (supports 3 matching methods)
+# ---------------------------------------------------------------------------
+
+
+def _compute_cosine_similarity_method(
+    spec_ref: "Spectrum",
+    spec_cmp: "Spectrum",
+    tolerance: float,
+    method: str = "standard",
+) -> float:
+    """Compute cosine similarity with selectable matching method.
+
+    method:
+        'standard'  – all fragments from both spectra (symmetric)
+        'forward'   – only reference fragments count toward denominator
+        'common'    – only matched (common) fragments are used
+    """
+    if spec_ref.ions.size == 0 or spec_cmp.ions.size == 0:
+        return 0.0
+
+    mz_ref = spec_ref.ions[:, 0].copy()
+    int_ref = spec_ref.ions[:, 1].copy()
+    mz_cmp = spec_cmp.ions[:, 0].copy()
+    int_cmp = spec_cmp.ions[:, 1].copy()
+
+    max_ref = int_ref.max()
+    max_cmp = int_cmp.max()
+    if max_ref == 0 or max_cmp == 0:
+        return 0.0
+    int_ref = int_ref / max_ref
+    int_cmp = int_cmp / max_cmp
+
+    # Greedy matching: each peak matched at most once
+    matched_ref_idx: List[int] = []
+    matched_cmp_idx: List[int] = []
+    used_cmp: set = set()
+
+    for i in range(len(mz_ref)):
+        best_j = None
+        best_dist = float("inf")
+        for j in range(len(mz_cmp)):
+            if j in used_cmp:
+                continue
+            dist = abs(float(mz_ref[i]) - float(mz_cmp[j]))
+            if dist <= tolerance and dist < best_dist:
+                best_dist = dist
+                best_j = j
+        if best_j is not None:
+            matched_ref_idx.append(i)
+            matched_cmp_idx.append(best_j)
+            used_cmp.add(best_j)
+
+    if method == "standard":
+        dot = sum(
+            float(int_ref[i]) * float(int_cmp[j])
+            for i, j in zip(matched_ref_idx, matched_cmp_idx)
+        )
+        norm_ref = float(np.sqrt(np.sum(int_ref**2)))
+        norm_cmp = float(np.sqrt(np.sum(int_cmp**2)))
+        if norm_ref == 0 or norm_cmp == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp)))
+
+    elif method == "forward":
+        dot = sum(
+            float(int_ref[i]) * float(int_cmp[j])
+            for i, j in zip(matched_ref_idx, matched_cmp_idx)
+        )
+        norm_ref = float(np.sqrt(np.sum(int_ref**2)))
+        norm_cmp_matched = (
+            float(np.sqrt(sum(float(int_cmp[j]) ** 2 for j in matched_cmp_idx)))
+            if matched_cmp_idx
+            else 0.0
+        )
+        if norm_ref == 0 or norm_cmp_matched == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp_matched)))
+
+    elif method == "common":
+        if not matched_ref_idx:
+            return 0.0
+        v_ref = np.array([float(int_ref[i]) for i in matched_ref_idx])
+        v_cmp = np.array([float(int_cmp[j]) for j in matched_cmp_idx])
+        dot = float(np.dot(v_ref, v_cmp))
+        norm_ref = float(np.linalg.norm(v_ref))
+        norm_cmp = float(np.linalg.norm(v_cmp))
+        if norm_ref == 0 or norm_cmp == 0:
+            return 0.0
+        return max(0.0, min(1.0, dot / (norm_ref * norm_cmp)))
+
+    return 0.0
+
+
+# Helper function to format spectrum display names
+def _format_spectrum_label(
+    spectrum: "Spectrum", naming_scheme: str = "Numbered"
+) -> str:
+    """Format spectrum display name as 'ID: metadata-value' or just 'ID'.
+
+    Args:
+        spectrum: The spectrum object
+        naming_scheme: The metadata field to use for naming (or "Numbered" for ID only)
+
+    Returns:
+        Formatted label as "ID: value" (if naming_scheme != "Numbered") or "ID"
+    """
+    spectrum_id = spectrum.spectrum_id
+    if naming_scheme == "Numbered":
+        return str(spectrum_id)
+    val = spectrum.get_metadata_value(naming_scheme)
+    if val:
+        return f"{spectrum_id}: {val}"
+    return str(spectrum_id)
+
+
+# Natural sorting
 try:
     from natsort import natsorted
 
@@ -22,11 +183,7 @@ try:
 except ImportError:
     NATSORT_AVAILABLE = False
 
-    # Simple natural sort implementation
     def natsorted(items, key=None):
-        """Simple natural sort implementation."""
-        import re
-
         def natural_key(text):
             if key:
                 text = key(text)
@@ -38,11 +195,12 @@ except ImportError:
         return sorted(items, key=natural_key)
 
 
-# RDKit imports for SMILES plotting
+# RDKit imports
 try:
     from rdkit import Chem
     from rdkit.Chem import Draw, rdMolDescriptors
     from rdkit.Chem.Draw import rdMolDraw2D
+    from PIL import Image
 
     RDKIT_AVAILABLE = True
 except ImportError:
@@ -50,2426 +208,1072 @@ except ImportError:
 
 
 class ToolTip:
-    """Create a tooltip for a given widget."""
+    """Thin wrapper — PyQt6 uses setToolTip() natively."""
 
-    def __init__(self, widget, text="widget info"):
-        self.widget = widget
-        self.text = text
-        self.tipwindow = None
-        self.id = None
-        self.x = self.y = 0
+    @staticmethod
+    def add_tooltip(widget: QWidget, text: str):
+        widget.setToolTip(text)
 
-        # Bind mouse events
-        self.widget.bind("<Enter>", self.enter)
-        self.widget.bind("<Leave>", self.leave)
-
-    def enter(self, event=None):
-        """Mouse entered widget."""
-        self.schedule_show()
-
-    def leave(self, event=None):
-        """Mouse left widget."""
-        self.cancel()
-        self.hide()
-
-    def schedule_show(self):
-        """Schedule showing the tooltip after a delay."""
-        self.cancel()
-        self.id = self.widget.after(500, self.show)  # 500ms delay
-
-    def cancel(self):
-        """Cancel any scheduled tooltip."""
-        id = self.id
-        self.id = None
-        if id:
-            self.widget.after_cancel(id)
-
-    def show(self):
-        """Display the tooltip."""
-        if self.tipwindow:
-            return
-
-        x, y, cx, cy = self.widget.bbox("insert")
-        x = x + self.widget.winfo_rootx() + 25
-        y = y + cy + self.widget.winfo_rooty() + 25
-
-        self.tipwindow = tw = tk.Toplevel(self.widget)
-        tw.wm_overrideredirect(True)
-        tw.wm_geometry("+%d+%d" % (x, y))
-
-        label = tk.Label(
-            tw,
-            text=self.text,
-            justify=tk.LEFT,
-            background="#ffffe0",
-            relief=tk.SOLID,
-            borderwidth=1,
-            font=("TkDefaultFont", "8", "normal"),
-        )
-        label.pack(ipadx=1)
-
-    def hide(self):
-        """Hide the tooltip."""
-        tw = self.tipwindow
-        self.tipwindow = None
-        if tw:
-            tw.destroy()
+    def __init__(self, widget: QWidget, text: str = ""):
+        """Legacy constructor: just sets the tooltip on the widget."""
+        if widget is not None:
+            widget.setToolTip(text)
 
 
-class SpectrumTreeView(ttk.Frame):
-    """Tree view component for displaying spectra list with tag-based grouping."""
+# ---------------------------------------------------------------------------
+# SpectrumTreeView
+# ---------------------------------------------------------------------------
 
-    def __init__(self, parent, on_selection_changed=None):
+
+# Grey shades per tree depth level (0 = darkest, last = white)
+_TREE_LEVEL_COLORS = [
+    QColor(200, 200, 200),  # level 0
+    QColor(220, 220, 220),  # level 1
+    QColor(238, 238, 238),  # level 2
+    QColor(255, 255, 255),  # level 3+ (white)
+]
+
+
+class SpectrumTreeView(QWidget):
+    """Tree view for displaying spectra with grouping/filtering."""
+
+    def __init__(
+        self,
+        parent=None,
+        on_selection_changed=None,
+        on_filter_similar_cb=None,
+    ):
         super().__init__(parent)
-        self.on_selection_changed = on_selection_changed
+        self._on_selection_changed_cb = on_selection_changed
+        self._on_filter_similar_cb = on_filter_similar_cb
         self.parser: Optional[MGFParser] = None
         self.selected_grouping_tags: List[str] = []
-        self.naming_scheme: str = "Numbered"  # Default naming scheme
-        self.filter_text: str = ""  # Current filter text
-        self.filter_job: Optional[str] = None  # Job ID for delayed filtering
-
+        self._naming_scheme: str = "Numbered"
+        self._filter_text: str = ""
+        self._similarity_visible_ids: Optional[set] = None  # None = no filter
+        self._similarity_reference_id = None  # highlighted reference spectrum
+        self._filter_timer: QTimer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._apply_filter)
+        self._block_selection_signal = False
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the tree view widgets."""
-        # Tag selection frame
-        tag_frame = ttk.LabelFrame(self, text="Grouping Tags", padding=5)
-        tag_frame.pack(fill="x", padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        # Tag entry with right-click context menu
-        self.tag_var = tk.StringVar()
-        self.tag_entry = ttk.Entry(tag_frame, textvariable=self.tag_var, width=40)
-        self.tag_entry.pack(fill="x", pady=5)
-        self.tag_entry.bind("<KeyRelease>", self._on_tag_entry_change)
-        self.tag_entry.bind("<Button-3>", self._show_context_menu)  # Right-click
-        self.tag_entry.bind("<Key>", self._on_key_press)  # For intelligent deletion
-        self.tag_entry.bind(
-            "<Double-Button-1>", self._on_double_click_entry
-        )  # Double-click to select field
-
-        # Create context menu for metadata fields
-        self.context_menu = tk.Menu(self, tearoff=0)
-
-        # Track previous text for deletion detection
-        self.previous_text = ""
-
-        # Filter frame
-        filter_frame = ttk.LabelFrame(self, text="Filter", padding=5)
-        filter_frame.pack(fill="x", padx=5, pady=5)
-
-        # Filter entry with responsive filtering
-        self.filter_var = tk.StringVar()
-        self.filter_entry = ttk.Entry(
-            filter_frame, textvariable=self.filter_var, width=40
+        # Grouping tags
+        tags_box = QGroupBox("Grouping Tags")
+        tags_layout = QVBoxLayout(tags_box)
+        self._tags_entry = QLineEdit("ms_frag_mode, focus_ion_type, name")
+        self._tags_entry.setPlaceholderText("Tag1, Tag2, …  (right-click for fields)")
+        self._tags_entry.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tags_entry.customContextMenuRequested.connect(
+            self._show_tags_context_menu
         )
-        self.filter_entry.pack(fill="x", pady=5)
-        self.filter_entry.bind("<KeyRelease>", self._on_filter_entry_change)
+        self._tags_entry.textChanged.connect(self._on_tags_changed)
+        tags_layout.addWidget(self._tags_entry)
+        layout.addWidget(tags_box)
 
-        # Add tooltip to filter entry with help text
-        help_text = "Default: search all fields\n$$ key: value (exact)\n$$$ key: regex"
-        self.filter_tooltip = ToolTip(self.filter_entry, help_text)
-
-        # Tree view frame
-        tree_frame = ttk.LabelFrame(self, text="Spectra", padding=5)
-        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Tree view with scrollbar
-        tree_container = ttk.Frame(tree_frame)
-        tree_container.pack(fill="both", expand=True)
-
-        self.tree = ttk.Treeview(tree_container, selectmode="extended")
-        tree_scrollbar = ttk.Scrollbar(
-            tree_container, orient="vertical", command=self.tree.yview
+        # Filter
+        filter_box = QGroupBox("Filter")
+        filter_layout = QVBoxLayout(filter_box)
+        self._filter_entry = QLineEdit()
+        self._filter_entry.setPlaceholderText("Search…  ($$key:val  $$$key:regex)")
+        self._filter_entry.setToolTip(
+            "Default: case-insensitive substring in any value\n"
+            "$$key: value — exact match in field\n"
+            "$$$key: regex — regex match in field"
         )
-        self.tree.configure(yscrollcommand=tree_scrollbar.set)
+        self._filter_entry.textChanged.connect(self._on_filter_changed)
+        filter_layout.addWidget(self._filter_entry)
+        layout.addWidget(filter_box)
 
-        self.tree.pack(side="left", fill="both", expand=True)
-        tree_scrollbar.pack(side="right", fill="y")
+        # Tree
+        tree_box = QGroupBox("Spectra")
+        tree_layout = QVBoxLayout(tree_box)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["Spectrum"])
+        self._tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._tree.setIndentation(10)
+        self._tree.itemSelectionChanged.connect(self._on_tree_selection)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._show_tree_context_menu)
+        tree_layout.addWidget(self._tree)
+        layout.addWidget(tree_box, stretch=1)
 
-        # Bind selection event
-        self.tree.bind("<<TreeviewSelect>>", self._on_tree_selection)
+    # ------------------------------------------------------------------
+    def _show_tags_context_menu(self, pos):
+        if not self.parser:
+            return
+        menu = QMenu(self)
+        all_keys = self.parser.get_all_metadata_keys()
+        for key in sorted(all_keys):
+            act = menu.addAction(key)
+            act.triggered.connect(lambda checked, k=key: self._add_tag(k))
+        menu.exec(self._tags_entry.mapToGlobal(pos))
 
-    def load_data(self, parser: MGFParser):
-        """Load spectra data into the tree view."""
-        self.parser = parser
-        # Initialize previous text tracking
-        self.previous_text = self.tag_var.get()
-        # Reset filter when loading new data
-        self.filter_var.set("")
-        self.filter_text = ""
-        if self.filter_job:
-            self.after_cancel(self.filter_job)
-            self.filter_job = None
+    def _add_tag(self, tag: str):
+        current = self._tags_entry.text().strip()
+        new_text = f"{current}, {tag}" if current else tag
+        self._tags_entry.setText(new_text)
+
+    def _on_tags_changed(self, text: str):
+        tags = [t.strip() for t in text.split(",") if t.strip()]
+        self.selected_grouping_tags = tags
         self._populate_tree()
 
-    def _show_context_menu(self, event):
-        """Show context menu with available metadata fields."""
+    def _on_filter_changed(self, text: str):
+        self._filter_timer.stop()
+        self._filter_timer.start(600)
+
+    def _apply_filter(self):
+        self._filter_text = self._filter_entry.text().strip()
+        self._populate_tree()
+
+    def set_filter_text(self, text: str):
+        """Programmatically set the filter text and repopulate the tree."""
+        self._filter_timer.stop()
+        self._filter_entry.setText(text)
+        self._filter_text = text
+        self._populate_tree()
+
+    # ------------------------------------------------------------------
+    def load_data(self, parser: MGFParser):
+        self.parser = parser
+        self._filter_entry.clear()
+        self._filter_text = ""
+        self._similarity_visible_ids = None
+        self._populate_tree()
+
+    def _populate_tree(self):
+        self._block_selection_signal = True
+        self._tree.clear()
+        self._block_selection_signal = False
+
         if not self.parser:
             return
 
-        # Clear existing menu items
-        self.context_menu.delete(0, "end")
+        spectra = [s for s in self.parser.spectra if self._spectrum_matches_filter(s)]
 
-        # Get all available metadata keys
-        all_keys = self.parser.get_all_metadata_keys()
-
-        if not all_keys:
-            self.context_menu.add_command(
-                label="No metadata fields available", state="disabled"
-            )
+        if self.selected_grouping_tags:
+            self._populate_grouped(spectra)
         else:
-            # Add each key as a menu item
-            for key in sorted(all_keys):
-                self.context_menu.add_command(
-                    label=key, command=lambda k=key: self._add_tag_from_menu(k)
-                )
+            self._populate_flat(spectra)
 
-        # Show the menu at the cursor position
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+        self._tree.expandAll()
+        self._color_tree_levels()
 
-    def _add_tag_from_menu(self, tag):
-        """Add a tag from the context menu to the text field."""
-        current_text = self.tag_var.get().strip()
+    def _color_tree_levels(self):
+        """Apply background colors based on item depth; highlight reference in yellow."""
+        ref_id = self._similarity_reference_id
 
-        if current_text:
-            # Add comma separator if there's existing text
-            new_text = f"{current_text}, {tag}"
-        else:
-            new_text = tag
+        def _visit(item: QTreeWidgetItem, depth: int):
+            sid = item.data(0, Qt.ItemDataRole.UserRole)
+            if ref_id is not None and sid == ref_id:
+                color = QColor(255, 230, 0)  # yellow for reference
+            else:
+                color = _TREE_LEVEL_COLORS[min(depth, len(_TREE_LEVEL_COLORS) - 1)]
+            for col in range(self._tree.columnCount()):
+                item.setBackground(col, color)
+            for i in range(item.childCount()):
+                _visit(item.child(i), depth + 1)
 
-        self.tag_var.set(new_text)
+        for i in range(self._tree.topLevelItemCount()):
+            _visit(self._tree.topLevelItem(i), 0)
 
-        # Apply grouping automatically
-        self._apply_grouping_auto()
+    def _populate_flat(self, spectra):
+        for spectrum in spectra:
+            item = QTreeWidgetItem(self._tree)
+            item.setText(0, self._get_display_name(spectrum))
+            item.setData(0, Qt.ItemDataRole.UserRole, spectrum.spectrum_id)
 
-    def _on_tag_entry_change(self, event=None):
-        """Handle changes in the tag entry field with automatic grouping and cleanup."""
-        current_text = self.tag_var.get()
+    def _populate_grouped(self, spectra):
+        """Build a nested tree with one level per grouping tag."""
 
-        # Clean up spacing: remove multiple spaces after commas
-        cleaned_text = self._clean_spacing(current_text)
-        if cleaned_text != current_text:
-            cursor_pos = self.tag_entry.index(tk.INSERT)
-            self.tag_var.set(cleaned_text)
-            # Try to maintain cursor position, but adjust if needed
-            new_cursor_pos = min(cursor_pos, len(cleaned_text))
-            self.tag_entry.icursor(new_cursor_pos)
-            current_text = cleaned_text
+        def _build_nested(items, tags):
+            """Recursively bucket spectra by the first tag, then recurse."""
+            if not tags:
+                return items  # leaf: list of spectra
+            result: Dict[str, List] = {}
+            for s in items:
+                val = s.get_metadata_value(tags[0]) or "N/A"
+                result.setdefault(str(val), []).append(s)
+            return {k: _build_nested(v, tags[1:]) for k, v in result.items()}
 
-        # Apply grouping automatically when text changes
-        self._apply_grouping_auto()
+        def _populate_node(parent, data):
+            if isinstance(data, list):
+                for spectrum in data:
+                    child = QTreeWidgetItem(parent)
+                    child.setText(0, self._get_display_name(spectrum))
+                    child.setData(0, Qt.ItemDataRole.UserRole, spectrum.spectrum_id)
+            else:
+                for key in natsorted(data.keys()):
+                    group_item = QTreeWidgetItem(parent)
+                    group_item.setText(0, key)
+                    group_item.setData(0, Qt.ItemDataRole.UserRole, None)
+                    _populate_node(group_item, data[key])
 
-        # Update previous text for next comparison
-        self.previous_text = current_text
+        nested = _build_nested(spectra, self.selected_grouping_tags)
+        _populate_node(self._tree, nested)
 
-    def _on_filter_entry_change(self, event=None):
-        """Handle changes in the filter entry field with delayed filtering."""
-        # Cancel any pending filter job
-        if self.filter_job:
-            self.after_cancel(self.filter_job)
+    def _get_display_name(self, spectrum) -> str:
+        return _format_spectrum_label(spectrum, self._naming_scheme)
 
-        # Schedule a new filter job after 2 seconds (2000ms)
-        self.filter_job = self.after(2000, self._apply_filter)
+    # ------------------------------------------------------------------
+    def _on_tree_selection(self):
+        if self._block_selection_signal:
+            return
+        ids = self.get_selected_spectrum_ids()
+        if self._on_selection_changed_cb:
+            self._on_selection_changed_cb(ids)
 
-    def _apply_filter(self):
-        """Apply the current filter to the tree view."""
-        self.filter_job = None
-        self.filter_text = self.filter_var.get().strip()
+    def get_selected_spectrum_ids(self) -> List:
+        ids = []
+        for item in self._tree.selectedItems():
+            sid = item.data(0, Qt.ItemDataRole.UserRole)
+            if sid is not None:
+                ids.append(sid)
+        return ids
+
+    def select_spectra_by_ids(self, ids):
+        self._block_selection_signal = True
+        self._tree.clearSelection()
+
+        def _visit(item):
+            sid = item.data(0, Qt.ItemDataRole.UserRole)
+            if sid in ids:
+                item.setSelected(True)
+            for i in range(item.childCount()):
+                _visit(item.child(i))
+
+        for i in range(self._tree.topLevelItemCount()):
+            _visit(self._tree.topLevelItem(i))
+        self._block_selection_signal = False
+
+    def set_grouping_tags(self, tags: List[str]):
+        self.selected_grouping_tags = tags
+        self._tags_entry.setText(", ".join(tags))
+
+    def get_grouping_tags(self) -> List[str]:
+        return self.selected_grouping_tags
+
+    def set_naming_scheme(self, scheme: str):
+        self._naming_scheme = scheme
+        if self.parser:
+            self._populate_tree()
+
+    def get_current_grouping_structure(self) -> Dict:
+        result = {}
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            if item.childCount() > 0:
+                children = []
+                for j in range(item.childCount()):
+                    child = item.child(j)
+                    sid = child.data(0, Qt.ItemDataRole.UserRole)
+                    if sid is not None:
+                        children.append(sid)
+                result[item.text(0)] = children
+        return result
+
+    def has_grouping(self) -> bool:
+        return len(self.selected_grouping_tags) > 0
+
+    # ------------------------------------------------------------------
+    # Similarity filter
+    # ------------------------------------------------------------------
+
+    def set_similarity_filter(self, visible_ids: set, reference_id=None):
+        """Show only spectra whose IDs are in *visible_ids*."""
+        self._similarity_visible_ids = set(visible_ids)
+        self._similarity_reference_id = reference_id
         self._populate_tree()
 
-    def _spectrum_matches_filter(self, spectrum):
-        """Check if a spectrum matches the current filter."""
-        if not self.filter_text:
-            return True
+    def clear_similarity_filter(self):
+        """Remove the similarity-based filter."""
+        self._similarity_visible_ids = None
+        self._similarity_reference_id = None
+        self._populate_tree()
 
-        # Check for special filtering syntax
-        if self.filter_text.startswith("$$$"):
-            # Regex search in specific key: "$$$ key: regex"
-            return self._filter_by_key_regex(spectrum, self.filter_text[3:].strip())
-        elif self.filter_text.startswith("$$"):
-            # Exact submatch in specific key: "$$ key: value"
-            return self._filter_by_key_exact(spectrum, self.filter_text[2:].strip())
+    def clear_all_filters(self):
+        """Remove both text filter and similarity filter, repopulate."""
+        self._filter_entry.clear()
+        self._filter_text = ""
+        self._similarity_visible_ids = None
+        self._similarity_reference_id = None
+        self._populate_tree()
+
+    def get_filtered_spectrum_ids(self) -> List:
+        """Return IDs of all spectra that currently pass the text filter."""
+        if not self.parser:
+            return []
+        return [
+            s.spectrum_id
+            for s in self.parser.spectra
+            if self._spectrum_matches_text_filter(s)
+        ]
+
+    # ------------------------------------------------------------------
+    # Right-click context menu on the tree
+    # ------------------------------------------------------------------
+
+    def _show_tree_context_menu(self, pos):
+        item = self._tree.itemAt(pos)
+        spectrum_id = None
+        if item is not None:
+            spectrum_id = item.data(0, Qt.ItemDataRole.UserRole)
+
+        menu = QMenu(self)
+
+        if spectrum_id is not None and self._on_filter_similar_cb is not None:
+            act_filter = menu.addAction("Filter similar spectra…")
+            act_filter.triggered.connect(
+                lambda: self._on_filter_similar_cb(spectrum_id)
+            )
+            menu.addSeparator()
+
+        act_show_all = menu.addAction("Show all spectra")
+        act_show_all.triggered.connect(self.clear_all_filters)
+
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+    # Filtering helpers
+    # ------------------------------------------------------------------
+
+    def _spectrum_matches_filter(self, spectrum) -> bool:
+        """Return True if spectrum passes both text filter and similarity filter."""
+        if self._similarity_visible_ids is not None:
+            if spectrum.spectrum_id not in self._similarity_visible_ids:
+                return False
+        return self._spectrum_matches_text_filter(spectrum)
+
+    def _spectrum_matches_text_filter(self, spectrum) -> bool:
+        if not self._filter_text:
+            return True
+        ft = self._filter_text
+        if ft.startswith("$$$"):
+            return self._filter_key_regex(spectrum, ft[3:].strip())
+        elif ft.startswith("$$"):
+            return self._filter_key_exact(spectrum, ft[2:].strip())
         else:
-            # Default: search in all metadata values
-            for key, value in spectrum.metadata.items():
-                if value and self.filter_text in str(value).lower():
+            low = ft.lower()
+            for val in spectrum.metadata.values():
+                if val and low in str(val).lower():
                     return True
             return False
 
-    def _filter_by_key_exact(self, spectrum, filter_text):
-        """Filter by exact submatch in a specific key field."""
+    def _filter_key_exact(self, spectrum, filter_text: str) -> bool:
         if ":" not in filter_text:
             return False
-
-        key_part, value_part = filter_text.split(":", 1)
-        key = key_part.strip()
-        search_value = value_part.strip().lower()
-
-        if key in spectrum.metadata:
-            metadata_value = spectrum.metadata[key]
-            if metadata_value and search_value in str(metadata_value).lower():
-                return True
+        key, value = filter_text.split(":", 1)
+        key = key.strip()
+        value = value.strip().lower()
+        meta_val = spectrum.metadata.get(key)
+        if meta_val and value in str(meta_val).lower():
+            return True
         return False
 
-    def _filter_by_key_regex(self, spectrum, filter_text):
-        """Filter by regex match in a specific key field."""
-        import re
-
+    def _filter_key_regex(self, spectrum, filter_text: str) -> bool:
         if ":" not in filter_text:
             return False
-
-        key_part, regex_part = filter_text.split(":", 1)
-        key = key_part.strip()
-        regex_pattern = regex_part.strip()
-
-        if key in spectrum.metadata:
-            metadata_value = spectrum.metadata[key]
-            if metadata_value:
-                try:
-                    # Case-insensitive regex search
-                    if re.search(regex_pattern, str(metadata_value), re.IGNORECASE):
-                        return True
-                except re.error:
-                    # Invalid regex pattern - fall back to literal search
-                    if regex_pattern.lower() in str(metadata_value).lower():
-                        return True
-        return False
-
-    def _clean_spacing(self, text):
-        """Clean up spacing in the text - ensure single space after commas."""
-        import re
-
-        # Replace comma followed by multiple spaces with comma followed by single space
-        cleaned = re.sub(r",\s+", ", ", text)
-        # Remove leading/trailing spaces from the entire string
-        cleaned = cleaned.strip()
-        return cleaned
-
-    def _on_key_press(self, event):
-        """Handle key presses for intelligent field deletion."""
-        if event.keysym in ("BackSpace", "Delete"):
-            return self._handle_intelligent_field_deletion(event)
-        return None
-
-    def _handle_intelligent_field_deletion(self, event):
-        """Handle backspace/delete to remove entire fields when cursor is in a field name."""
-        current_text = self.tag_var.get()
-        cursor_pos = self.tag_entry.index(tk.INSERT)
-
-        # Find which field the cursor is currently in
-        field_info = self._get_field_at_cursor(current_text, cursor_pos)
-
-        if field_info is None:
-            # Cursor not in a field, allow normal behavior
-            return None
-
-        field_index, field_start, field_end, field_text = field_info
-
-        # Check if cursor is in the field name (not in separator)
-        if field_start <= cursor_pos <= field_end and field_text.strip():
-            # Cursor is in a field name, remove the entire field
-            self._remove_field_at_index(field_index)
-            return "break"  # Prevent default behavior
-
-        # Allow normal behavior for separators or empty areas
-        return None
-
-    def _get_field_at_cursor(self, text, cursor_pos):
-        """Get information about the field at cursor position."""
-        if not text:
-            return None
-
-        # Split by commas but keep track of positions
-        fields = []
-        current_pos = 0
-        parts = text.split(",")
-
-        for i, part in enumerate(parts):
-            field_start = current_pos
-            field_end = current_pos + len(part)
-            field_text = part.strip()
-
-            fields.append((i, field_start, field_end, field_text))
-            current_pos = field_end + 1  # +1 for comma
-
-        # Find which field contains the cursor
-        for field_index, field_start, field_end, field_text in fields:
-            if field_start <= cursor_pos <= field_end:
-                return (field_index, field_start, field_end, field_text)
-
-        return None
-
-    def _remove_field_at_index(self, field_index):
-        """Remove a field at the specified index and update the text."""
-        current_text = self.tag_var.get()
-        parts = [part.strip() for part in current_text.split(",")]
-
-        if 0 <= field_index < len(parts):
-            # Remove the field
-            parts.pop(field_index)
-
-            # Rebuild text
-            new_text = ", ".join(parts)
-            self.tag_var.set(new_text)
-
-            # Position cursor appropriately
-            if parts:
-                if field_index == 0:
-                    # Removed first field, position at start
-                    self.tag_entry.icursor(0)
-                elif field_index >= len(parts):
-                    # Removed last field, position at end
-                    self.tag_entry.icursor(len(new_text))
-                else:
-                    # Position at start of next field
-                    pos = len(", ".join(parts[:field_index])) + (
-                        2 if field_index > 0 else 0
-                    )
-                    self.tag_entry.icursor(min(pos, len(new_text)))
-            else:
-                # No fields left, position at start
-                self.tag_entry.icursor(0)
-
-            # Apply grouping with updated text
-            self._apply_grouping_auto()
-
-    def _on_double_click_entry(self, event):
-        """Handle double-click to select entire field."""
-        cursor_pos = self.tag_entry.index(tk.INSERT)
-        current_text = self.tag_var.get()
-
-        # Use the same field detection logic
-        field_info = self._get_field_at_cursor(current_text, cursor_pos)
-
-        if field_info:
-            field_index, field_start, field_end, field_text = field_info
-
-            # Skip leading whitespace
-            while field_start < field_end and current_text[field_start] == " ":
-                field_start += 1
-            # Skip trailing whitespace
-            while field_end > field_start and current_text[field_end - 1] == " ":
-                field_end -= 1
-
-            # Select the field text
-            if field_start < field_end:
-                self.tag_entry.selection_range(field_start, field_end)
-                self.tag_entry.icursor(field_end)
-
-    def _apply_grouping_auto(self):
-        """Apply grouping automatically without user action."""
-        tag_text = self.tag_var.get().strip()
-        if tag_text:
-            # Parse comma-separated tags
-            self.selected_grouping_tags = [
-                tag.strip() for tag in tag_text.split(",") if tag.strip()
-            ]
-        else:
-            self.selected_grouping_tags = []
-
-        self._populate_tree()
-
-    def _apply_grouping(self, event=None):
-        """Apply the grouping based on entered tags (legacy method)."""
-        self._apply_grouping_auto()
-
-    def set_grouping_tags(self, tags: List[str]):
-        """Set the grouping tags from a list and refresh the hierarchy."""
-        tag_text = ", ".join(tag.strip() for tag in tags if tag.strip())
-        self.tag_var.set(tag_text)
-        self.previous_text = tag_text
-        self._apply_grouping_auto()
-
-    def _populate_tree(self):
-        """Populate the tree view with spectra using hierarchical grouping."""
-        # Clear existing items
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        if not self.parser:
-            return
-
-        # Configure tree display
-        self.tree["show"] = "tree"
-
-        if not self.selected_grouping_tags:
-            # No grouping - show flat list
-            self._populate_flat_list()
-        else:
-            # Hierarchical grouping
-            self._populate_hierarchical_tree()
-
-    def _populate_flat_list(self):
-        """Populate tree with flat list of spectra."""
-        for spectrum in self.parser.spectra:
-            # Apply filter if specified
-            if not self._spectrum_matches_filter(spectrum):
-                continue
-
-            display_name = self._get_spectrum_display_name(spectrum)
-            item_id = self.tree.insert(
-                "", "end", text=display_name, tags=("spectrum", spectrum.spectrum_id)
-            )
-
-    def _populate_hierarchical_tree(self):
-        """Populate tree with hierarchical grouping."""
-        # Build hierarchy
-        hierarchy = {}
-
-        for spectrum in self.parser.spectra:
-            # Apply filter if specified
-            if not self._spectrum_matches_filter(spectrum):
-                continue
-
-            # Get values for grouping tags
-            path = []
-            for tag in self.selected_grouping_tags:
-                value = spectrum.get_metadata_value(tag)
-                if value is None:
-                    value = "<missing>"
-                path.append(f"{tag}={value}")
-
-            # Build nested dictionary
-            current = hierarchy
-            for level, path_part in enumerate(path):
-                if path_part not in current:
-                    current[path_part] = {"spectra": [], "children": {}}
-                current = current[path_part]["children"]
-
-            # Add spectrum to the final level
-            final_level = hierarchy
-            for path_part in path[:-1]:
-                final_level = final_level[path_part]["children"]
-            if path:
-                final_level[path[-1]]["spectra"].append(spectrum)
-            else:
-                # No valid grouping path, add to root
-                if "_ungrouped_" not in hierarchy:
-                    hierarchy["_ungrouped_"] = {"spectra": [], "children": {}}
-                hierarchy["_ungrouped_"]["spectra"].append(spectrum)
-
-        # Populate tree from hierarchy
-        self._add_hierarchy_to_tree("", hierarchy, 0)
-
-    def _add_hierarchy_to_tree(self, parent_id: str, hierarchy: dict, level: int):
-        """Recursively add hierarchy to tree."""
-        for key, data in hierarchy.items():
-            # Create group node
-            display_text = key if key != "_ungrouped_" else "Ungrouped"
-            group_id = self.tree.insert(
-                parent_id, "end", text=display_text, tags=("group", level)
-            )
-
-            # Add spectra in this group
-            for spectrum in data["spectra"]:
-                display_name = self._get_spectrum_display_name(spectrum)
-                spectrum_id = self.tree.insert(
-                    group_id,
-                    "end",
-                    text=display_name,
-                    tags=("spectrum", spectrum.spectrum_id),
-                )
-
-            # Recursively add children
-            if data["children"]:
-                self._add_hierarchy_to_tree(group_id, data["children"], level + 1)
-
-            # Expand group if it has items
-            if data["spectra"] or data["children"]:
-                self.tree.item(group_id, open=True)
-
-    def _on_tree_selection(self, event):
-        """Handle tree selection changes."""
-        selected_items = self.tree.selection()
-        selected_spectrum_ids = []
-
-        for item in selected_items:
-            tags = self.tree.item(item, "tags")
-            if not tags:
-                continue
-
-            if tags[0] == "spectrum":
-                # Direct spectrum selection - spectrum ID could be string or int
-                spectrum_id = tags[1]
-                # Try to convert to int, but keep as string if it fails (for prefixed IDs)
-                try:
-                    spectrum_id = int(spectrum_id)
-                except ValueError:
-                    pass  # Keep as string
-                selected_spectrum_ids.append(spectrum_id)
-            elif tags[0] == "group":
-                # Group selection - get all spectra in group and children
-                group_spectra = self._get_spectra_in_group(item)
-                selected_spectrum_ids.extend(group_spectra)
-
-        # Remove duplicates and sort
-        selected_spectrum_ids = sorted(list(set(selected_spectrum_ids)))
-
-        if self.on_selection_changed:
-            self.on_selection_changed(selected_spectrum_ids)
-
-    def _get_spectra_in_group(self, group_item):
-        """Get all spectrum IDs in a group and its children."""
-        spectrum_ids = []
-
-        def collect_spectra(item):
-            for child in self.tree.get_children(item):
-                tags = self.tree.item(child, "tags")
-                if tags and tags[0] == "spectrum":
-                    spectrum_id = tags[1]
-                    # Try to convert to int, but keep as string if it fails (for prefixed IDs)
-                    try:
-                        spectrum_id = int(spectrum_id)
-                    except ValueError:
-                        pass  # Keep as string
-                    spectrum_ids.append(spectrum_id)
-                else:
-                    # Recursive for nested groups
-                    collect_spectra(child)
-
-        collect_spectra(group_item)
-        return spectrum_ids
-
-    def get_selected_spectrum_ids(self) -> List:
-        """Get currently selected spectrum IDs."""
-        selected_items = self.tree.selection()
-        selected_ids = []
-
-        for item in selected_items:
-            tags = self.tree.item(item, "tags")
-            if not tags:
-                continue
-
-            if tags[0] == "spectrum":
-                spectrum_id = tags[1]
-                # Try to convert to int, but keep as string if it fails (for prefixed IDs)
-                try:
-                    spectrum_id = int(spectrum_id)
-                except ValueError:
-                    pass  # Keep as string
-                selected_ids.append(spectrum_id)
-            elif tags[0] == "group":
-                group_spectra = self._get_spectra_in_group(item)
-                selected_ids.extend(group_spectra)
-
-        return sorted(list(set(selected_ids)))
-
-    def select_spectra_by_ids(self, spectrum_ids):
-        """Select spectra by their IDs with performance optimizations."""
-        if not spectrum_ids:
-            # Clear selection
-            for item in self.tree.selection():
-                self.tree.selection_remove(item)
-            return
-
-        # Cancel any ongoing async selection
-        if hasattr(self, "_async_selection_items"):
-            self._cleanup_async_selection()
-
-        # For very large selections, show a progress indicator and use async selection
-        if len(spectrum_ids) > 100:
-            print(f"Debug: Using async selection for {len(spectrum_ids)} spectra")
-            self._select_spectra_async(spectrum_ids)
-        else:
-            print(f"Debug: Using standard selection for {len(spectrum_ids)} spectra")
-            found_items = self._select_spectra_by_ids_standard(spectrum_ids)
-            print(
-                f"Debug: Standard selection found {len(found_items) if found_items else 0} items"
-            )
-
-    def _select_spectra_async(self, spectrum_ids):
-        """Asynchronously select large numbers of spectra."""
-        # Show progress message
-        self.after_idle(lambda: self._show_selection_progress(len(spectrum_ids)))
-
-        # Schedule the selection to collect all items first, then select
-        self._async_selection_ids = set(spectrum_ids)
-        self._async_selection_items = []
-
-        # Use a more robust approach: collect all items first
-        self.after(10, self._collect_all_spectrum_items_async)
-
-    def _collect_all_spectrum_items_async(self):
-        """Collect all spectrum items from the tree structure."""
-        all_spectrum_items = []
-
-        def collect_items(parent=""):
-            for item in self.tree.get_children(parent):
-                tags = self.tree.item(item, "tags")
-                if tags and tags[0] == "spectrum":
-                    spectrum_id = tags[1]  # Don't convert to int - keep original type
-                    if spectrum_id in self._async_selection_ids:
-                        all_spectrum_items.append(item)
-                elif tags and tags[0] == "group":
-                    # Recursively check group children
-                    collect_items(item)
-                else:
-                    # Handle items without proper tags
-                    collect_items(item)
-
-        # Clear current selection first
-        self.tree.selection_remove(*self.tree.selection())
-
-        # Collect all matching items
-        collect_items()
-
-        # Store the collected items
-        self._async_selection_items = all_spectrum_items
-        self._selection_chunk_index = 0
-
-        # Start applying selection in chunks
-        self.after(10, self._apply_async_selection)
-
-    def _show_selection_progress(self, count):
-        """Show selection progress in the tree."""
-        # Temporarily clear selection and show message
-        self.tree.selection_remove(*self.tree.selection())
-
-        # You could add a temporary item here showing progress
-        # For now, we'll just ensure the UI updates
-        self.update_idletasks()
-
-    def _apply_async_selection(self):
-        """Apply the collected selection asynchronously."""
-        if not hasattr(self, "_async_selection_items"):
-            return
-
-        # Apply selection in chunks
-        chunk_size = 50
-        items = self._async_selection_items
-
-        if not hasattr(self, "_selection_chunk_index"):
-            self._selection_chunk_index = 0
-
-        # Process a chunk
-        start_idx = self._selection_chunk_index
-        end_idx = min(start_idx + chunk_size, len(items))
-
-        for item in items[start_idx:end_idx]:
-            self.tree.selection_add(item)
-
-        self._selection_chunk_index = end_idx
-
-        # Check if we're done
-        if end_idx >= len(items):
-            # Selection complete
-            self._cleanup_async_selection()
-
-            # Make first item visible
-            if items:
-                self.tree.see(items[0])
-        else:
-            # Continue with next chunk
-            self.after(10, self._apply_async_selection)
-
-    def _cleanup_async_selection(self):
-        """Clean up async selection variables."""
-        for attr in [
-            "_async_selection_ids",
-            "_async_selection_items",
-            "_selection_chunk_index",
-        ]:
-            if hasattr(self, attr):
-                delattr(self, attr)
-
-    def _select_spectra_by_ids_standard(self, spectrum_ids):
-        """Standard selection method for moderate number of spectra."""
-        # Clear current selection
-        for item in self.tree.selection():
-            self.tree.selection_remove(item)
-
-        # Convert to set for faster lookup
-        target_ids = set(spectrum_ids)
-        found_items = []
-
-        # Select matching spectra
-        def select_in_tree(parent=""):
-            for item in self.tree.get_children(parent):
-                tags = self.tree.item(item, "tags")
-                if tags and tags[0] == "spectrum":
-                    spectrum_id = tags[1]  # Don't convert to int - keep original type
-                    if spectrum_id in target_ids:
-                        self.tree.selection_add(item)
-                        found_items.append(item)
-                        # Only ensure visibility for first few items to avoid performance issues
-                        if len(found_items) <= 10:
-                            self.tree.see(item)
-                elif tags and tags[0] == "group":
-                    # Recursively check children of group items
-                    select_in_tree(item)
-                else:
-                    # Handle items without proper tags - recursively check children anyway
-                    select_in_tree(item)
-
-        select_in_tree()
-
-        # Debug information - can be removed later
-        if len(found_items) != len(spectrum_ids):
-            print(
-                f"Selection mismatch: requested {len(spectrum_ids)}, found {len(found_items)}"
-            )
-            print(f"Tree has grouping: {bool(self.selected_grouping_tags)}")
-            print(f"Grouping tags: {self.selected_grouping_tags}")
-
-        return found_items
-
-    def _select_spectra_by_ids_batch(self, spectrum_ids):
-        """Optimized selection method for large number of spectra."""
-        # Clear current selection
-        self.tree.selection_remove(*self.tree.selection())
-
-        # Convert to set for faster lookup
-        target_ids = set(spectrum_ids)
-        items_to_select = []
-
-        # Collect all items to select first
-        def collect_items(parent=""):
-            for item in self.tree.get_children(parent):
-                tags = self.tree.item(item, "tags")
-                if tags and tags[0] == "spectrum":
-                    spectrum_id = tags[1]  # Don't convert to int - keep original type
-                    if spectrum_id in target_ids:
-                        items_to_select.append(item)
-                else:
-                    # Recursively check children
-                    collect_items(item)
-
-        collect_items()
-
-        # Batch select items to reduce UI updates
-        if items_to_select:
-            # Disable updates during batch operation
-            self.tree.configure(state="disabled")
+        key, pattern = filter_text.split(":", 1)
+        key = key.strip()
+        pattern = pattern.strip()
+        meta_val = spectrum.metadata.get(key)
+        if meta_val:
             try:
-                # Select in chunks to avoid overwhelming the UI
-                chunk_size = 100
-                for i in range(0, len(items_to_select), chunk_size):
-                    chunk = items_to_select[i : i + chunk_size]
-                    for item in chunk:
-                        self.tree.selection_add(item)
-
-                    # Update UI periodically
-                    if i % (chunk_size * 5) == 0:
-                        self.update_idletasks()
-
-                # Make the first selected item visible
-                if items_to_select:
-                    self.tree.see(items_to_select[0])
-
-            finally:
-                self.tree.configure(state="normal")
-
-    def set_naming_scheme(self, scheme: str):
-        """Set the naming scheme for spectrum display."""
-        self.naming_scheme = scheme
-
-    def _get_spectrum_display_name(self, spectrum) -> str:
-        """Get the display name for a spectrum based on the current naming scheme."""
-        if self.naming_scheme == "Numbered":
-            return f"S {spectrum.spectrum_id}"
-        else:
-            # Use the specified metadata field
-            value = spectrum.get_metadata_value(self.naming_scheme)
-            if value:
-                return f"{spectrum.spectrum_id}: {self.naming_scheme}={value}"
-            else:
-                return f"{spectrum.spectrum_id}: {self.naming_scheme}=<missing>"
-
-    def get_current_grouping_structure(self):
-        """Get the current grouping structure for export functionality."""
-        if not self.parser or not self.selected_grouping_tags:
-            return None
-
-        # Build the same hierarchy structure used in _populate_hierarchical_tree
-        hierarchy = {}
-
-        for spectrum in self.parser.spectra:
-            # Apply filter if specified
-            if not self._spectrum_matches_filter(spectrum):
-                continue
-
-            # Get values for grouping tags
-            path = []
-            for tag in self.selected_grouping_tags:
-                value = spectrum.get_metadata_value(tag)
-                if value is None:
-                    value = "<missing>"
-                path.append(f"{tag}={value}")
-
-            # Build nested dictionary
-            current = hierarchy
-            for level, path_part in enumerate(path):
-                if path_part not in current:
-                    current[path_part] = {"spectra": [], "children": {}}
-                current = current[path_part]["children"]
-
-            # Add spectrum to the final level
-            final_level = hierarchy
-            for path_part in path[:-1]:
-                final_level = final_level[path_part]["children"]
-            if path:
-                final_level[path[-1]]["spectra"].append(spectrum)
-            else:
-                # No valid grouping path, add to root
-                if "_ungrouped_" not in hierarchy:
-                    hierarchy["_ungrouped_"] = {"spectra": [], "children": {}}
-                hierarchy["_ungrouped_"]["spectra"].append(spectrum)
-
-        return hierarchy
-
-    def has_grouping(self):
-        """Check if there is currently active grouping."""
-        return bool(self.selected_grouping_tags)
-
-    def get_grouping_tags(self):
-        """Get the current grouping tags."""
-        return self.selected_grouping_tags.copy()
+                if re.search(pattern, str(meta_val), re.IGNORECASE):
+                    return True
+            except re.error:
+                if pattern.lower() in str(meta_val).lower():
+                    return True
+        return False
 
 
-class MetadataEditor(ttk.Frame):
-    """Component for viewing and editing metadata."""
+# ---------------------------------------------------------------------------
+# MetadataEditor
+# ---------------------------------------------------------------------------
 
-    def __init__(self, parent, on_metadata_changed=None):
+
+class MetadataEditor(QWidget):
+    """Component for viewing and editing spectrum metadata."""
+
+    def __init__(
+        self,
+        parent=None,
+        on_metadata_changed=None,
+        on_set_spectrum_name=None,
+        on_filter_by_value=None,
+        on_add_grouping_tag=None,
+    ):
         super().__init__(parent)
-        self.parent = parent  # Store parent reference
-        self.on_metadata_changed = on_metadata_changed
+        self._on_metadata_changed_cb = on_metadata_changed
+        self._on_set_spectrum_name_cb = on_set_spectrum_name
+        self._on_filter_by_value_cb = on_filter_by_value
+        self._on_add_grouping_tag_cb = on_add_grouping_tag
         self.parser: Optional[MGFParser] = None
-        self.selected_spectrum_ids: List[int] = []
-        self.edit_var = tk.StringVar()
-        self.edit_entry = None
-        self.editing_item = None
-        self.editing_column = None
-        self._pending_selection: Optional[List[int]] = None
+        self.selected_spectrum_ids: List = []
+        self._pending_selection: Optional[List] = None
         self.metadata_groups: List[Dict[str, List[str]]] = []
         self._others_group_name = "others"
-
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the metadata editor widgets."""
-        # Header
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        # Main content area with horizontal split
-        content_frame = ttk.Frame(self)
-        content_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
 
-        # Create horizontal paned window
-        paned_window = ttk.PanedWindow(content_frame, orient="horizontal")
-        paned_window.pack(fill="both", expand=True)
+        # Left: metadata table
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self._metadata_tree = QTreeWidget()
+        self._metadata_tree.setHeaderLabels(["Group / Key", "Value", "Unique Values"])
+        self._metadata_tree.setColumnWidth(0, 180)
+        self._metadata_tree.setColumnWidth(1, 200)
+        self._metadata_tree.setColumnWidth(2, 120)
+        self._metadata_tree.setAlternatingRowColors(True)
+        self._metadata_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._metadata_tree.customContextMenuRequested.connect(self._on_right_click)
+        self._metadata_tree.itemDoubleClicked.connect(self._on_double_click)
+        self._metadata_tree.itemChanged.connect(self._on_item_changed)
+        left_layout.addWidget(self._metadata_tree)
+        splitter.addWidget(left)
 
-        # Left side: Metadata table
-        metadata_frame = ttk.LabelFrame(paned_window, text="Metadata", padding=5)
-        paned_window.add(metadata_frame, weight=4)
+        # Right: SMILES plot
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        self._smiles_fig = Figure(figsize=(4, 4), dpi=80)
+        self._smiles_canvas = FigureCanvasQTAgg(self._smiles_fig)
+        right_layout.addWidget(self._smiles_canvas)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
 
-        # Create treeview for metadata
-        columns = ("Key", "Value", "Unique Values")
-        self.metadata_tree = ttk.Treeview(
-            metadata_frame, columns=columns, show="tree headings", height=10
-        )
-
-        self.metadata_tree.heading("#0", text="Group")
-        self.metadata_tree.column("#0", width=180, anchor="w")
-
-        for col in columns:
-            self.metadata_tree.heading(col, text=col)
-            self.metadata_tree.column(col, width=150)
-
-        # Scrollbars for metadata table
-        v_scrollbar = ttk.Scrollbar(
-            metadata_frame, orient="vertical", command=self.metadata_tree.yview
-        )
-        h_scrollbar = ttk.Scrollbar(
-            metadata_frame, orient="horizontal", command=self.metadata_tree.xview
-        )
-
-        self.metadata_tree.configure(
-            yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set
-        )
-
-        self.metadata_tree.grid(row=0, column=0, sticky="nsew")
-        v_scrollbar.grid(row=0, column=1, sticky="ns")
-        h_scrollbar.grid(row=1, column=0, sticky="ew")
-
-        metadata_frame.grid_rowconfigure(0, weight=1)
-        metadata_frame.grid_columnconfigure(0, weight=1)
-
-        # Right side: SMILES structure plot
-        smiles_frame = ttk.LabelFrame(paned_window, text="SMILES Structure", padding=5)
-        paned_window.add(smiles_frame, weight=1)
-
-        # Create SMILES plot area
-        self._create_smiles_plot(smiles_frame)
-
-        # Instructions
-        instructions_frame = ttk.Frame(self)
-        instructions_frame.pack(fill="x", padx=5, pady=5)
-
-        # Bind selection and editing events
-        self.metadata_tree.bind("<<TreeviewSelect>>", self._on_metadata_selection)
-        self.metadata_tree.bind("<Double-1>", self._on_double_click)
-        self.metadata_tree.bind("<Button-1>", self._on_single_click)
-        self.metadata_tree.bind("<Button-3>", self._on_right_click)  # Right-click
-
-    def _create_smiles_plot(self, parent_frame):
-        """Create the SMILES structure plot area."""
-        # Create matplotlib figure for SMILES display
-        self.smiles_fig = Figure(figsize=(4, 4), dpi=100)
-        self.smiles_canvas = FigureCanvasTkAgg(self.smiles_fig, parent_frame)
-        self.smiles_canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        # Initially show empty plot with message
         self._show_smiles_message("No SMILES data available")
+        self._editing_item = None
+        self._editing_column = None
 
-    def _show_smiles_message(self, message):
-        """Show a text message in the SMILES plot area."""
-        self.smiles_fig.clear()
-        ax = self.smiles_fig.add_subplot(111)
+    # ------------------------------------------------------------------
+    def _show_smiles_message(self, msg: str):
+        self._smiles_fig.clear()
+        ax = self._smiles_fig.add_subplot(111)
         ax.text(
             0.5,
             0.5,
-            message,
+            msg,
             ha="center",
             va="center",
-            fontsize=10,
+            fontsize=9,
             wrap=True,
             transform=ax.transAxes,
         )
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
         ax.axis("off")
-        self.smiles_canvas.draw()
+        self._smiles_canvas.draw()
 
-    def _get_smiles_from_spectra(self, spectrum_ids):
-        """Extract SMILES codes from selected spectra."""
-        if not self.parser or not spectrum_ids:
-            return None, "No spectra selected"
-
-        # Common SMILES key names to check
-        smiles_keys = ["smiles", "SMILES", "Smiles", "smiles_code", "SMILES_CODE"]
-
-        smiles_values = []
-        found_key = None
-
-        for spectrum_id in spectrum_ids:
-            spectrum = next(
-                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
-            )
-            if not spectrum:
-                continue
-
-            # Find SMILES key in metadata
-            spectrum_smiles = None
-            for key in smiles_keys:
-                value = spectrum.get_metadata_value(key)
-                if value and value.strip():
-                    spectrum_smiles = value.strip()
-                    found_key = key
-                    break
-
-            if spectrum_smiles:
-                smiles_values.append(spectrum_smiles)
-            else:
-                smiles_values.append(None)
-
-        if not any(smiles_values):
-            return None, "No SMILES data found in selected spectra"
-
-        # Check if all non-None SMILES are the same
-        non_none_smiles = [s for s in smiles_values if s is not None]
-        if len(set(non_none_smiles)) > 1:
-            return None, f"Different SMILES codes found:\n" + "\n".join(
-                set(non_none_smiles)
-            ) + ("\n..." if len(set(non_none_smiles)) > 3 else "")
-
-        return non_none_smiles[0], None
-
-    def _plot_smiles(self, smiles_code):
-        """Plot a SMILES structure using RDKit."""
+    def _plot_smiles(self, smiles_code: str):
         if not RDKIT_AVAILABLE:
-            self._show_smiles_message("RDKit not available for SMILES plotting")
+            self._show_smiles_message("RDKit not available")
             return
-
         try:
-            # Parse SMILES
             mol = Chem.MolFromSmiles(smiles_code)
             if mol is None:
-                self._show_smiles_message(f"Invalid SMILES code:\n{smiles_code}")
+                self._show_smiles_message(f"Invalid SMILES:\n{smiles_code[:40]}")
                 return
-
-            # Get molecular formula from RDKit
-            molecular_formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
-
-            # Generate 2D coordinates
-            from rdkit.Chem import rdDepictor
-
-            rdDepictor.Compute2DCoords(mol)
-
-            # Create drawer
-            drawer = rdMolDraw2D.MolDraw2DCairo(400, 400)
+            drawer = rdMolDraw2D.MolDraw2DCairo(300, 300)
+            drawer.drawOptions().addStereoAnnotation = True
             drawer.DrawMolecule(mol)
             drawer.FinishDrawing()
-
-            # Get image data
-            img_data = drawer.GetDrawingText()
-
-            # Convert to matplotlib image
-            from PIL import Image
-            import io
-
-            img = Image.open(io.BytesIO(img_data))
-
-            # Clear figure and display image
-            self.smiles_fig.clear()
-            ax = self.smiles_fig.add_subplot(111)
-            ax.imshow(img)
+            png = drawer.GetDrawingText()
+            img = Image.open(io.BytesIO(png))
+            self._smiles_fig.clear()
+            ax = self._smiles_fig.add_subplot(111)
+            ax.imshow(np.array(img))
             ax.axis("off")
-
-            # Create title with SMILES and formula
-            title_text = f"SMILES: {smiles_code[:30]}{'...' if len(smiles_code) > 30 else ''}\nFormula: {molecular_formula}"
-            ax.set_title(
-                title_text,
-                fontsize=8,
-                pad=10,
-            )
-
-            self.smiles_canvas.draw()
-
+            self._smiles_canvas.draw()
         except Exception as e:
-            self._show_smiles_message(f"Error plotting SMILES:\n{str(e)}")
+            self._show_smiles_message(f"SMILES error:\n{e}")
 
-    def _update_smiles_plot(self):
-        """Update the SMILES plot based on current selection."""
-        smiles_code, error_msg = self._get_smiles_from_spectra(
-            self.selected_spectrum_ids
-        )
-
-        if error_msg:
-            self._show_smiles_message(error_msg)
-        elif smiles_code:
-            self._plot_smiles(smiles_code)
-
-    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
-        """Load metadata for selected spectra."""
+    # ------------------------------------------------------------------
+    def load_data(self, parser: MGFParser, ids: List):
         self.parser = parser
-        self.selected_spectrum_ids = selected_spectrum_ids
-        self._populate_metadata()
-        self._update_smiles_plot()
+        self.selected_spectrum_ids = ids
+        self._populate_tree()
+        self._update_smiles_display()
 
-    def set_metadata_groups(self, groups: List[Dict[str, Any]]):
-        """Update the configured metadata groups used for presentation order."""
-        cleaned_groups: List[Dict[str, List[str]]] = []
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            name = str(group.get("name", "")).strip()
-            keys_raw = group.get("keys", [])
-            if isinstance(keys_raw, list):
-                keys = [str(key).strip() for key in keys_raw if str(key).strip()]
-            elif isinstance(keys_raw, str):
-                keys = [part.strip() for part in keys_raw.split(",") if part.strip()]
-            else:
-                keys = []
-
-            if name:
-                cleaned_groups.append({"name": name, "keys": keys})
-
-        self.metadata_groups = cleaned_groups
-        self._populate_metadata()
-
-    def _prepare_metadata_row(
-        self,
-        key: str,
-        first_spectrum: Optional[Spectrum],
-        selected_spectra: List[Spectrum],
-    ) -> Tuple[str, str]:
-        """Create the value and unique summary strings for a metadata row."""
-        value = ""
-        if first_spectrum:
-            raw_value = first_spectrum.get_metadata_value(key)
-            value = raw_value if raw_value is not None else ""
-
-        unique_values = self._get_unique_values_for_selected_spectra(
-            key, selected_spectra
-        )
-
-        if len(unique_values) > 1:
-            unique_preview = "; ".join(
-                [f'"{v}"' if v else "<empty>" for v in unique_values[:5]]
-            )
-            if len(unique_values) > 5:
-                unique_preview += f" ... ({len(unique_values)} total)"
-        else:
-            unique_preview = ""
-
-        return value, unique_preview
-
-    def _populate_metadata(self):
-        """Populate the metadata table."""
-        # Clear existing items
-        for item in self.metadata_tree.get_children():
-            self.metadata_tree.delete(item)
+    def _populate_tree(self):
+        self._metadata_tree.blockSignals(True)
+        self._metadata_tree.clear()
 
         if not self.parser or not self.selected_spectrum_ids:
+            self._metadata_tree.blockSignals(False)
             return
 
-        # Get all metadata keys
-        all_keys = self.parser.get_all_metadata_keys()
-        # Get selected spectra objects
-        selected_spectra = [
+        spectra = [
             s
             for s in self.parser.spectra
             if s.spectrum_id in self.selected_spectrum_ids
         ]
 
-        first_spectrum = None
-        if self.selected_spectrum_ids:
-            first_spectrum = next(
-                (
-                    s
-                    for s in self.parser.spectra
-                    if s.spectrum_id == self.selected_spectrum_ids[0]
-                ),
-                None,
-            )
+        # Collect all keys and values
+        all_keys = set()
+        for s in spectra:
+            all_keys.update(s.metadata.keys())
 
-        remaining_keys = set(all_keys)
-        used_keys = set()
-
-        # Insert keys according to configured groups
-        for group in self.metadata_groups:
-            group_name = group.get("name", "") or self._others_group_name
-            keys = group.get("keys", [])
-
-            parent_id = None
-            for key in keys:
-                key_str = str(key).strip()
-                if not key_str or key_str in used_keys:
-                    continue
-
-                value, unique_str = self._prepare_metadata_row(
-                    key_str, first_spectrum, selected_spectra
-                )
-
-                if parent_id is None:
-                    parent_id = self.metadata_tree.insert("", "end", text=group_name)
-                    self.metadata_tree.item(parent_id, open=True)
-
-                self.metadata_tree.insert(
-                    parent_id, "end", text="", values=(key_str, value, unique_str)
-                )
-                used_keys.add(key_str)
-                remaining_keys.discard(key_str)
-
-            # Show empty group even if keys not present to reflect configuration
-            if parent_id is None:
-                parent_id = self.metadata_tree.insert("", "end", text=group_name)
-                self.metadata_tree.item(parent_id, open=True)
-
-        if remaining_keys:
-            others_id = self.metadata_tree.insert(
-                "", "end", text=self._others_group_name
-            )
-            self.metadata_tree.item(others_id, open=True)
-            for key in sorted(remaining_keys):
-                value, unique_str = self._prepare_metadata_row(
-                    key, first_spectrum, selected_spectra
-                )
-                self.metadata_tree.insert(
-                    others_id, "end", text="", values=(key, value, unique_str)
-                )
-
-    def _get_unique_values_for_selected_spectra(
-        self, key: str, selected_spectra: List[Spectrum]
-    ) -> List[str]:
-        """Get unique values for a key from only the selected spectra."""
-        values = set()
-        has_missing = False
-
-        for spectrum in selected_spectra:
-            if key in spectrum.metadata:
-                values.add(spectrum.metadata[key])
-            else:
-                has_missing = True
-
-        # Include empty string if any selected spectrum is missing this key
-        if has_missing:
-            values.add("")
-
-        return sorted(list(values))
-
-    def _on_metadata_selection(self, event):
-        """Handle metadata selection."""
-        # This can be used for future functionality if needed
-        pass
-
-    def _on_single_click(self, event):
-        """Handle single click to close any open editor."""
-        self._close_editor()
-
-    def _on_right_click(self, event):
-        """Handle right-click to show context menu."""
-        # Identify the item and column
-        item = self.metadata_tree.identify("item", event.x, event.y)
-        column = self.metadata_tree.identify("column", event.x, event.y)
-
-        if not item or column not in ("#1", "#2"):  # Only for Key or Value columns
-            return
-
-        values = self.metadata_tree.item(item, "values")
-        if not values:
-            return
-
-        key = values[0]
-        value = values[1]
-
-        # Create context menu
-        context_menu = tk.Menu(self, tearoff=0)
-
-        # Always show selection option for value column, including empty values
-        if column == "#2":  # Value column
-            display_value = value if value else "<empty>"
-            context_menu.add_command(
-                label=f"Select all with '{key}' = '{display_value}'",
-                command=lambda: self._select_spectra_by_value(key, value),
-            )
-
-        # Add options for key column
-        if column == "#1":  # Key column
-            context_menu.add_command(
-                label=f"Add '{key}' as grouping tag",
-                command=lambda: self._add_key_as_grouping_tag(key),
-            )
-            context_menu.add_command(
-                label=f"Set '{key}' as spectrum name",
-                command=lambda: self._set_key_as_spectrum_name(key),
-            )
-
-        # Show menu if it has items
-        if context_menu.index("end") is not None:
-            try:
-                context_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                context_menu.grab_release()
-
-    def _select_spectra_by_value(self, key: str, value: str):
-        """Select all spectra that have the specified key-value pair."""
-        if not self.parser:
-            return
-
-        total_spectra = len(self.parser.spectra)
-
-        # For very large datasets, warn user and ask for confirmation
-        if total_spectra > 5000:
-            result = messagebox.askyesno(
-                "Large Dataset Warning",
-                f"This dataset contains {total_spectra} spectra.\n"
-                f"Searching and selecting by value may take time and impact performance.\n\n"
-                f"Do you want to proceed?",
-            )
-            if not result:
-                return
-
-        # Show progress for large datasets
-        if total_spectra > 1000:
-            progress_dialog = self._create_progress_dialog("Searching spectra...")
-            self.update_idletasks()
-        else:
-            progress_dialog = None
-
-        try:
-            # Find all spectra with this key-value pair
-            matching_spectrum_ids = []
-            start_time = time.time()
-
-            for i, spectrum in enumerate(self.parser.spectra):
-                # Check for timeout (max 30 seconds)
-                if time.time() - start_time > 30:
-                    if progress_dialog:
-                        progress_dialog.destroy()
-                    messagebox.showwarning(
-                        "Search Timeout",
-                        f"Search timed out after checking {i} spectra.\n"
-                        f"Found {len(matching_spectrum_ids)} matches so far.\n"
-                        f"Consider using a smaller dataset or more specific search criteria.",
-                    )
-                    if matching_spectrum_ids:
-                        # Proceed with partial results
-                        break
-                    else:
-                        return
-
-                # Check if spectrum matches the search criteria
-                # Treat None (missing key) as empty string for comparison
-                spectrum_value = spectrum.get_metadata_value(key)
-                if spectrum_value is None:
-                    spectrum_value = ""
-
-                if spectrum_value == value:
-                    matching_spectrum_ids.append(spectrum.spectrum_id)
-
-                # Update progress for large datasets
-                if progress_dialog and i % 100 == 0:
-                    progress = (i / total_spectra) * 100
-                    progress_dialog.update_progress(
-                        progress,
-                        f"Checked {i}/{total_spectra} spectra\nFound {len(matching_spectrum_ids)} matches",
-                    )
-
-            if progress_dialog:
-                progress_dialog.destroy()
-
-            if matching_spectrum_ids:
-                # Check if selection is very large
-                if len(matching_spectrum_ids) > 1000:
-                    result = messagebox.askyesno(
-                        "Very Large Selection",
-                        f"Found {len(matching_spectrum_ids)} matching spectra.\n\n"
-                        f"Selecting this many spectra will significantly impact performance:\n"
-                        f"• Similarity calculations will be disabled\n"
-                        f"• Only subset will be shown in detailed views\n"
-                        f"• UI may become slow\n\n"
-                        f"Do you want to proceed?",
-                    )
-                    if not result:
-                        return
-                elif len(matching_spectrum_ids) > 500:
-                    result = messagebox.askyesno(
-                        "Large Selection",
-                        f"Found {len(matching_spectrum_ids)} matching spectra.\n"
-                        f"Selecting this many spectra may impact performance.\n\n"
-                        f"Do you want to proceed?",
-                    )
-                    if not result:
-                        return
-
-                # Trigger the selection callback to update the main application
-                if self.on_metadata_changed:
-                    # Store the matching IDs for the parent to handle
-                    self._pending_selection = matching_spectrum_ids
-                    print(
-                        f"Debug: Setting pending selection of {len(matching_spectrum_ids)} spectra"
-                    )
-                    self.on_metadata_changed()
-
-                    # Verify selection was applied (after a short delay)
-                    self.after(
-                        500,
-                        lambda: self._verify_selection_applied(matching_spectrum_ids),
-                    )
-            else:
-                display_value = value if value else "<empty>"
-                messagebox.showinfo(
-                    "No Matches", f"No spectra found with {key} = '{display_value}'"
-                )
-
-        except Exception as e:
-            if progress_dialog:
-                progress_dialog.destroy()
-            messagebox.showerror("Error", f"Error during search: {str(e)}")
-
-    def _verify_selection_applied(self, expected_ids):
-        """Verify that the selection was properly applied (debug method)."""
-        # This method can be removed once the issue is resolved
-        try:
-            # Get the current selection from the parent's spectrum tree
-            if hasattr(self.parent, "spectrum_tree"):
-                current_selection = (
-                    self.parent.spectrum_tree.get_selected_spectrum_ids()
-                )
-                if set(current_selection) != set(expected_ids):
-                    print(f"Debug: Selection mismatch!")
-                    print(f"  Expected: {len(expected_ids)} spectra")
-                    print(f"  Got: {len(current_selection)} spectra")
-                    print(
-                        f"  Tree grouped: {bool(self.parent.spectrum_tree.selected_grouping_tags)}"
-                    )
+        key_data: Dict[str, List[str]] = {k: [] for k in all_keys}
+        for s in spectra:
+            for k in all_keys:
+                val = s.metadata.get(k, "")
+                if val is not None:
+                    key_data[k].append(str(val))
                 else:
-                    print(
-                        f"Debug: Selection verified correctly ({len(current_selection)} spectra)"
-                    )
-        except Exception as e:
-            print(f"Debug: Could not verify selection: {e}")
+                    key_data[k].append("")
 
-    def _create_progress_dialog(self, title: str):
-        """Create a simple progress dialog."""
-        dialog = tk.Toplevel(self)
-        dialog.title(title)
-        dialog.geometry("300x100")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (300 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (100 // 2)
-        dialog.geometry(f"300x100+{x}+{y}")
-
-        # Progress label
-        dialog.progress_label = ttk.Label(dialog, text="Searching...")
-        dialog.progress_label.pack(pady=10)
-
-        # Progress bar
-        dialog.progress_bar = ttk.Progressbar(dialog, length=250, mode="determinate")
-        dialog.progress_bar.pack(pady=10)
-
-        def update_progress(percent, text=""):
-            dialog.progress_bar["value"] = percent
-            dialog.progress_label.config(text=text)
-            dialog.update_idletasks()
-
-        dialog.update_progress = update_progress
-        return dialog
-
-    def _on_double_click(self, event):
-        """Handle double click to start editing."""
-        item = self.metadata_tree.identify("item", event.x, event.y)
-        column = self.metadata_tree.identify("column", event.x, event.y)
-
-        if item and column in ("#1", "#2"):  # Key or Value columns
-            self._start_editing(item, column)
-
-    def _start_editing(self, item, column):
-        """Start inline editing of a cell."""
-        # Close any existing editor
-        self._close_editor()
-
-        # Get current value
-        values = self.metadata_tree.item(item, "values")
-        if not values:
-            return
-
-        current_value = values[0] if column == "#1" else values[1]
-        self.edit_var.set(current_value)
-
-        # Get cell position
-        bbox = self.metadata_tree.bbox(item, column)
-        if not bbox:
-            return
-
-        x, y, width, height = bbox
-
-        # Create entry widget
-        self.edit_entry = ttk.Entry(self.metadata_tree, textvariable=self.edit_var)
-        self.edit_entry.place(x=x, y=y, width=width, height=height)
-        self.edit_entry.focus()
-        self.edit_entry.select_range(0, tk.END)
-
-        # Store editing context
-        self.editing_item = item
-        self.editing_column = column
-
-        # Bind events
-        self.edit_entry.bind("<Return>", self._finish_editing)
-        self.edit_entry.bind("<Escape>", self._cancel_editing)
-        self.edit_entry.bind("<FocusOut>", self._cancel_editing)
-
-    def _close_editor(self):
-        """Close the inline editor."""
-        if self.edit_entry:
-            self.edit_entry.destroy()
-            self.edit_entry = None
-            self.editing_item = None
-            self.editing_column = None
-
-    def _cancel_editing(self, event=None):
-        """Cancel editing without saving."""
-        self._close_editor()
-
-    def _finish_editing(self, event=None):
-        """Finish editing and save changes."""
-        if not self.editing_item or not self.editing_column:
-            return
-
-        new_value = self.edit_var.get().strip()
-        values = self.metadata_tree.item(self.editing_item, "values")
-
-        if not values:
-            self._close_editor()
-            return
-
-        current_key = values[0]
-        current_value = values[1]
-
-        if self.editing_column == "#1":  # Editing key
-            self._handle_key_edit(current_key, new_value)
-        else:  # Editing value
-            self._handle_value_edit(current_key, new_value)
-
-        self._close_editor()
-
-    def _handle_key_edit(self, old_key: str, new_key: str):
-        """Handle editing of a metadata key."""
-        if not new_key or old_key == new_key:
-            return
-
-        if not self.parser:
-            return
-
-        # Check if new key already exists in any spectrum
-        existing_spectra_with_new_key = []
-        for spectrum in self.parser.spectra:
-            if new_key in spectrum.metadata:
-                existing_spectra_with_new_key.append(spectrum.spectrum_id)
-
-        # Ask user if they want to update for all spectra
-        message = f"Do you want to rename the key '{old_key}' to '{new_key}' for all loaded spectra?"
-        if not messagebox.askyesno("Rename Key", message):
-            return
-
-        if existing_spectra_with_new_key:
-            # New key already exists in some spectra
-            conflict_message = (
-                f"The key '{new_key}' already exists in {len(existing_spectra_with_new_key)} spectra.\n\n"
-                f"What would you like to do?\n\n"
-                f"• Update: Only rename '{old_key}' to '{new_key}' in spectra that don't have '{new_key}'\n"
-                f"• Merge: Combine values ('{old_key}' values will overwrite '{new_key}' values)\n"
-                f"• Abort: Cancel the operation"
-            )
-
-            result = messagebox.askyesnocancel(
-                "Key Conflict", conflict_message, title="Choose Action"
-            )
-
-            if result is None:  # Cancel
-                return
-            elif result:  # Yes - Update only
-                self._rename_key_selective(
-                    old_key, new_key, existing_spectra_with_new_key
-                )
-            else:  # No - Merge
-                self._rename_key_merge(old_key, new_key)
-        else:
-            # No conflict, rename for all spectra
-            self._rename_key_all(old_key, new_key)
-
-    def _rename_key_selective(
-        self, old_key: str, new_key: str, exclude_spectrum_ids: List[int]
-    ):
-        """Rename key only in spectra that don't have the new key."""
-        for spectrum in self.parser.spectra:
-            if spectrum.spectrum_id not in exclude_spectrum_ids:
-                if old_key in spectrum.metadata:
-                    spectrum.rename_metadata_key(old_key, new_key)
-
-        # Add empty key for spectra that don't have the old key
-        for spectrum in self.parser.spectra:
-            if (
-                spectrum.spectrum_id not in exclude_spectrum_ids
-                and new_key not in spectrum.metadata
-            ):
-                spectrum.add_metadata(new_key, "")
-
-        self._refresh_after_change()
-
-    def _rename_key_merge(self, old_key: str, new_key: str):
-        """Merge keys, with old_key values overwriting new_key values."""
-        for spectrum in self.parser.spectra:
-            if old_key in spectrum.metadata:
-                old_value = spectrum.metadata[old_key]
-                spectrum.metadata[new_key] = old_value
-                del spectrum.metadata[old_key]
-            elif new_key not in spectrum.metadata:
-                spectrum.add_metadata(new_key, "")
-
-        self._refresh_after_change()
-
-    def _rename_key_all(self, old_key: str, new_key: str):
-        """Rename key for all spectra."""
-        for spectrum in self.parser.spectra:
-            if old_key in spectrum.metadata:
-                spectrum.rename_metadata_key(old_key, new_key)
+        # Group keys
+        def make_group_item(label: str, parent=None) -> QTreeWidgetItem:
+            if parent is None:
+                item = QTreeWidgetItem(self._metadata_tree)
             else:
-                spectrum.add_metadata(new_key, "")
+                item = QTreeWidgetItem(parent)
+            item.setText(0, label)
+            item.setData(0, Qt.ItemDataRole.UserRole, None)
+            font = item.font(0)
+            font.setBold(True)
+            item.setFont(0, font)
+            return item
 
-        self._refresh_after_change()
+        def make_key_item(key: str, values: List[str], parent: QTreeWidgetItem):
+            item = QTreeWidgetItem(parent)
+            item.setText(0, key)
+            item.setData(0, Qt.ItemDataRole.UserRole, key)
+            unique_vals = sorted(set(v for v in values if v))
+            display_val = (
+                values[0] if len(set(v for v in values if v)) <= 1 else "<multiple>"
+            )
+            item.setText(1, display_val if display_val else "")
+            item.setText(2, str(len(unique_vals)))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+            return item
 
-    def _handle_value_edit(self, key: str, new_value: str):
-        """Handle editing of a metadata value."""
+        grouped_keys: set = set()
+        if self.metadata_groups:
+            for group_def in self.metadata_groups:
+                for group_name, keys in group_def.items():
+                    group_item = make_group_item(group_name)
+                    for k in keys:
+                        if k in key_data:
+                            make_key_item(k, key_data[k], group_item)
+                            grouped_keys.add(k)
+
+        remaining = sorted(all_keys - grouped_keys)
+        if remaining:
+            if self.metadata_groups:
+                others_item = make_group_item(self._others_group_name)
+                for k in remaining:
+                    make_key_item(k, key_data[k], others_item)
+            else:
+                for k in remaining:
+                    make_key_item(
+                        k, key_data[k], self._metadata_tree.invisibleRootItem()
+                    )
+
+        self._metadata_tree.expandAll()
+        self._metadata_tree.blockSignals(False)
+
+    def _update_smiles_display(self):
         if not self.parser or not self.selected_spectrum_ids:
+            self._show_smiles_message("No spectra selected")
             return
+        smiles_keys = ["smiles", "SMILES", "Smiles", "smiles_code", "SMILES_CODE"]
+        # Collect unique SMILES (preserving order) across selected spectra, up to 9
+        seen: set = set()
+        unique_smiles: List[str] = []
+        for sid in self.selected_spectrum_ids:
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == sid), None
+            )
+            if not spectrum:
+                continue
+            for k in smiles_keys:
+                v = spectrum.get_metadata_value(k)
+                if v and v.strip() and v.strip() not in seen:
+                    seen.add(v.strip())
+                    unique_smiles.append(v.strip())
+            if len(unique_smiles) >= 9:
+                break
+        if unique_smiles:
+            self._plot_smiles_grid(unique_smiles[:9])
+        else:
+            self._show_smiles_message("No SMILES data found")
 
-        # Update value in all selected spectra
-        for spectrum in self.parser.spectra:
-            if spectrum.spectrum_id in self.selected_spectrum_ids:
-                # Always update the metadata - even if new_value is empty string
-                spectrum.metadata[key] = new_value
-
-        self._refresh_after_change()
-
-    def _refresh_after_change(self):
-        """Refresh the view after metadata changes."""
-        self._populate_metadata()
-        if self.on_metadata_changed:
-            self.on_metadata_changed()
-
-    def _add_key_as_grouping_tag(self, key: str):
-        """Add the selected key as a grouping tag in the spectrum tree view."""
-        # Find the spectrum tree view in the parent application
-        root = self.winfo_toplevel()
-        spectrum_tree = self._find_spectrum_tree_view(root)
-
-        if spectrum_tree:
-            # Get current grouping tags
-            current_tags = spectrum_tree.tag_var.get().strip()
-
-            # Add the new key if it's not already present
-            if current_tags:
-                tags = [tag.strip() for tag in current_tags.split(",")]
-                if key not in tags:
-                    tags.append(key)
-                    new_tags = ", ".join(tags)
-                else:
-                    messagebox.showinfo(
-                        "Already Added", f"Key '{key}' is already in grouping tags."
+    def _plot_smiles_grid(self, smiles_list: List[str]):
+        if not RDKIT_AVAILABLE:
+            self._show_smiles_message("RDKit not available")
+            return
+        n = len(smiles_list)
+        # Determine grid size (up to 3×3)
+        cols = min(n, 3)
+        rows = (n + cols - 1) // cols
+        cell_px = 200
+        self._smiles_fig.clear()
+        self._smiles_fig.set_size_inches(cols * (cell_px / 80), rows * (cell_px / 80))
+        for idx, smiles_code in enumerate(smiles_list):
+            ax = self._smiles_fig.add_subplot(rows, cols, idx + 1)
+            try:
+                mol = Chem.MolFromSmiles(smiles_code)
+                if mol is None:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "Invalid\nSMILES",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        transform=ax.transAxes,
                     )
-                    return
-            else:
-                new_tags = key
-
-            # Update the tag entry
-            spectrum_tree.tag_var.set(new_tags)
-            spectrum_tree._on_tag_entry_change()
-
-        else:
-            messagebox.showwarning("Error", "Could not find spectrum tree view.")
-
-    def _set_key_as_spectrum_name(self, key: str):
-        """Set the selected key as the spectrum naming scheme."""
-        # Try to get the main app through the callback
-        main_app = None
-
-        # First try: use the callback to find the main app
-        if self.on_metadata_changed and hasattr(self.on_metadata_changed, "__self__"):
-            potential_app = self.on_metadata_changed.__self__
-            if hasattr(potential_app, "spectrum_name_var") and hasattr(
-                potential_app, "spectrum_tree"
-            ):
-                main_app = potential_app
-
-        # Second try: search through widget hierarchy
-        if not main_app:
-            main_app = self._find_main_app(self.winfo_toplevel())
-
-        if main_app and hasattr(main_app, "spectrum_name_var"):
-            # Check if this key exists as a naming option
-            # First, we need to ensure the key is added to available naming options
-            if hasattr(main_app, "spectrum_tree") and hasattr(
-                main_app.spectrum_tree, "parser"
-            ):
-                parser = main_app.spectrum_tree.parser
-                if parser:
-                    # Add this key to the spectrum naming menu if it doesn't exist
-                    self._add_naming_option_if_missing(main_app, key)
-
-                    # Set the naming scheme
-                    main_app.spectrum_name_var.set(key)
-                    main_app._update_spectrum_names()
-
                 else:
-                    messagebox.showwarning("Error", "No data loaded.")
-            else:
-                messagebox.showwarning("Error", "Could not access spectrum data.")
-        else:
-            messagebox.showwarning("Error", "Could not find main application.")
-
-    def _find_spectrum_tree_view(self, widget):
-        """Recursively find the SpectrumTreeView widget."""
-        if isinstance(widget, SpectrumTreeView):
-            return widget
-
-        for child in widget.winfo_children():
-            result = self._find_spectrum_tree_view(child)
-            if result:
-                return result
-        return None
-
-    def _find_main_app(self, widget):
-        """Find the main application instance."""
-        # First, try to find the main app through the widget hierarchy
-        current = widget
-        while current:
-            # Check if this widget has the main app attributes
-            if hasattr(current, "spectrum_name_var") and hasattr(
-                current, "spectrum_tree"
-            ):
-                return current
-
-            # Check if current has a reference to main app via callbacks
-            if hasattr(current, "on_metadata_changed") and current.on_metadata_changed:
-                # The callback is likely bound to the main app
-                try:
-                    # Get the instance that the callback method is bound to
-                    if hasattr(current.on_metadata_changed, "__self__"):
-                        potential_app = current.on_metadata_changed.__self__
-                        if hasattr(potential_app, "spectrum_name_var") and hasattr(
-                            potential_app, "spectrum_tree"
-                        ):
-                            return potential_app
-                except:
-                    pass
-
-            # Try the parent widget
-            try:
-                current = current.master
-            except:
-                current = None
-
-        # If we can't find it through hierarchy, try a different approach
-        # Look through all top-level windows
-        root = self.winfo_toplevel()
-        try:
-            # Check all children of the root window
-            for child in root.winfo_children():
-                if hasattr(child, "spectrum_name_var") and hasattr(
-                    child, "spectrum_tree"
-                ):
-                    return child
-                # Recursively check children
-                result = self._search_for_main_app_in_children(child)
-                if result:
-                    return result
-        except:
-            pass
-
-        return None
-
-    def _search_for_main_app_in_children(self, widget):
-        """Recursively search for main app in widget children."""
-        try:
-            if hasattr(widget, "spectrum_name_var") and hasattr(
-                widget, "spectrum_tree"
-            ):
-                return widget
-
-            for child in widget.winfo_children():
-                result = self._search_for_main_app_in_children(child)
-                if result:
-                    return result
-        except:
-            pass
-        return None
-
-    def _add_naming_option_if_missing(self, main_app, key: str):
-        """Add a naming option to the spectrum name menu if it doesn't exist."""
-        if hasattr(main_app, "spectrum_name_menu"):
-            menu = main_app.spectrum_name_menu
-
-            # Check if the option already exists
-            try:
-                last_index = menu.index("end")
-                if last_index is not None:
-                    for i in range(last_index + 1):
-                        try:
-                            label = menu.entrycget(i, "label")
-                            if label == key:
-                                return  # Already exists
-                        except:
-                            continue
-
-                # Add the new option
-                menu.add_radiobutton(
-                    label=key,
-                    variable=main_app.spectrum_name_var,
-                    value=key,
-                    command=main_app._update_spectrum_names,
+                    drawer = rdMolDraw2D.MolDraw2DCairo(cell_px, cell_px)
+                    drawer.drawOptions().addStereoAnnotation = True
+                    drawer.DrawMolecule(mol)
+                    drawer.FinishDrawing()
+                    png = drawer.GetDrawingText()
+                    img = Image.open(io.BytesIO(png))
+                    ax.imshow(np.array(img))
+            except Exception as e:
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"Error:\n{e}",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    transform=ax.transAxes,
+                    wrap=True,
                 )
-            except:
-                # If there's an error with the menu, ignore it
-                pass
+            ax.axis("off")
+        self._smiles_fig.tight_layout(pad=0.2)
+        self._smiles_canvas.draw()
 
-    def get_pending_selection(self) -> Optional[List[int]]:
-        """Get and clear any pending selection."""
-        if self._pending_selection:
-            selection = self._pending_selection
+    def _on_double_click(self, item: QTreeWidgetItem, column: int):
+        if item.data(0, Qt.ItemDataRole.UserRole) is None:
+            return  # group node
+        if column in (0, 1):
+            self._metadata_tree.editItem(item, column)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int):
+        key_data = item.data(0, Qt.ItemDataRole.UserRole)
+        if key_data is None:
+            return
+        if column == 1 and self.parser:
+            new_value = item.text(1)
+            original_key = item.text(0)
+            for s in self.parser.spectra:
+                if s.spectrum_id in self.selected_spectrum_ids:
+                    s.metadata[original_key] = new_value
+            if self._on_metadata_changed_cb:
+                self._on_metadata_changed_cb()
+
+    def _on_right_click(self, pos):
+        item = self._metadata_tree.itemAt(pos)
+        if not item:
+            return
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        if key is None:
+            return
+        menu = QMenu(self)
+        act_select = menu.addAction("Select by value")
+        act_filter = menu.addAction("Filter by value")
+        act_group = menu.addAction("Add as grouping tag")
+        act_name = menu.addAction("Set as spectrum name")
+        action = menu.exec(self._metadata_tree.viewport().mapToGlobal(pos))
+        if action == act_select:
+            self._select_by_value(item)
+        elif action == act_filter:
+            self._filter_by_value(item)
+        elif action == act_group:
+            self._add_as_grouping_tag(key)
+        elif action == act_name:
+            self._set_as_spectrum_name(key)
+
+    def _select_by_value(self, item: QTreeWidgetItem):
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        value = item.text(1)
+        if not self.parser or key is None:
+            return
+        matching = [
+            s.spectrum_id
+            for s in self.parser.spectra
+            if str(s.metadata.get(key, "")) == value
+        ]
+        self._pending_selection = matching
+        if self._on_metadata_changed_cb:
+            self._on_metadata_changed_cb()
+
+    def _filter_by_value(self, item: QTreeWidgetItem):
+        key = item.data(0, Qt.ItemDataRole.UserRole)
+        value = item.text(1)
+        if key is None:
+            return
+        filter_text = f"$${key}:{value}"
+        if self._on_filter_by_value_cb:
+            self._on_filter_by_value_cb(filter_text)
+
+    def _add_as_grouping_tag(self, key: str):
+        if self._on_add_grouping_tag_cb:
+            self._on_add_grouping_tag_cb(key)
+
+    def _set_as_spectrum_name(self, key: str):
+        if self._on_set_spectrum_name_cb:
+            self._on_set_spectrum_name_cb(key)
+        elif self._on_metadata_changed_cb:
+            self._on_metadata_changed_cb()
+
+    def set_metadata_groups(self, groups: List[Dict[str, List[str]]]):
+        self.metadata_groups = groups
+
+    def get_pending_selection(self) -> Optional[List]:
+        if self._pending_selection is not None:
+            sel = self._pending_selection
             self._pending_selection = None
-            return selection
+            return sel
         return None
 
     def clear(self):
-        """Clear the metadata editor and reset to empty state."""
-        # Clear the metadata tree
-        for item in self.metadata_tree.get_children():
-            self.metadata_tree.delete(item)
-
-        # Clear the SMILES plot
+        self._metadata_tree.clear()
         self._show_smiles_message("No spectra selected")
-
-        # Reset state
         self.parser = None
         self.selected_spectrum_ids = []
         self._pending_selection = None
 
-        # Close any open editor
-        self._close_editor()
+
+# ---------------------------------------------------------------------------
+# AddKeyValueDialog
+# ---------------------------------------------------------------------------
 
 
-class AddKeyValueDialog:
-    """Dialog for adding new key-value pairs."""
+class AddKeyValueDialog(QDialog):
+    """Dialog for adding a new key-value pair to spectra."""
 
-    def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List[int]):
-        self.parent = parent
+    def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List):
+        super().__init__(parent)
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
         self.result = None
+        self.setWindowTitle("Add New Key-Value Pair")
+        self.setMinimumWidth(400)
+        self._build_ui()
+        self.exec()
 
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Add New Key-Value Pair")
-        self.dialog.geometry("400x200")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
 
-        # Center the dialog
-        self.dialog.geometry(
-            "+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50)
-        )
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Key Name:"), 0, 0)
+        self._key_edit = QLineEdit()
+        grid.addWidget(self._key_edit, 0, 1)
 
-        self._create_widgets()
-        self.dialog.wait_window()
+        grid.addWidget(QLabel("Value:"), 1, 0)
+        self._value_edit = QLineEdit()
+        grid.addWidget(self._value_edit, 1, 1)
 
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # Key input
-        ttk.Label(main_frame, text="Key Name:").grid(
-            row=0, column=0, sticky="w", pady=5
-        )
-        self.key_var = tk.StringVar()
-        key_entry = ttk.Entry(main_frame, textvariable=self.key_var, width=30)
-        key_entry.grid(row=0, column=1, padx=(10, 0), pady=5)
-        key_entry.focus()
-
-        # Value input
-        ttk.Label(main_frame, text="Value:").grid(row=1, column=0, sticky="w", pady=5)
-        self.value_var = tk.StringVar()
-        value_entry = ttk.Entry(main_frame, textvariable=self.value_var, width=30)
-        value_entry.grid(row=1, column=1, padx=(10, 0), pady=5)
-
-        # Scope selection
-        ttk.Label(main_frame, text="Apply to:").grid(
-            row=2, column=0, sticky="w", pady=5
-        )
-        self.scope_var = tk.StringVar(value="selected")
-        scope_frame = ttk.Frame(main_frame)
-        scope_frame.grid(row=2, column=1, padx=(10, 0), pady=5, sticky="w")
-
-        selected_text = (
+        grid.addWidget(QLabel("Apply to:"), 2, 0)
+        scope_widget = QWidget()
+        scope_layout = QVBoxLayout(scope_widget)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        self._rb_selected = QRadioButton(
             f"Selected spectra ({len(self.selected_spectrum_ids)})"
-            if self.selected_spectrum_ids
-            else "Selected spectra (none)"
         )
-        ttk.Radiobutton(
-            scope_frame, text=selected_text, variable=self.scope_var, value="selected"
-        ).pack(anchor="w")
-        ttk.Radiobutton(
-            scope_frame,
-            text=f"All loaded spectra ({len(self.parser.spectra)})",
-            variable=self.scope_var,
-            value="all",
-        ).pack(anchor="w")
+        self._rb_all = QRadioButton(f"All loaded spectra ({len(self.parser.spectra)})")
+        self._rb_selected.setChecked(True)
+        scope_layout.addWidget(self._rb_selected)
+        scope_layout.addWidget(self._rb_all)
+        grid.addWidget(scope_widget, 2, 1)
+        layout.addLayout(grid)
 
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
-
-        ttk.Button(button_frame, text="Add", command=self._add_key_value).pack(
-            side="left", padx=5
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
-            side="left", padx=5
-        )
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        self._key_edit.setFocus()
 
-        # Bind Enter key
-        self.dialog.bind("<Return>", lambda e: self._add_key_value())
-        self.dialog.bind("<Escape>", lambda e: self._cancel())
-
-    def _add_key_value(self):
-        """Add the new key-value pair."""
-        key = self.key_var.get().strip()
-        value = self.value_var.get().strip()
-        scope = self.scope_var.get()
-
+    def _on_ok(self):
+        key = self._key_edit.text().strip()
+        value = self._value_edit.text().strip()
         if not key:
-            messagebox.showerror("Error", "Key name cannot be empty")
+            QMessageBox.critical(self, "Error", "Key name cannot be empty.")
             return
-
-        # Check if key already exists
-        existing_keys = self.parser.get_all_metadata_keys()
-        if key in existing_keys:
-            if not messagebox.askyesno(
+        existing = self.parser.get_all_metadata_keys()
+        if key in existing:
+            ans = QMessageBox.question(
+                self,
                 "Key Exists",
-                f"Key '{key}' already exists. Do you want to update its value?",
-            ):
+                f"Key '{key}' already exists. Update its value?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
                 return
-
-        # Apply to selected scope
-        if scope == "selected":
+        if self._rb_selected.isChecked():
             if not self.selected_spectrum_ids:
-                messagebox.showwarning("Warning", "No spectra selected")
+                QMessageBox.warning(self, "Warning", "No spectra selected.")
                 return
             target_ids = self.selected_spectrum_ids
         else:
             target_ids = [s.spectrum_id for s in self.parser.spectra]
-
-        # Add/update the key-value pair
-        for spectrum in self.parser.spectra:
-            if spectrum.spectrum_id in target_ids:
-                spectrum.metadata[key] = value
-
+        for s in self.parser.spectra:
+            if s.spectrum_id in target_ids:
+                s.metadata[key] = value
         self.result = True
-        self.dialog.destroy()
-
-    def _cancel(self):
-        """Cancel the dialog."""
-        self.result = False
-        self.dialog.destroy()
+        self.accept()
 
 
-class RegexEditorDialog:
-    """Dialog for regex-based metadata editing."""
+# ---------------------------------------------------------------------------
+# RegexEditorDialog
+# ---------------------------------------------------------------------------
+
+
+class RegexEditorDialog(QDialog):
+    """Dialog for regex-based bulk metadata editing."""
 
     def __init__(self, parent, parser: MGFParser):
-        self.parent = parent
+        super().__init__(parent)
         self.parser = parser
         self.changes_made = False
-        self.current_key = None
-        self.value_data = {}  # {value: {'count': int, 'updated': str}}
-
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Regex Metadata Editor")
-        self.dialog.geometry("900x600")
-        self.dialog.resizable(True, True)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-
-        # Center the dialog
-        self.dialog.geometry(
-            "+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50)
-        )
-
-        self._create_widgets()
+        self.current_key: Optional[str] = None
+        self.value_data: Dict = {}
+        self.setWindowTitle("Regex Metadata Editor")
+        self.resize(900, 600)
+        self._build_ui()
         self._populate_keys()
-        self.dialog.wait_window()
+        self.exec()
 
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
+    def _build_ui(self):
+        layout = QHBoxLayout(self)
 
-        # Top frame with three columns
-        top_frame = ttk.Frame(main_frame)
-        top_frame.pack(fill="both", expand=True, pady=(0, 10))
+        # Keys list
+        keys_box = QGroupBox("Metadata Keys")
+        keys_layout = QVBoxLayout(keys_box)
+        self._keys_list = QListWidget()
+        self._keys_list.currentRowChanged.connect(self._on_key_changed)
+        keys_layout.addWidget(self._keys_list)
+        layout.addWidget(keys_box, 1)
 
-        # Left column - Keys list
-        keys_frame = ttk.LabelFrame(top_frame, text="Metadata Keys", padding=5)
-        keys_frame.pack(side="left", fill="y", padx=(0, 5))
+        # Values table
+        values_box = QGroupBox("Values")
+        values_layout = QVBoxLayout(values_box)
+        self._values_tree = QTreeWidget()
+        self._values_tree.setHeaderLabels(["Original Value", "Count", "Updated Value"])
+        self._values_tree.setColumnWidth(0, 200)
+        self._values_tree.setColumnWidth(1, 60)
+        self._values_tree.setColumnWidth(2, 200)
+        values_layout.addWidget(self._values_tree)
+        layout.addWidget(values_box, 2)
 
-        # Keys listbox with scrollbar
-        keys_container = ttk.Frame(keys_frame)
-        keys_container.pack(fill="both", expand=True)
+        # Right panel: regex editor
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
 
-        self.keys_listbox = tk.Listbox(keys_container, width=20, height=20)
-        keys_scrollbar = ttk.Scrollbar(
-            keys_container, orient="vertical", command=self.keys_listbox.yview
-        )
-        self.keys_listbox.configure(yscrollcommand=keys_scrollbar.set)
+        regex_box = QGroupBox("Regex Replace")
+        regex_inner = QGridLayout(regex_box)
+        regex_inner.addWidget(QLabel("Pattern:"), 0, 0)
+        self._pattern_edit = QLineEdit()
+        regex_inner.addWidget(self._pattern_edit, 0, 1)
+        regex_inner.addWidget(QLabel("Replacement:"), 1, 0)
+        self._replacement_edit = QLineEdit()
+        regex_inner.addWidget(self._replacement_edit, 1, 1)
+        self._preview_btn = QPushButton("Preview")
+        self._preview_btn.clicked.connect(self._preview_changes)
+        regex_inner.addWidget(self._preview_btn, 2, 0)
+        self._apply_btn = QPushButton("Apply")
+        self._apply_btn.clicked.connect(self._apply_changes)
+        regex_inner.addWidget(self._apply_btn, 2, 1)
+        right_layout.addWidget(regex_box)
 
-        self.keys_listbox.pack(side="left", fill="both", expand=True)
-        keys_scrollbar.pack(side="right", fill="y")
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        right_layout.addWidget(close_btn)
+        right_layout.addStretch()
 
-        self.keys_listbox.bind("<<ListboxSelect>>", self._on_key_selection)
-
-        # Middle column - Values table
-        values_frame = ttk.LabelFrame(top_frame, text="Values", padding=5)
-        values_frame.pack(side="left", fill="both", expand=True, padx=5)
-
-        # Values treeview
-        columns = ("Original Value", "Count", "Updated Value")
-        self.values_tree = ttk.Treeview(
-            values_frame, columns=columns, show="headings", height=20
-        )
-
-        for col in columns:
-            self.values_tree.heading(col, text=col)
-
-        # Set column widths
-        self.values_tree.column("Original Value", width=200)
-        self.values_tree.column("Count", width=80)
-        self.values_tree.column("Updated Value", width=200)
-
-        # Scrollbars for values tree
-        values_v_scrollbar = ttk.Scrollbar(
-            values_frame, orient="vertical", command=self.values_tree.yview
-        )
-        values_h_scrollbar = ttk.Scrollbar(
-            values_frame, orient="horizontal", command=self.values_tree.xview
-        )
-
-        self.values_tree.configure(
-            yscrollcommand=values_v_scrollbar.set, xscrollcommand=values_h_scrollbar.set
-        )
-
-        self.values_tree.grid(row=0, column=0, sticky="nsew")
-        values_v_scrollbar.grid(row=0, column=1, sticky="ns")
-        values_h_scrollbar.grid(row=1, column=0, sticky="ew")
-
-        values_frame.grid_rowconfigure(0, weight=1)
-        values_frame.grid_columnconfigure(0, weight=1)
-
-        # Bottom frame - Regex editor
-        regex_frame = ttk.LabelFrame(main_frame, text="Regex Editor", padding=5)
-        regex_frame.pack(fill="x", pady=(0, 10))
-
-        # Regex pattern input
-        pattern_frame = ttk.Frame(regex_frame)
-        pattern_frame.pack(fill="x", pady=5)
-
-        ttk.Label(pattern_frame, text="Search Pattern (regex):").pack(anchor="w")
-        self.pattern_var = tk.StringVar()
-        self.pattern_entry = ttk.Entry(
-            pattern_frame, textvariable=self.pattern_var, width=80
-        )
-        self.pattern_entry.pack(fill="x", pady=2)
-
-        # Replacement input
-        replacement_frame = ttk.Frame(regex_frame)
-        replacement_frame.pack(fill="x", pady=5)
-
-        ttk.Label(replacement_frame, text="Replacement:").pack(anchor="w")
-        self.replacement_var = tk.StringVar()
-        self.replacement_entry = ttk.Entry(
-            replacement_frame, textvariable=self.replacement_var, width=80
-        )
-        self.replacement_entry.pack(fill="x", pady=2)
-
-        # Regex options
-        options_frame = ttk.Frame(regex_frame)
-        options_frame.pack(fill="x", pady=5)
-
-        self.ignore_case_var = tk.BooleanVar()
-        ttk.Checkbutton(
-            options_frame, text="Ignore case", variable=self.ignore_case_var
-        ).pack(side="left", padx=(0, 10))
-
-        self.multiline_var = tk.BooleanVar()
-        ttk.Checkbutton(
-            options_frame, text="Multiline", variable=self.multiline_var
-        ).pack(side="left", padx=(0, 10))
-
-        # Buttons for regex operations
-        regex_buttons_frame = ttk.Frame(regex_frame)
-        regex_buttons_frame.pack(fill="x", pady=5)
-
-        ttk.Button(
-            regex_buttons_frame, text="Preview", command=self._preview_regex
-        ).pack(side="left", padx=(0, 5))
-        ttk.Button(regex_buttons_frame, text="Apply", command=self._apply_regex).pack(
-            side="left", padx=(0, 5)
-        )
-        ttk.Button(regex_buttons_frame, text="Reset", command=self._reset_values).pack(
-            side="left", padx=(0, 5)
-        )
-
-        # Examples
-        examples_frame = ttk.Frame(regex_frame)
-        examples_frame.pack(fill="x", pady=5)
-
-        ttk.Label(examples_frame, text="Examples:", font=("Arial", 9, "bold")).pack(
-            anchor="w"
-        )
-        examples_text = (
-            "• Remove prefix: ^prefix_ → (empty)\n"
-            "• Replace spaces: \\s+ → _\n"
-            "• Extract numbers: .*?([0-9]+).* → \\1\n"
-            "• Add suffix: (.*) → \\1_new"
-        )
-        ttk.Label(
-            examples_frame, text=examples_text, font=("Arial", 8), foreground="gray"
-        ).pack(anchor="w")
-
-        # Bottom buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x")
-
-        ttk.Button(button_frame, text="Close", command=self._close_dialog).pack(
-            side="right", padx=5
-        )
-
-        # Bind Enter key for quick preview
-        self.pattern_entry.bind("<KeyRelease>", self._on_pattern_change)
-        self.replacement_entry.bind("<KeyRelease>", self._on_pattern_change)
+        layout.addWidget(right_panel, 1)
 
     def _populate_keys(self):
-        """Populate the keys listbox."""
-        all_keys = self.parser.get_all_metadata_keys()
-        for key in all_keys:
-            self.keys_listbox.insert(tk.END, key)
-
-    def _on_key_selection(self, event):
-        """Handle key selection."""
-        selection = self.keys_listbox.curselection()
-        if not selection:
+        if not self.parser:
             return
+        for key in sorted(self.parser.get_all_metadata_keys()):
+            self._keys_list.addItem(key)
 
-        key = self.keys_listbox.get(selection[0])
-        self.current_key = key
-        self._load_values_for_key(key)
-
-    def _load_values_for_key(self, key: str):
-        """Load and display values for the selected key."""
-        # Clear existing data
-        for item in self.values_tree.get_children():
-            self.values_tree.delete(item)
-
-        self.value_data.clear()
-
-        # Count unique values
-        value_counts = {}
-        for spectrum in self.parser.spectra:
-            value = spectrum.get_metadata_value(key)
-            if value is not None:
-                value_counts[value] = value_counts.get(value, 0) + 1
-
-        # Store and display data
-        for value, count in sorted(value_counts.items()):
-            self.value_data[value] = {"count": count, "updated": value}
-            self.values_tree.insert("", "end", values=(value, count, value))
-
-    def _on_pattern_change(self, event=None):
-        """Handle pattern or replacement changes - auto preview if both fields have content."""
-        if self.pattern_var.get().strip() and self.replacement_var.get().strip():
-            self._preview_regex()
-
-    def _preview_regex(self):
-        """Preview the regex transformation."""
-        if not self.current_key or not self.value_data:
+    def _on_key_changed(self, row: int):
+        if row < 0:
             return
+        self.current_key = self._keys_list.item(row).text()
+        self._populate_values()
 
-        pattern = self.pattern_var.get()
-        replacement = self.replacement_var.get()
-
-        if not pattern:
-            messagebox.showwarning("Warning", "Please enter a search pattern.")
+    def _populate_values(self):
+        self._values_tree.clear()
+        if not self.current_key or not self.parser:
             return
+        counts: Dict[str, int] = {}
+        for s in self.parser.spectra:
+            val = s.metadata.get(self.current_key, "")
+            if val is not None:
+                counts[str(val)] = counts.get(str(val), 0) + 1
+        for val, cnt in sorted(counts.items()):
+            item = QTreeWidgetItem(self._values_tree)
+            item.setText(0, val)
+            item.setText(1, str(cnt))
+            item.setText(2, val)
 
+    def _preview_changes(self):
+        pattern = self._pattern_edit.text()
+        replacement = self._replacement_edit.text()
+        if not pattern or not self.current_key:
+            return
         try:
-            # Compile regex with options
-            flags = 0
-            if self.ignore_case_var.get():
-                flags |= re.IGNORECASE
-            if self.multiline_var.get():
-                flags |= re.MULTILINE
-
-            compiled_pattern = re.compile(pattern, flags)
-
-            # Update the tree with preview
-            for item in self.values_tree.get_children():
-                values = self.values_tree.item(item, "values")
-                original_value = values[0]
-
-                try:
-                    updated_value = compiled_pattern.sub(replacement, original_value)
-                    self.value_data[original_value]["updated"] = updated_value
-
-                    # Update tree display
-                    self.values_tree.item(
-                        item, values=(original_value, values[1], updated_value)
-                    )
-
-                except Exception as e:
-                    # If replacement fails for this value, keep original
-                    self.value_data[original_value]["updated"] = original_value
-                    self.values_tree.item(
-                        item, values=(original_value, values[1], f"ERROR: {str(e)}")
-                    )
-
+            for i in range(self._values_tree.topLevelItemCount()):
+                item = self._values_tree.topLevelItem(i)
+                original = item.text(0)
+                updated = re.sub(pattern, replacement, original)
+                item.setText(2, updated)
         except re.error as e:
-            messagebox.showerror("Regex Error", f"Invalid regular expression: {str(e)}")
+            QMessageBox.critical(self, "Regex Error", str(e))
 
-    def _apply_regex(self):
-        """Apply the regex transformation to all spectra."""
-        if not self.current_key or not self.value_data:
-            messagebox.showwarning(
-                "Warning", "Please select a key and preview changes first."
-            )
+    def _apply_changes(self):
+        if not self.current_key or not self.parser:
             return
-
-        # Confirm before applying
-        num_affected = sum(
-            data["count"]
-            for data in self.value_data.values()
-            if data["updated"]
-            != list(self.value_data.keys())[list(self.value_data.values()).index(data)]
-        )
-
-        if num_affected == 0:
-            messagebox.showinfo("Info", "No changes to apply.")
+        mapping: Dict[str, str] = {}
+        for i in range(self._values_tree.topLevelItemCount()):
+            item = self._values_tree.topLevelItem(i)
+            original = item.text(0)
+            updated = item.text(2)
+            if original != updated:
+                mapping[original] = updated
+        if not mapping:
             return
-
-        if not messagebox.askyesno(
-            "Confirm Changes",
-            f"Apply regex transformation to {num_affected} values in key '{self.current_key}'?",
-        ):
-            return
-
-        # Apply changes to all spectra
-        changes_made = False
-        for spectrum in self.parser.spectra:
-            current_value = spectrum.get_metadata_value(self.current_key)
-            if current_value in self.value_data:
-                new_value = self.value_data[current_value]["updated"]
-                if new_value != current_value and not new_value.startswith("ERROR:"):
-                    spectrum.metadata[self.current_key] = new_value
-                    changes_made = True
-
-        if changes_made:
-            self.changes_made = True
-            messagebox.showinfo("Success", "Regex transformation applied successfully!")
-
-            # Reload values to show the changes
-            self._load_values_for_key(self.current_key)
-
-    def _reset_values(self):
-        """Reset all values to original."""
-        if not self.current_key:
-            return
-
-        # Reset the updated values to original
-        for original_value in self.value_data:
-            self.value_data[original_value]["updated"] = original_value
-
-        # Update tree display
-        for item in self.values_tree.get_children():
-            values = self.values_tree.item(item, "values")
-            original_value = values[0]
-            count = values[1]
-            self.values_tree.item(item, values=(original_value, count, original_value))
-
-    def _close_dialog(self):
-        """Close the dialog."""
-        self.dialog.destroy()
+        for s in self.parser.spectra:
+            val = s.metadata.get(self.current_key)
+            if val is not None and str(val) in mapping:
+                s.metadata[self.current_key] = mapping[str(val)]
+        self.changes_made = True
+        self._populate_values()
 
 
-class SpectrumVisualization(ttk.Frame):
-    """Component for visualizing spectra as stick charts."""
+# ---------------------------------------------------------------------------
+# SpectrumVisualization
+# ---------------------------------------------------------------------------
 
-    def __init__(self, parent):
+
+class SpectrumVisualization(QWidget):
+    """Spectrum stick-plot visualization widget."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.parser: Optional[MGFParser] = None
-        self.selected_spectrum_ids: List[int] = []
-        self.highlighted_ions: Dict[int, List[int]] = {}  # {spectrum_id: [ion_indices]}
-        self.axes: List = []  # Track all subplot axes for zoom synchronization
-        self._syncing_zoom = False  # Prevent infinite recursion during sync
-        self.show_combined_plot = tk.BooleanVar(
-            value=False
-        )  # Control combined plot display
-        self.ppm_tolerance = tk.DoubleVar(
-            value=20.0
-        )  # PPM tolerance for fragment matching
-        self.top_fragments_count = tk.IntVar(
-            value=15
-        )  # Number of top fragments to show
-        self.naming_scheme = "Numbered"  # Current spectrum naming scheme
-
+        self.selected_spectrum_ids: List = []
+        self.highlighted_ions: Dict = {}
+        self.naming_scheme: str = "Numbered"
+        self.axes: List = []
+        self._syncing_zoom = False
+        # hover/click state
+        self._ax_spectrum_map: Dict = {}  # {ax: spectrum}
+        self._hover_artists: List = []  # overlay artists to remove on next hover
+        self._pinned_ions: Dict = {}  # {spectrum_id: {ion_index: label}}
+        self._hover_callback = None  # (spectrum_id, ion_index|None) -> None
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the visualization widgets."""
-        # Header with controls
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        ttk.Label(
-            header_frame, text="Spectrum Visualization", font=("Arial", 12, "bold")
-        ).pack(side="left")
+        # Controls
+        ctrl = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Controls frame
-        controls_frame = ttk.Frame(header_frame)
-        controls_frame.pack(side="right")
+        self._combined_cb = QCheckBox("Show Combined Plot")
+        self._combined_cb.stateChanged.connect(self._plot_spectra)
+        ctrl_layout.addWidget(self._combined_cb)
 
-        # Combined plot checkbox
-        ttk.Checkbutton(
-            controls_frame,
-            text="Show Combined Plot",
-            variable=self.show_combined_plot,
-            command=self._plot_spectra,
-        ).pack(side="left", padx=(0, 10))
+        ctrl_layout.addWidget(QLabel("PPM tolerance:"))
+        self._ppm_spin = QDoubleSpinBox()
+        self._ppm_spin.setRange(1.0, 500.0)
+        self._ppm_spin.setValue(10.0)
+        self._ppm_spin.valueChanged.connect(self._on_ppm_change)
+        ctrl_layout.addWidget(self._ppm_spin)
 
-        # PPM tolerance for fragment matching in combined plot
-        ttk.Label(controls_frame, text="PPM tolerance:").pack(side="left", padx=(0, 2))
-        ppm_spinbox = ttk.Spinbox(
-            controls_frame,
-            from_=1.0,
-            to=100.0,
-            increment=1.0,
-            width=8,
-            textvariable=self.ppm_tolerance,
-            command=self._on_ppm_change,
-        )
-        ppm_spinbox.pack(side="left", padx=(0, 10))
-        ppm_spinbox.bind("<KeyRelease>", self._on_ppm_change)
+        ctrl_layout.addWidget(QLabel("Top fragments:"))
+        self._top_fragments_spin = QSpinBox()
+        self._top_fragments_spin.setRange(1, 100)
+        self._top_fragments_spin.setValue(10)
+        self._top_fragments_spin.valueChanged.connect(self._on_fragments_count_change)
+        ctrl_layout.addWidget(self._top_fragments_spin)
 
-        # Top fragments count for combined plot
-        ttk.Label(controls_frame, text="Top fragments:").pack(side="left", padx=(0, 2))
-        fragments_spinbox = ttk.Spinbox(
-            controls_frame,
-            from_=5,
-            to=50,
-            increment=1,
-            width=6,
-            textvariable=self.top_fragments_count,
-            command=self._on_fragments_count_change,
-        )
-        fragments_spinbox.pack(side="left", padx=(0, 10))
-        fragments_spinbox.bind("<KeyRelease>", self._on_fragments_count_change)
+        popup_btn = QPushButton("Create Popup")
+        popup_btn.clicked.connect(self._create_popup_window)
+        ctrl_layout.addWidget(popup_btn)
+        ctrl_layout.addStretch()
+        layout.addWidget(ctrl)
 
-        # Popup button
-        ttk.Button(
-            controls_frame, text="Create Popup", command=self._create_popup_window
-        ).pack(side="left")
-
-        # Matplotlib figure
+        # Figure
         self.figure = Figure(figsize=(8, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, self)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=(5, 0))
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, stretch=1)
 
-        # Add navigation toolbar for zoom/pan functionality
-        toolbar_frame = ttk.Frame(self)
-        toolbar_frame.pack(fill="x", padx=5, pady=(0, 5))
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
+        toolbar = NavigationToolbar2QT(self.canvas, self)
+        layout.addWidget(toolbar)
 
-    def set_naming_scheme(self, naming_scheme: str):
-        """Set the spectrum naming scheme."""
-        self.naming_scheme = naming_scheme
-        # Replot if we have data to show updated names
+    def _on_ppm_change(self):
+        if self._combined_cb.isChecked():
+            self._plot_spectra()
+
+    def _on_fragments_count_change(self):
+        if self._combined_cb.isChecked():
+            self._plot_spectra()
+
+    def set_naming_scheme(self, scheme: str):
+        self.naming_scheme = scheme
         if self.parser and self.selected_spectrum_ids:
             self._plot_spectra()
 
-    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
-        """Load and visualize selected spectra."""
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List):
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
-        self.highlighted_ions = {}  # Clear highlighted ions when loading new data
+        self.highlighted_ions = {}
+        self._pinned_ions = {}
+        self._hover_artists = []
         self._plot_spectra()
 
-    def highlight_ions(self, spectrum_id: int, ion_indices: List[int]):
-        """Highlight specific ions in the spectrum visualization."""
+    def highlight_ions(self, spectrum_id, ion_indices: List[int]):
         self.highlighted_ions[spectrum_id] = ion_indices
-        self._plot_spectra()  # Replot to show highlights
+        self._plot_spectra()
+
+    def clear_plot(self):
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            "No spectra loaded",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.axis("off")
+        self.canvas.draw()
+        self.parser = None
+        self.selected_spectrum_ids = []
+
+    def _get_spectrum_display_name(self, spectrum) -> str:
+        return _format_spectrum_label(spectrum, self.naming_scheme)
 
     def _plot_spectra(self):
-        """Plot the selected spectra."""
         self.figure.clear()
-        self.axes = []  # Reset axes list
-
+        self.axes = []
         if not self.parser or not self.selected_spectrum_ids:
             ax = self.figure.add_subplot(111)
             ax.text(
@@ -2480,321 +1284,63 @@ class SpectrumVisualization(ttk.Frame):
                 va="center",
                 transform=ax.transAxes,
             )
+            ax.axis("off")
             self.canvas.draw()
             return
 
-        # Get selected spectra
         selected_spectra = [
             s
             for s in self.parser.spectra
             if s.spectrum_id in self.selected_spectrum_ids
         ]
-
         if not selected_spectra:
             return
 
-        if self.show_combined_plot.get() and len(selected_spectra) > 1:
+        if self._combined_cb.isChecked() and len(selected_spectra) > 1:
             self._plot_combined_spectra(selected_spectra)
         else:
             self._plot_individual_spectra(selected_spectra)
 
     def _plot_individual_spectra(self, selected_spectra):
-        """Plot individual spectra in separate subplots."""
-        # Performance check: limit to first 5 spectra if more than 10 are selected
         original_count = len(selected_spectra)
+        warning = None
         if original_count > 10:
             selected_spectra = selected_spectra[:5]
-            # Add a warning text to the plot
-            performance_warning = f"Performance limit: Showing first 5 of {original_count} selected spectra"
-        else:
-            performance_warning = None
+            warning = f"Performance limit: Showing first 5 of {original_count} selected spectra"
 
-        # Calculate global m/z limits for all selected spectra
-        global_mz_min = float("inf")
-        global_mz_max = float("-inf")
-
-        for spectrum in selected_spectra:
-            if spectrum.ions.size > 0:
-                mz_values = spectrum.ions[:, 0]
-                global_mz_min = min(global_mz_min, mz_values.min())
-                global_mz_max = max(global_mz_max, mz_values.max())
-
-        # Add some padding to the limits
-        if global_mz_min != float("inf") and global_mz_max != float("-inf"):
-            mz_range = global_mz_max - global_mz_min
-            padding = mz_range * 0.02  # 2% padding
-            global_mz_min -= padding
-            global_mz_max += padding
-        else:
-            # Fallback if no valid data
+        global_mz_min, global_mz_max = float("inf"), float("-inf")
+        for s in selected_spectra:
+            if s.ions.size > 0:
+                global_mz_min = min(global_mz_min, s.ions[:, 0].min())
+                global_mz_max = max(global_mz_max, s.ions[:, 0].max())
+        if global_mz_min == float("inf"):
             global_mz_min, global_mz_max = 0, 1000
-
-        # Create subplots
-        n_spectra = len(selected_spectra)
-        if n_spectra == 1:
-            ax = self.figure.add_subplot(111)
-            self.axes.append(ax)
-            self._plot_single_spectrum(
-                ax, selected_spectra[0], (global_mz_min, global_mz_max), is_last=True
-            )
         else:
-            for i, spectrum in enumerate(selected_spectra):
-                is_last = i == n_spectra - 1
-                ax = self.figure.add_subplot(n_spectra, 1, i + 1)
-                self.axes.append(ax)
-                self._plot_single_spectrum(
-                    ax, spectrum, (global_mz_min, global_mz_max), is_last=is_last
-                )
+            rng = global_mz_max - global_mz_min
+            pad = max(rng * 0.02, 5.0)
+            global_mz_min = max(0.0, global_mz_min - pad)
+            global_mz_max = global_mz_max + pad
 
-        # Set up zoom synchronization for multiple spectra
+        self._ax_spectrum_map = {}
+        n = len(selected_spectra)
+        for i, spectrum in enumerate(selected_spectra):
+            ax = self.figure.add_subplot(n, 1, i + 1)
+            self.axes.append(ax)
+            self._ax_spectrum_map[ax] = spectrum
+            self._plot_single_spectrum(
+                ax, spectrum, (global_mz_min, global_mz_max), is_last=(i == n - 1)
+            )
+
         if len(self.axes) > 1:
             self._setup_zoom_synchronization()
-
-        # Add performance warning if applicable
-        if performance_warning:
-            self.figure.suptitle(performance_warning, fontsize=10, color="red", y=0.98)
-
-        # Minimize space between subplots
+        if warning:
+            self.figure.suptitle(warning, fontsize=9, color="red", y=0.99)
         self.figure.tight_layout(pad=0.5, h_pad=0.2)
-        # Adjust layout to make room for the warning if present
-        if performance_warning:
-            self.figure.subplots_adjust(top=0.94, hspace=0.1)
-        else:
-            self.figure.subplots_adjust(hspace=0.1)
+        self.figure.subplots_adjust(hspace=0.1)
+        self._connect_mouse_events()
         self.canvas.draw()
 
-    def _plot_combined_spectra(self, selected_spectra):
-        """Plot all selected spectra in a combined plot with fragment matching."""
-        # Limit to 10 spectra for performance
-        original_count = len(selected_spectra)
-        if original_count > 10:
-            selected_spectra = selected_spectra[:10]
-            performance_warning = f"Performance limit: Showing first 10 of {original_count} selected spectra"
-        else:
-            performance_warning = None
-
-        ax = self.figure.add_subplot(111)
-        self.axes.append(ax)
-
-        # Collect all fragments from all spectra with sum-scaled intensities
-        all_fragments = {}  # {mz_value: [(spectrum_id, relative_intensity), ...]}
-        spectrum_colors = plt.cm.tab10(
-            np.linspace(0, 1, min(len(selected_spectra), 10))
-        )
-        spectrum_info = {}  # {spectrum_id: {'color': color, 'index': i, 'label': str}}
-
-        for i, spectrum in enumerate(selected_spectra):
-            if spectrum.ions.size == 0:
-                continue
-
-            mz_values = spectrum.ions[:, 0]
-            intensity_values = spectrum.ions[:, 1]
-
-            # Sum-scale intensities (normalize to sum = 1)
-            total_intensity = np.sum(intensity_values)
-            if total_intensity > 0:
-                relative_intensities = intensity_values / total_intensity
-            else:
-                relative_intensities = intensity_values
-
-            spectrum_info[spectrum.spectrum_id] = {
-                "color": spectrum_colors[i],
-                "index": i,
-                "label": self._get_spectrum_display_name(spectrum),
-            }
-
-            # Add fragments to collection
-            for mz, rel_intensity in zip(mz_values, relative_intensities):
-                if mz not in all_fragments:
-                    all_fragments[mz] = []
-                all_fragments[mz].append((spectrum.spectrum_id, rel_intensity))
-
-        # Group fragments by similar m/z values within PPM tolerance
-        fragment_groups = self._group_fragments_by_mz(
-            all_fragments, self.ppm_tolerance.get()
-        )
-
-        # Calculate total intensity for each fragment group and sort by intensity
-        fragment_intensities = []
-        for group_mz, fragments_in_group in fragment_groups.items():
-            if (
-                len(fragments_in_group) > 1
-            ):  # Only consider fragments present in multiple spectra
-                total_intensity = sum(
-                    rel_intensity for _, rel_intensity in fragments_in_group
-                )
-                fragment_intensities.append(
-                    (total_intensity, group_mz, fragments_in_group)
-                )
-
-        # Sort by total intensity (descending) and take top N
-        top_fragments_count = self.top_fragments_count.get()
-        fragment_intensities.sort(key=lambda x: x[0], reverse=True)
-        top_fragments = fragment_intensities[:top_fragments_count]
-
-        # Create a plot showing spectra on x-axis and relative abundance on y-axis
-        # Each line represents a fragment group (similar m/z values)
-
-        # Sort spectrum IDs by their display names using natural sorting
-        sorted_spec_ids = list(spectrum_info.keys())
-        try:
-            sorted_spec_ids = natsorted(
-                sorted_spec_ids,
-                key=lambda spec_id: self._get_spectrum_display_name(spec_id),
-            )
-        except NameError:
-            # Fallback to regular sorting if natsort is not available
-            sorted_spec_ids = sorted(
-                sorted_spec_ids,
-                key=lambda spec_id: self._get_spectrum_display_name(spec_id),
-            )
-
-        spectrum_positions = {spec_id: i for i, spec_id in enumerate(sorted_spec_ids)}
-        spectrum_labels = [
-            self._get_spectrum_display_name(spec_id) for spec_id in sorted_spec_ids
-        ]
-
-        # Plot each top fragment group as a line connecting spectra
-        for total_intensity, group_mz, fragments_in_group in top_fragments:
-            # Create arrays for plotting
-            x_positions = []
-            y_intensities = []
-
-            # Sort fragments by spectrum index for consistent line drawing
-            sorted_fragments = sorted(
-                fragments_in_group,
-                key=lambda x: spectrum_info.get(x[0], {}).get("index", 999),
-            )
-
-            for spectrum_id, rel_intensity in sorted_fragments:
-                if spectrum_id in spectrum_info:
-                    x_positions.append(spectrum_positions[spectrum_id])
-                    y_intensities.append(rel_intensity)
-
-            if len(x_positions) > 1:
-                # Plot line connecting the same fragment across spectra
-                ax.plot(
-                    x_positions,
-                    y_intensities,
-                    "o-",
-                    alpha=0.7,
-                    linewidth=2,
-                    markersize=6,
-                    label=f"m/z {group_mz:.4f}",
-                )
-
-        # Set x-axis to show spectrum names
-        ax.set_xticks(range(len(spectrum_labels)))
-        ax.set_xticklabels(spectrum_labels, rotation=45, ha="right")
-        ax.set_xlabel("Spectra")
-        ax.set_ylabel("Relative Abundance (Sum-scaled)")
-        ax.set_title(
-            f"Combined Spectrum Plot - Fragment Matching ({len(selected_spectra)} spectra)"
-        )
-        ax.grid(True, alpha=0.3)
-
-        # Add legend for fragment m/z values
-        handles, labels = ax.get_legend_handles_labels()
-        if len(handles) > 0:
-            legend_title = (
-                f"Top {min(len(handles), top_fragments_count)} fragments (by intensity)"
-            )
-            ax.legend(loc="upper right", framealpha=0.9, fontsize=8, title=legend_title)
-
-        # Add performance warning if applicable
-        if performance_warning:
-            ax.text(
-                0.02,
-                0.98,
-                performance_warning,
-                transform=ax.transAxes,
-                fontsize=10,
-                color="red",
-                verticalalignment="top",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7),
-            )
-
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-    def _group_fragments_by_mz(self, all_fragments, ppm_tolerance):
-        """Group fragments by similar m/z values within PPM tolerance."""
-        fragment_groups = {}
-        sorted_mz_values = sorted(all_fragments.keys())
-
-        for mz in sorted_mz_values:
-            # Find if this m/z belongs to an existing group
-            group_found = False
-            for group_mz in fragment_groups:
-                # Calculate PPM difference
-                ppm_diff = abs(mz - group_mz) / group_mz * 1e6
-                if ppm_diff <= ppm_tolerance:
-                    # Add to existing group
-                    fragment_groups[group_mz].extend(all_fragments[mz])
-                    group_found = True
-                    break
-
-            if not group_found:
-                # Create new group
-                fragment_groups[mz] = all_fragments[mz][:]
-
-        return fragment_groups
-
-    def _on_ppm_change(self, event=None):
-        """Handle PPM tolerance change."""
-        if self.show_combined_plot.get():
-            self._plot_spectra()
-
-    def _on_fragments_count_change(self, event=None):
-        """Handle top fragments count change."""
-        if self.show_combined_plot.get():
-            self._plot_spectra()
-
-    def _get_spectrum_display_name(self, spectrum_or_id):
-        """Get the display name for a spectrum based on the current naming scheme."""
-        # Handle both spectrum objects and spectrum IDs
-        if isinstance(spectrum_or_id, (str, int)):
-            # It's a spectrum ID, find the spectrum object
-            spectrum_id = spectrum_or_id
-            if not self.parser:
-                return f"S {spectrum_id}"
-
-            spectrum = next(
-                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
-            )
-            if not spectrum:
-                return f"S {spectrum_id}"
-        else:
-            # It's already a spectrum object
-            spectrum = spectrum_or_id
-            spectrum_id = spectrum.spectrum_id
-
-        # Use the local naming scheme
-        if self.naming_scheme == "Numbered":
-            return f"S {spectrum_id}"
-        else:
-            # Use the metadata value for the naming key
-            name_value = spectrum.get_metadata_value(self.naming_scheme)
-            if name_value:
-                return str(name_value)
-            else:
-                return f"S {spectrum_id}"  # Fall back to numbered if key not found
-
-    def _create_popup_window(self):
-        """Create a popup window with current selected spectra and metadata."""
-        if not self.parser or not self.selected_spectrum_ids:
-            messagebox.showwarning("No Selection", "No spectra selected for popup.")
-            return
-
-        # Get the root window from the widget hierarchy
-        root = self.winfo_toplevel()
-        popup = SpectrumPopupWindow(
-            root, self.parser, self.selected_spectrum_ids, self.naming_scheme
-        )
-        popup.show()
-
-    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None, is_last=False):
-        """Plot a single spectrum as a stick chart."""
+    def _plot_single_spectrum(self, ax, spectrum, mz_limits, is_last=True):
         if spectrum.ions.size == 0:
             ax.text(
                 0.5,
@@ -2807,45 +1353,57 @@ class SpectrumVisualization(ttk.Frame):
             if mz_limits:
                 ax.set_xlim(mz_limits)
             return
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        highlighted = self.highlighted_ions.get(spectrum.spectrum_id, [])
+        pinned = self._pinned_ions.get(spectrum.spectrum_id, {})
+        for i, (m, inten) in enumerate(zip(mz, intensity)):
+            if i in pinned:
+                color = "darkorange"
+                lw = 2.5
+            elif i in highlighted:
+                color = "green"
+                lw = 2.0
+            else:
+                color = "blue"
+                lw = 1.5
+            ax.vlines(m, 0, inten, colors=color, linewidth=lw)
 
-        mz_values = spectrum.ions[:, 0]
-        intensity_values = spectrum.ions[:, 1]
+        # Draw pinned annotations
+        for idx, label in pinned.items():
+            m = mz[idx]
+            inten = intensity[idx]
+            ax.annotate(
+                label,
+                xy=(m, inten),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=7,
+                color="darkorange",
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", alpha=0.85),
+                zorder=5,
+            )
 
-        # Get highlighted ions for this spectrum
-        highlighted_indices = self.highlighted_ions.get(spectrum.spectrum_id, [])
-
-        # Create stick plot with different colors for highlighted vs normal ions
-        for i, (mz, intensity) in enumerate(zip(mz_values, intensity_values)):
-            color = "green" if i in highlighted_indices else "blue"
-            linewidth = 2.0 if i in highlighted_indices else 1.5
-            ax.vlines(mz, 0, intensity, colors=color, linewidth=linewidth)
-
-        # Add precursor mass line if available
-        precursor_mass = self._get_precursor_mass_from_spectrum(spectrum)
-        if precursor_mass is not None:
-            # Check if precursor mass is within the current plot range
-            x_min, x_max = ax.get_xlim()
-            if mz_limits:
-                x_min, x_max = mz_limits
-            elif len(mz_values) > 0:
-                x_min = mz_values.min() * 0.95
-                x_max = mz_values.max() * 1.05
-
-            if x_min <= precursor_mass <= x_max:
-                y_max = intensity_values.max() if len(intensity_values) > 0 else 1
+        precursor = self._get_precursor_mass(spectrum)
+        if precursor is not None:
+            y_max = intensity.max() if len(intensity) > 0 else 1
+            # Only draw the precursor line if it falls inside the x-axis window
+            x_lo = (
+                mz_limits[0] if mz_limits else (mz.min() * 0.95 if len(mz) > 0 else 0)
+            )
+            x_hi = (
+                mz_limits[1]
+                if mz_limits
+                else (mz.max() * 1.05 if len(mz) > 0 else 1000)
+            )
+            if x_lo <= precursor <= x_hi:
                 ax.axvline(
-                    precursor_mass,
-                    color="grey",
-                    linestyle="--",
-                    linewidth=1.5,
-                    alpha=0.7,
-                    label=f"Precursor: {precursor_mass:.4f}",
+                    precursor, color="grey", linestyle="--", linewidth=1.5, alpha=0.7
                 )
-                # Add a small text label at the top
                 ax.text(
-                    precursor_mass,
+                    precursor,
                     y_max * 1.05,
-                    f"M: {precursor_mass:.2f}",
+                    f"M: {precursor:.2f}",
                     ha="center",
                     va="bottom",
                     fontsize=8,
@@ -2853,800 +1411,738 @@ class SpectrumVisualization(ttk.Frame):
                     rotation=90,
                 )
 
-        # Only show x-axis label and ticks on the last spectrum
         if is_last:
             ax.set_xlabel("m/z")
         else:
             ax.set_xticklabels([])
             ax.tick_params(axis="x", which="both", bottom=False)
-
-        ax.set_ylabel("Intensity")
-
-        # Remove title - spectrum ID will be shown in y-axis label instead
-        spectrum_label = f"S {spectrum.spectrum_id}"
-        ax.set_ylabel(f"{spectrum_label}\nIntensity", fontsize=9)
-
+        label = self._get_spectrum_display_name(spectrum)
+        ax.set_ylabel(f"{label}\nIntensity", fontsize=9)
         ax.grid(True, alpha=0.3)
-
-        # Set limits
+        # Always enforce x limits so all subplots share the same full-width range
         if mz_limits:
             ax.set_xlim(mz_limits)
-        elif len(mz_values) > 0:
-            ax.set_xlim(mz_values.min() * 0.95, mz_values.max() * 1.05)
+        elif len(mz) > 0:
+            pad = max((mz.max() - mz.min()) * 0.02, 5.0)
+            ax.set_xlim(max(0.0, mz.min() - pad), mz.max() + pad)
+        if len(intensity) > 0:
+            ax.set_ylim(0, intensity.max() * 1.1)
 
-        # Set y limits
-        if len(intensity_values) > 0:
-            ax.set_ylim(0, intensity_values.max() * 1.1)
-
-    def _get_precursor_mass_from_spectrum(self, spectrum):
-        """Extract precursor mass from spectrum metadata."""
-        # Common precursor mass key names to check
-        mass_keys = [
-            "pepmass",
-            "PEPMASS",
-            "precursor_mass",
-            "PRECURSOR_MASS",
-            "precursormass",
-        ]
-
-        for key in mass_keys:
-            value = spectrum.get_metadata_value(key)
-            if value:
+    def _get_precursor_mass(self, spectrum) -> Optional[float]:
+        for key in ["pepmass", "PEPMASS", "precursor_mass", "PRECURSOR_MASS"]:
+            val = spectrum.get_metadata_value(key)
+            if val:
                 try:
-                    # Handle different formats like "123.456" or "123.456 2" (mass and charge)
-                    mass_str = value.strip().split()[0]  # Take first part (mass)
-                    return float(mass_str)
+                    return float(val.strip().split()[0])
                 except (ValueError, IndexError):
                     continue
         return None
 
-    def clear_plot(self):
-        """Clear the plot and reset to empty state."""
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-        ax.text(
-            0.5,
-            0.5,
-            "No spectra loaded",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
-        self.canvas.draw()
-        self.parser = None
-        self.selected_spectrum_ids = []
+    def _plot_combined_spectra(self, selected_spectra):
+        original_count = len(selected_spectra)
+        warning = None
+        if original_count > 10:
+            selected_spectra = selected_spectra[:10]
+            warning = f"Performance limit: Showing first 10 of {original_count} spectra"
 
-    def clear_plot(self):
-        """Clear the spectrum plot and reset data."""
-        fig = self.canvas.figure
-        fig.clear()
-        ax = fig.add_subplot(111)
-        ax.text(
-            0.5,
-            0.5,
-            "No spectra loaded",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
+        ax = self.figure.add_subplot(111)
+        self.axes.append(ax)
+        spectrum_colors = plt.cm.tab10(
+            np.linspace(0, 1, min(len(selected_spectra), 10))
         )
+        all_fragments: Dict = {}
+        spectrum_info: Dict = {}
+
+        for i, spectrum in enumerate(selected_spectra):
+            if spectrum.ions.size == 0:
+                continue
+            mz = spectrum.ions[:, 0]
+            intensity = spectrum.ions[:, 1]
+            total = np.sum(intensity)
+            rel = intensity / total if total > 0 else intensity
+            spectrum_info[spectrum.spectrum_id] = {
+                "color": spectrum_colors[i],
+                "label": self._get_spectrum_display_name(spectrum),
+            }
+            for m, r in zip(mz, rel):
+                all_fragments.setdefault(m, []).append((spectrum.spectrum_id, r))
+
+        groups = self._group_fragments_by_mz(all_fragments, self._ppm_spin.value())
+        fragment_intensities = []
+        for group_mz, frags in groups.items():
+            if len(frags) > 1:
+                total = sum(r for _, r in frags)
+                fragment_intensities.append((total, group_mz, frags))
+
+        fragment_intensities.sort(key=lambda x: x[0], reverse=True)
+        top = fragment_intensities[: self._top_fragments_spin.value()]
+
+        sorted_ids = list(spectrum_info.keys())
+        try:
+            sorted_ids = natsorted(
+                sorted_ids, key=lambda sid: spectrum_info[sid]["label"]
+            )
+        except Exception:
+            pass
+
+        x_positions = {sid: i for i, sid in enumerate(sorted_ids)}
+        for _, group_mz, frags in top:
+            x_vals = [x_positions[sid] for sid, _ in frags if sid in x_positions]
+            y_vals = [r for sid, r in frags if sid in x_positions]
+            if len(x_vals) > 1:
+                ax.plot(
+                    x_vals,
+                    y_vals,
+                    "o-",
+                    alpha=0.7,
+                    linewidth=1.5,
+                    label=f"m/z {group_mz:.2f}",
+                )
+
+        ax.set_xticks(range(len(sorted_ids)))
+        ax.set_xticklabels(
+            [spectrum_info[sid]["label"] for sid in sorted_ids],
+            rotation=45,
+            ha="right",
+            fontsize=8,
+        )
+        ax.set_xlabel("Spectrum")
+        ax.set_ylabel("Relative Intensity (sum-scaled)")
+        ax.set_title(f"Top {self._top_fragments_spin.value()} shared fragments")
+        ax.grid(True, alpha=0.3)
+        if top:
+            ax.legend(fontsize=7, loc="upper right", ncol=2)
+        if warning:
+            self.figure.suptitle(warning, fontsize=9, color="red")
+        self.figure.tight_layout()
         self.canvas.draw()
-        self.parser = None
-        self.selected_spectrum_ids = []
+
+    def _group_fragments_by_mz(self, fragments: Dict, ppm_tolerance: float) -> Dict:
+        sorted_mzs = sorted(fragments.keys())
+        groups: Dict = {}
+        used: set = set()
+        for mz in sorted_mzs:
+            if mz in used:
+                continue
+            group_mz = mz
+            group_frags = list(fragments[mz])
+            for other_mz in sorted_mzs:
+                if other_mz == mz or other_mz in used:
+                    continue
+                ppm = abs(mz - other_mz) / mz * 1e6
+                if ppm <= ppm_tolerance:
+                    group_frags.extend(fragments[other_mz])
+                    used.add(other_mz)
+            groups[group_mz] = group_frags
+            used.add(mz)
+        return groups
 
     def _setup_zoom_synchronization(self):
-        """Set up zoom synchronization between all subplot axes."""
         for ax in self.axes:
             ax.callbacks.connect("xlim_changed", self._on_xlims_change)
 
     def _on_xlims_change(self, ax):
-        """Handle x-axis limit changes to synchronize zoom across all subplots."""
         if self._syncing_zoom:
-            return  # Prevent infinite recursion
-
+            return
         self._syncing_zoom = True
         try:
-            # Get the new x limits from the changed axis
             xlims = ax.get_xlim()
-
-            # Apply the same x limits to all other axes
-            for other_ax in self.axes:
-                if other_ax != ax:
-                    other_ax.set_xlim(xlims)
-
-            # Redraw the canvas
+            for other in self.axes:
+                if other is not ax:
+                    other.set_xlim(xlims)
             self.canvas.draw_idle()
         finally:
             self._syncing_zoom = False
 
+    def _create_popup_window(self):
+        if not self.parser or not self.selected_spectrum_ids:
+            QMessageBox.information(self, "No Data", "No spectra selected.")
+            return
+        popup = SpectrumPopupWindow(
+            self, self.parser, self.selected_spectrum_ids, self.naming_scheme
+        )
+        popup.show()
 
-class IonDataTable(ttk.Frame):
-    """Component for displaying ion data in table format."""
+    # ------------------------------------------------------------------
+    # Hover / click interaction
+    # ------------------------------------------------------------------
 
-    def __init__(self, parent):
+    def set_hover_callback(self, cb):
+        """Set callback invoked on hover: cb(spectrum_id, ion_index) or cb(None, None)."""
+        self._hover_callback = cb
+
+    def _connect_mouse_events(self):
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_click)
+
+    def _on_mouse_move(self, event):
+        if event.inaxes is None:
+            if self._hover_artists:
+                self._clear_hover_artists()
+                self.canvas.draw_idle()
+            if self._hover_callback:
+                self._hover_callback(None, None)
+            return
+
+        spectrum = self._ax_spectrum_map.get(event.inaxes)
+        if spectrum is None or spectrum.ions.size == 0:
+            return
+
+        ax = event.inaxes
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        max_inten = intensity.max() if len(intensity) > 0 else 1.0
+
+        # Find nearest fragment in display (pixel) space
+        try:
+            xy_data = np.column_stack([mz, intensity])
+            cursor_data = np.array([[event.xdata, event.ydata]])
+            xy_display = ax.transData.transform(xy_data)
+            cursor_display = ax.transData.transform(cursor_data)
+            distances = np.linalg.norm(xy_display - cursor_display, axis=1)
+            closest_idx = int(np.argmin(distances))
+            min_dist = distances[closest_idx]
+        except Exception:
+            return
+
+        self._clear_hover_artists()
+
+        PIXEL_THRESHOLD = 25
+        if min_dist <= PIXEL_THRESHOLD:
+            m = mz[closest_idx]
+            inten = intensity[closest_idx]
+            rel = inten / max_inten * 100
+            label = f"m/z {m:.4f}\n{rel:.1f}%"
+
+            # Overlay highlighted line
+            vline = ax.vlines(m, 0, inten, colors="red", linewidth=2.5, zorder=5)
+            # Annotation
+            ann = ax.annotate(
+                label,
+                xy=(m, inten),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=8,
+                color="red",
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", alpha=0.85),
+                zorder=6,
+            )
+            self._hover_artists = [vline, ann]
+            self.canvas.draw_idle()
+
+            if self._hover_callback:
+                self._hover_callback(spectrum.spectrum_id, closest_idx)
+        else:
+            self.canvas.draw_idle()
+            if self._hover_callback:
+                self._hover_callback(None, None)
+
+    def _on_mouse_click(self, event):
+        if event.button != 1 or event.inaxes is None:
+            return
+        spectrum = self._ax_spectrum_map.get(event.inaxes)
+        if spectrum is None or spectrum.ions.size == 0:
+            return
+
+        ax = event.inaxes
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        max_inten = intensity.max() if len(intensity) > 0 else 1.0
+
+        try:
+            xy_data = np.column_stack([mz, intensity])
+            cursor_data = np.array([[event.xdata, event.ydata]])
+            xy_display = ax.transData.transform(xy_data)
+            cursor_display = ax.transData.transform(cursor_data)
+            distances = np.linalg.norm(xy_display - cursor_display, axis=1)
+            closest_idx = int(np.argmin(distances))
+            min_dist = distances[closest_idx]
+        except Exception:
+            return
+
+        if min_dist > 25:
+            return
+
+        sid = spectrum.spectrum_id
+        pins = self._pinned_ions.setdefault(sid, {})
+        if closest_idx in pins:
+            del pins[closest_idx]
+        else:
+            m = mz[closest_idx]
+            rel = intensity[closest_idx] / max_inten * 100
+            pins[closest_idx] = f"m/z {m:.4f}\n({rel:.1f}%)"
+
+        # Redraw to reflect pinned state; preserve current xlim/ylim
+        xlims = {a: a.get_xlim() for a in self.axes}
+        ylims = {a: a.get_ylim() for a in self.axes}
+        self._plot_spectra()
+        for a in self.axes:
+            if a in xlims:
+                a.set_xlim(xlims[a])
+            if a in ylims:
+                a.set_ylim(ylims[a])
+        self.canvas.draw_idle()
+
+    def _clear_hover_artists(self):
+        for artist in self._hover_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._hover_artists = []
+
+
+# ---------------------------------------------------------------------------
+# Numeric-sort capable QTreeWidgetItem
+# ---------------------------------------------------------------------------
+
+
+class _NumericSortItem(QTreeWidgetItem):
+    """QTreeWidgetItem that sorts numeric columns as floats, not strings."""
+
+    _NUMERIC_COLS = {0, 1, 2, 3}  # Index, m/z, Intensity, Rel. Intensity %
+
+    def __lt__(self, other: QTreeWidgetItem) -> bool:
+        col = self.treeWidget().sortColumn() if self.treeWidget() else 0
+        if col in self._NUMERIC_COLS:
+            try:
+                return float(self.text(col)) < float(other.text(col))
+            except ValueError:
+                pass
+        return super().__lt__(other)
+
+
+# ---------------------------------------------------------------------------
+# IonDataTable
+# ---------------------------------------------------------------------------
+
+
+class IonDataTable(QWidget):
+    """Tabbed ion data table."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.parser: Optional[MGFParser] = None
-        self.selected_spectrum_ids: List[int] = []
-        self.spectrum_viz_callback = None  # Callback to update spectrum visualization
-        self.table_data = {}  # Store data for sorting: {tab_id: [(ion_index, mz, intensity, annotations), ...]}
-
+        self.selected_spectrum_ids: List = []
+        self.spectrum_viz_callback = None
+        self._block_hover_highlight = False
+        self.naming_scheme: str = "Numbered"
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the table widgets."""
-        # Header
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=5, pady=5)
-
-        ttk.Label(header_frame, text="Ion Data", font=("Arial", 12, "bold")).pack()
-
-        # Notebook for multiple spectra
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel("Ion Data")
+        lbl.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        layout.addWidget(lbl)
+        self.notebook = QTabWidget()
+        layout.addWidget(self.notebook, stretch=1)
 
     def set_spectrum_viz_callback(self, callback):
-        """Set callback function to update spectrum visualization when ions are selected."""
         self.spectrum_viz_callback = callback
 
-    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
-        """Load ion data for selected spectra."""
+    def set_naming_scheme(self, scheme: str):
+        self.naming_scheme = scheme
+        if self.selected_spectrum_ids and self.parser:
+            self._populate_tables()
+
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List):
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
         self._populate_tables()
 
     def _populate_tables(self):
-        """Populate tables with ion data."""
-        # Clear existing tabs
-        for tab in self.notebook.tabs():
-            self.notebook.forget(tab)
-
+        self.notebook.clear()
         if not self.parser or not self.selected_spectrum_ids:
             return
-
-        # Get selected spectra
-        selected_spectra = [
+        spectra = [
             s
             for s in self.parser.spectra
             if s.spectrum_id in self.selected_spectrum_ids
         ]
-
-        for spectrum in selected_spectra:
+        for spectrum in spectra:
             self._create_table_for_spectrum(spectrum)
 
-    def _create_table_for_spectrum(self, spectrum: Spectrum):
-        """Create a table tab for a single spectrum."""
-        # Create frame for this spectrum
-        frame = ttk.Frame(self.notebook)
-        tab_text = f"S {spectrum.spectrum_id}"
-        self.notebook.add(frame, text=tab_text)
-
-        # Create treeview with additional columns for annotations
-        columns = ("Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations")
-        tree = ttk.Treeview(
-            frame, columns=columns, show="headings", height=15, selectmode="extended"
+    def _create_table_for_spectrum(self, spectrum: "Spectrum"):
+        tree = QTreeWidget()
+        tree.setHeaderLabels(
+            ["Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations"]
         )
-
-        # Configure columns with sorting callbacks
-        tree.heading(
-            "Index",
-            text="Index ↕",
-            command=lambda: self._sort_table(tree, spectrum, "Index"),
+        tree.setColumnWidth(0, 70)
+        tree.setColumnWidth(1, 110)
+        tree.setColumnWidth(2, 110)
+        tree.setColumnWidth(3, 110)
+        tree.setColumnWidth(4, 260)
+        tree.setAlternatingRowColors(True)
+        tree.setSortingEnabled(True)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.customContextMenuRequested.connect(
+            lambda pos, s=spectrum, t=tree: self._on_right_click(pos, s, t)
         )
-        tree.column("Index", width=80)
-
-        tree.heading(
-            "m/z", text="m/z ↕", command=lambda: self._sort_table(tree, spectrum, "m/z")
+        tree.itemSelectionChanged.connect(
+            lambda s=spectrum, t=tree: self._on_ion_selection(s, t)
         )
-        tree.column("m/z", width=120)
-
-        tree.heading(
-            "Intensity",
-            text="Intensity ↕",
-            command=lambda: self._sort_table(tree, spectrum, "Intensity"),
-        )
-        tree.column("Intensity", width=120)
-
-        tree.heading(
-            "Rel. Intensity %",
-            text="Rel. Intensity % ↕",
-            command=lambda: self._sort_table(tree, spectrum, "Rel. Intensity %"),
-        )
-        tree.column("Rel. Intensity %", width=120)
-
-        tree.heading(
-            "Annotations",
-            text="Annotations (Formula [ppm]) ↕",
-            command=lambda: self._sort_table(tree, spectrum, "Annotations"),
-        )
-        tree.column("Annotations", width=300)
-
-        # Bind selection event
-        tree.bind(
-            "<<TreeviewSelect>>", lambda event: self._on_ion_selection(event, spectrum)
-        )
-
-        # Bind right-click event for context menu
-        tree.bind("<Button-3>", lambda event: self._on_right_click(event, spectrum))
-
-        # Add scrollbars
-        v_scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        h_scrollbar = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-
-        tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-
-        tree.grid(row=0, column=0, sticky="nsew")
-        v_scrollbar.grid(row=0, column=1, sticky="ns")
-        h_scrollbar.grid(row=1, column=0, sticky="ew")
-
-        frame.grid_rowconfigure(0, weight=1)
-        frame.grid_columnconfigure(0, weight=1)
-
-        # Store reference to tree for later access
-        frame.tree = tree
-        frame.spectrum = spectrum
-
-        # Populate with ion data and store for sorting
         self._populate_table_data(tree, spectrum)
+        tab_label = _format_spectrum_label(spectrum, self.naming_scheme)
+        self.notebook.addTab(tree, tab_label)
 
-        # Populate with ion data and store for sorting
-        self._populate_table_data(tree, spectrum)
-
-    def _populate_table_data(self, tree, spectrum):
-        """Populate table with ion data and store for sorting."""
-        # Clear existing items
-        for item in tree.get_children():
-            tree.delete(item)
-
+    def _populate_table_data(self, tree: QTreeWidget, spectrum: "Spectrum"):
+        tree.clear()
         if spectrum.ions.size == 0:
             return
+        mz = spectrum.ions[:, 0]
+        intensity = spectrum.ions[:, 1]
+        max_inten = intensity.max() if len(intensity) > 0 else 1.0
 
-        # Get precursor mass for comparison
-        precursor_mass = self._get_precursor_mass(spectrum)
-
-        # Calculate total intensity for relative percentage calculation
-        total_intensity = (
-            float(spectrum.ions[:, 1].sum()) if spectrum.ions.size > 0 else 1.0
-        )
-
-        # Store data for this table
-        table_id = id(tree)
-        self.table_data[table_id] = []
-
-        for i, (mz, intensity) in enumerate(spectrum.ions):
-            # Calculate relative intensity percentage
-            rel_intensity_percent = (intensity / total_intensity) * 100.0
-
-            # Get fragment annotations for this ion
-            annotations = spectrum.get_fragment_annotations(i)
-
-            # Format annotations (sorted by ppm error)
-            annotation_text = ""
-            if annotations:
-                # Sort by ppm error
-                sorted_annotations = sorted(annotations, key=lambda x: x["ppm_error"])
-                annotation_strings = []
-                for ann in sorted_annotations[:3]:  # Show only top 3 matches
-                    annotation_strings.append(
-                        f"{ann['formula']} [{ann['ppm_error']:.1f}]"
+        for i, (m, inten) in enumerate(zip(mz, intensity)):
+            rel = (inten / max_inten * 100) if max_inten > 0 else 0
+            annotations = ""
+            if (
+                hasattr(spectrum, "fragment_annotations")
+                and spectrum.fragment_annotations
+            ):
+                ann = spectrum.fragment_annotations.get(i, [])
+                if ann:
+                    annotations = "; ".join(
+                        f"{a.get('formula', '?')} [{a.get('ppm_error', 0):.1f}ppm]"
+                        for a in ann
                     )
-                annotation_text = "; ".join(annotation_strings)
-                if len(annotations) > 3:
-                    annotation_text += f" (+{len(annotations) - 3} more)"
+            item = _NumericSortItem()
+            item.setData(0, Qt.ItemDataRole.UserRole, i)
+            item.setText(0, str(i))
+            item.setText(1, f"{m:.4f}")
+            item.setText(2, f"{inten:.2f}")
+            item.setText(3, f"{rel:.2f}")
+            item.setText(4, annotations)
+            tree.addTopLevelItem(item)
 
-            # Check if this fragment is close to precursor mass
-            precursor_indicator = ""
-            if precursor_mass and abs(mz - precursor_mass) < 0.1:  # Within 0.1 Da
-                precursor_indicator = " [M+H]+"
-            elif (
-                precursor_mass and abs(mz - (precursor_mass - 1.007825)) < 0.1
-            ):  # M+ (no proton)
-                precursor_indicator = " [M]+"
-
-            # Format m/z with precursor indicator
-            mz_text = f"{mz:.6f}{precursor_indicator}"
-
-            # Store raw data for sorting
-            self.table_data[table_id].append(
-                {
-                    "ion_index": i,
-                    "index_display": i + 1,
-                    "mz_value": mz,
-                    "mz_display": mz_text,
-                    "intensity": intensity,
-                    "intensity_display": f"{intensity:.3f}",
-                    "rel_intensity_percent": rel_intensity_percent,
-                    "rel_intensity_display": f"{rel_intensity_percent:.2f}%",
-                    "annotations": annotation_text,
-                    "precursor_indicator": precursor_indicator,
-                }
-            )
-
-            # Insert into tree
-            tree.insert(
-                "",
-                "end",
-                values=(
-                    i + 1,
-                    mz_text,
-                    f"{intensity:.3f}",
-                    f"{rel_intensity_percent:.2f}%",
-                    annotation_text,
-                ),
-                tags=(f"ion_{i}",),  # Tag with ion index for highlighting
-            )
-
-    def _sort_table(self, tree, spectrum, column):
-        """Sort table by the specified column."""
-        table_id = id(tree)
-        if table_id not in self.table_data:
+    def highlight_hover_row(self, spectrum_id, ion_index):
+        """Temporarily highlight a row corresponding to a hovered fragment."""
+        if self._block_hover_highlight:
             return
+        for tab_idx in range(self.notebook.count()):
+            tab_label = self.notebook.tabText(tab_idx)
+            # Tab label is "S {spectrum_id}"
+            try:
+                tab_sid = int(tab_label.split()[-1])
+            except (ValueError, IndexError):
+                tab_sid = None
+            tree = self.notebook.widget(tab_idx)
+            if not isinstance(tree, QTreeWidget):
+                continue
+            if spectrum_id is None or ion_index is None:
+                # Clear hover background
+                for j in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(j)
+                    for col in range(tree.columnCount()):
+                        item.setBackground(col, Qt.GlobalColor.transparent)
+            elif tab_sid == spectrum_id:
+                self.notebook.setCurrentIndex(tab_idx)
+                for j in range(tree.topLevelItemCount()):
+                    item = tree.topLevelItem(j)
+                    idx = item.data(0, Qt.ItemDataRole.UserRole)
+                    for col in range(tree.columnCount()):
+                        if idx == ion_index:
+                            item.setBackground(col, Qt.GlobalColor.yellow)
+                            tree.scrollToItem(item)
+                        else:
+                            item.setBackground(col, Qt.GlobalColor.transparent)
 
-        data = self.table_data[table_id]
-
-        # Determine sort key based on column
-        if column == "Index":
-            sort_key = lambda x: x["index_display"]
-        elif column == "m/z":
-            sort_key = lambda x: x["mz_value"]
-        elif column == "Intensity":
-            sort_key = lambda x: x["intensity"]
-        elif column == "Rel. Intensity %":
-            sort_key = lambda x: x["rel_intensity_percent"]
-        elif column == "Annotations":
-            sort_key = lambda x: x["annotations"]
-        else:
+    def _on_ion_selection(self, spectrum: "Spectrum", tree: QTreeWidget):
+        if self.spectrum_viz_callback is None:
             return
+        selected_indices = [
+            item.data(0, Qt.ItemDataRole.UserRole) for item in tree.selectedItems()
+        ]
+        self.spectrum_viz_callback(spectrum.spectrum_id, selected_indices)
 
-        # Check current sort direction (stored as attribute on tree)
-        current_sort = getattr(tree, "_sort_column", None)
-        reverse = False
-        if current_sort == column:
-            reverse = not getattr(tree, "_sort_reverse", False)
-
-        # Store sort state
-        tree._sort_column = column
-        tree._sort_reverse = reverse
-
-        # Sort data
-        data.sort(key=sort_key, reverse=reverse)
-
-        # Update column headers to show sort direction
-        for col in ["Index", "m/z", "Intensity", "Rel. Intensity %", "Annotations"]:
-            if col == column:
-                direction = "↓" if reverse else "↑"
-                if col == "Annotations":
-                    tree.heading(col, text=f"Annotations (Formula [ppm]) {direction}")
-                elif col == "Rel. Intensity %":
-                    tree.heading(col, text=f"Rel. Intensity % {direction}")
-                else:
-                    tree.heading(col, text=f"{col} {direction}")
-            else:
-                if col == "Annotations":
-                    tree.heading(col, text="Annotations (Formula [ppm]) ↕")
-                elif col == "Rel. Intensity %":
-                    tree.heading(col, text="Rel. Intensity % ↕")
-                else:
-                    tree.heading(col, text=f"{col} ↕")
-                    tree.heading(col, text=f"{col} ↕")
-
-        # Clear and repopulate tree
-        for item in tree.get_children():
-            tree.delete(item)
-
-        for row_data in data:
-            tree.insert(
-                "",
-                "end",
-                values=(
-                    row_data["index_display"],
-                    row_data["mz_display"],
-                    row_data["intensity_display"],
-                    row_data["rel_intensity_display"],
-                    row_data["annotations"],
-                ),
-                tags=(f"ion_{row_data['ion_index']}",),
-            )
-
-    def _on_ion_selection(self, event, spectrum):
-        """Handle ion selection in the table."""
-        tree = event.widget
-        selected_items = tree.selection()
-
-        # Extract ion indices from selected items
-        selected_ion_indices = []
-        for item in selected_items:
-            tags = tree.item(item)["tags"]
-            for tag in tags:
-                if tag.startswith("ion_"):
-                    ion_index = int(tag.split("_")[1])
-                    selected_ion_indices.append(ion_index)
-
-        # Update spectrum visualization if callback is set
-        if self.spectrum_viz_callback:
-            self.spectrum_viz_callback(spectrum.spectrum_id, selected_ion_indices)
-
-    def _on_right_click(self, event, spectrum):
-        """Handle right-click on ion table to show context menu."""
-        tree = event.widget
-
-        # Get the item under the cursor
-        item = tree.identify_row(event.y)
+    def _on_right_click(self, pos, spectrum: "Spectrum", tree: QTreeWidget):
+        item = tree.itemAt(pos)
         if not item:
             return
-
-        # Select the item if it's not already selected
-        if item not in tree.selection():
-            tree.selection_set(item)
-
-        # Get the ion index from the selected item
-        tags = tree.item(item)["tags"]
-        ion_index = None
-        for tag in tags:
-            if tag.startswith("ion_"):
-                ion_index = int(tag.split("_")[1])
-                break
-
-        if ion_index is None:
-            return
-
-        # Create context menu
-        context_menu = tk.Menu(tree, tearoff=0)
-        context_menu.add_command(
-            label="Delete fragment",
-            command=lambda: self._delete_fragment(spectrum, ion_index, tree),
-        )
-
-        # Show context menu
-        try:
-            context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            context_menu.grab_release()
-
-    def _delete_fragment(self, spectrum, ion_index, tree):
-        """Delete a specific fragment after confirmation."""
-        # Get fragment info for confirmation
-        if ion_index >= len(spectrum.ions):
-            messagebox.showerror("Error", "Invalid fragment index.")
-            return
-
-        mz_value = spectrum.ions[ion_index, 0]
-        intensity_value = spectrum.ions[ion_index, 1]
-
-        # Confirmation dialog
-        result = messagebox.askyesno(
-            "Confirm Deletion",
-            f"Are you sure you want to delete fragment at m/z {mz_value:.6f} "
-            f"with intensity {intensity_value:.3f}?\n\n"
-            f"This action cannot be undone.",
-        )
-
-        if not result:
-            return
-
-        # Delete the fragment
-        mask = np.ones(len(spectrum.ions), dtype=bool)
-        mask[ion_index] = False
-        spectrum.ions = spectrum.ions[mask]
-
-        # Update fragment annotations - reindex them
-        if spectrum.fragment_annotations:
-            new_annotations = {}
-            for old_idx, annotations in spectrum.fragment_annotations.items():
-                if old_idx < ion_index:
-                    # Indices before deleted fragment stay the same
-                    new_annotations[old_idx] = annotations
-                elif old_idx > ion_index:
-                    # Indices after deleted fragment shift down by 1
-                    new_annotations[old_idx - 1] = annotations
-                # old_idx == ion_index gets deleted (not added to new_annotations)
-            spectrum.fragment_annotations = new_annotations
-
-        # Refresh the table display
-        self._populate_table_data(tree, spectrum)
-
-        # Update spectrum visualization if callback is set
-        if self.spectrum_viz_callback:
-            self.spectrum_viz_callback(spectrum.spectrum_id, [])  # Clear selection
-
-        messagebox.showinfo(
-            "Fragment Deleted",
-            f"Fragment at m/z {mz_value:.6f} has been successfully deleted.",
-        )
-
-    def _get_precursor_mass(self, spectrum):
-        """Extract precursor mass from spectrum metadata."""
-        # Common precursor mass key names to check
-        mass_keys = [
-            "pepmass",
-            "PEPMASS",
-            "precursor_mass",
-            "PRECURSOR_MASS",
-            "precursormass",
-        ]
-
-        for key in mass_keys:
-            value = spectrum.get_metadata_value(key)
-            if value:
-                try:
-                    # Handle different formats like "123.456" or "123.456 2" (mass and charge)
-                    mass_str = value.strip().split()[0]  # Take first part (mass)
-                    return float(mass_str)
-                except (ValueError, IndexError):
-                    continue
-        return None
+        menu = QMenu(self)
+        del_act = menu.addAction("Delete fragment")
+        action = menu.exec(tree.viewport().mapToGlobal(pos))
+        if action == del_act:
+            idx = item.data(0, Qt.ItemDataRole.UserRole)
+            if idx is not None and spectrum.ions.size > 0:
+                spectrum.ions = np.delete(spectrum.ions, idx, axis=0)
+                if hasattr(spectrum, "annotations") and spectrum.annotations:
+                    spectrum.annotations.pop(idx, None)
+                self._populate_table_data(tree, spectrum)
 
     def clear_data(self):
-        """Clear all data from the tables."""
-        # Clear all tabs
-        for tab_id in self.notebook.tabs():
-            self.notebook.forget(tab_id)
-
+        self.notebook.clear()
         self.parser = None
         self.selected_spectrum_ids = []
 
+    def clear(self):
+        self.clear_data()
 
-class CosineSimilarityVisualization(ttk.Frame):
-    """Component for visualizing cosine similarity matrix and statistics."""
 
-    def __init__(self, parent):
+# ---------------------------------------------------------------------------
+# CosineSimilarityVisualization
+# ---------------------------------------------------------------------------
+
+
+class CosineSimilarityVisualization(QWidget):
+    """Heatmap visualization of cosine similarity between spectra."""
+
+    MAX_SPECTRA_AUTO = 50
+    MAX_SPECTRA_MANUAL = 500
+
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.parser: Optional[MGFParser] = None
-        self.selected_spectrum_ids: List[int] = []
+        self.selected_spectrum_ids: List = []
         self.similarity_matrix: Optional[np.ndarray] = None
         self.calculation_thread: Optional[threading.Thread] = None
         self.cancel_calculation = False
-
-        # Performance limits
-        self.MAX_SPECTRA_AUTO = 20  # Auto-calculate up to this many spectra (reduced)
-        self.MAX_SPECTRA_MANUAL = (
-            100  # Allow manual calculation up to this many (reduced)
-        )
-
+        self._calculation_error: Optional[str] = None
+        self.naming_scheme: str = "Numbered"
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the cosine similarity visualization widgets."""
-        # Header
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
 
-        ttk.Label(
-            header_frame, text="Cosine Similarity", font=("Arial", 12, "bold")
-        ).pack()
+        # Controls
+        ctrl = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.addWidget(QLabel("Tolerance (Da):"))
+        self._tolerance_spin = QDoubleSpinBox()
+        self._tolerance_spin.setRange(0.0, 1.0)
+        self._tolerance_spin.setValue(0.02)
+        self._tolerance_spin.setSingleStep(0.01)
+        self._tolerance_spin.valueChanged.connect(self._on_tolerance_changed)
+        ctrl_layout.addWidget(self._tolerance_spin)
 
-        # Control frame
-        control_frame = ttk.Frame(header_frame)
-        control_frame.pack(fill="x", pady=2)
+        self._calc_btn = QPushButton("Calculate")
+        self._calc_btn.clicked.connect(self._recalculate_similarity)
+        ctrl_layout.addWidget(self._calc_btn)
 
-        # Tolerance setting
-        ttk.Label(control_frame, text="m/z Tolerance:").pack(side="left")
-        self.tolerance_var = tk.DoubleVar(value=0.1)
-        tolerance_spinbox = ttk.Spinbox(
-            control_frame,
-            from_=0.01,
-            to=1.0,
-            increment=0.01,
-            width=8,
-            textvariable=self.tolerance_var,
-            command=self._on_tolerance_changed,
-        )
-        tolerance_spinbox.pack(side="left", padx=5)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel_calculation)
+        ctrl_layout.addWidget(self._cancel_btn)
 
-        # Calculate button
-        self.calc_button = ttk.Button(
-            control_frame, text="Calculate", command=self._recalculate_similarity
-        )
-        self.calc_button.pack(side="left", padx=5)
+        self._progress_label = QLabel("")
+        ctrl_layout.addWidget(self._progress_label)
+        ctrl_layout.addStretch()
+        layout.addWidget(ctrl)
 
-        # Cancel button
-        self.cancel_button = ttk.Button(
-            control_frame,
-            text="Cancel",
-            command=self._cancel_calculation,
-            state="disabled",
-        )
-        self.cancel_button.pack(side="left", padx=2)
+        # Figure
+        self.figure = Figure(figsize=(6, 5), dpi=90)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, stretch=2)
 
-        # Progress bar
-        self.progress_var = tk.StringVar()
-        self.progress_label = ttk.Label(control_frame, textvariable=self.progress_var)
-        self.progress_label.pack(side="left", padx=10)
+        # Stats
+        self._stats_text = QTextEdit()
+        self._stats_text.setReadOnly(True)
+        self._stats_text.setMaximumHeight(80)
+        layout.addWidget(self._stats_text)
 
-        # Main content area
-        content_frame = ttk.Frame(self)
-        content_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Matplotlib figure for heatmap
-        self.figure = Figure(figsize=(6, 4), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, content_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
-
-        # Statistics frame
-        stats_frame = ttk.LabelFrame(
-            content_frame, text="Similarity Statistics", padding=5
-        )
-        stats_frame.pack(fill="x", pady=5)
-
-        self.stats_text = tk.Text(
-            stats_frame, height=4, wrap="word", font=("Courier", 9)
-        )
-        self.stats_text.pack(fill="x")
-
-    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
-        """Load and visualize cosine similarity for selected spectra."""
-        # Cancel any ongoing calculation
-        self._cancel_calculation()
-
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List):
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
-
-        # Check if we should auto-calculate or require manual trigger
+        self.similarity_matrix = None
+        self._stats_text.clear()
         if len(selected_spectrum_ids) <= self.MAX_SPECTRA_AUTO:
             self._calculate_and_display_similarity()
         else:
-            self._show_performance_warning()
+            self._show_large_dataset_warning()
 
-    def _show_performance_warning(self):
-        """Show performance warning for large selections."""
+    def set_naming_scheme(self, scheme: str):
+        self.naming_scheme = scheme
+        if self.similarity_matrix is not None:
+            self._display_similarity_results()
+
+    def clear_data(self):
         self.figure.clear()
-        self.stats_text.delete(1.0, tk.END)
+        self._stats_text.clear()
+        self.similarity_matrix = None
+        self.selected_spectrum_ids = []
+        self.canvas.draw()
 
-        n_selected = len(self.selected_spectrum_ids)
+    def _show_large_dataset_warning(self):
+        n = len(self.selected_spectrum_ids)
+        self.figure.clear()
         ax = self.figure.add_subplot(111)
-
-        if n_selected > self.MAX_SPECTRA_MANUAL:
-            warning_text = (
-                f"Too many spectra selected ({n_selected}).\n"
-                f"Maximum supported: {self.MAX_SPECTRA_MANUAL}\n\n"
-                f"Please select fewer spectra for\n"
-                f"similarity analysis."
-            )
-            self.calc_button.config(state="disabled")
+        if n > self.MAX_SPECTRA_MANUAL:
+            msg = f"Too many spectra ({n}).\nMaximum: {self.MAX_SPECTRA_MANUAL}"
+            self._calc_btn.setEnabled(False)
         else:
-            warning_text = (
-                f"Large selection ({n_selected} spectra).\n"
-                f"Similarity calculation may take time.\n\n"
-                f'Click "Calculate" to proceed.'
-            )
-            self.calc_button.config(state="normal")
-
+            msg = f'Large selection ({n} spectra).\nClick "Calculate" to proceed.'
+            self._calc_btn.setEnabled(True)
         ax.text(
             0.5,
             0.5,
-            warning_text,
+            msg,
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=11,
             color="orange",
+            fontsize=11,
         )
         ax.set_xticks([])
         ax.set_yticks([])
-
-        # Show computation complexity estimate
-        n_comparisons = n_selected * (n_selected - 1) // 2
-        stats_text = (
-            f"Selected: {n_selected} spectra\n"
-            f"Pairwise comparisons needed: {n_comparisons:,}\n"
-            f"Estimated time: {self._estimate_calculation_time(n_selected)}"
-        )
-        self.stats_text.insert(tk.END, stats_text)
-
-        self.progress_var.set("")
         self.canvas.draw()
 
-    def _estimate_calculation_time(self, n_spectra: int) -> str:
-        """Estimate calculation time based on number of spectra."""
-        n_comparisons = n_spectra * (n_spectra - 1) // 2
-
-        # Rough estimates based on typical performance
-        if n_comparisons < 100:
-            return "< 1 second"
-        elif n_comparisons < 1000:
-            return "1-5 seconds"
-        elif n_comparisons < 5000:
-            return "5-30 seconds"
-        elif n_comparisons < 20000:
-            return "30 seconds - 2 minutes"
-        else:
-            return "> 2 minutes"
-
     def _on_tolerance_changed(self):
-        """Handle tolerance change."""
-        # Only auto-recalculate for small selections
         if len(self.selected_spectrum_ids) <= self.MAX_SPECTRA_AUTO:
             self._recalculate_similarity()
 
     def _recalculate_similarity(self):
-        """Recalculate similarity with current tolerance."""
         if not self.parser or not self.selected_spectrum_ids:
             return
-
         if len(self.selected_spectrum_ids) > self.MAX_SPECTRA_MANUAL:
-            messagebox.showwarning(
+            QMessageBox.warning(
+                self,
                 "Too Many Spectra",
-                f"Cannot calculate similarity for {len(self.selected_spectrum_ids)} spectra.\n"
-                f"Maximum supported: {self.MAX_SPECTRA_MANUAL}",
+                f"Cannot calculate for {len(self.selected_spectrum_ids)} spectra.\n"
+                f"Maximum: {self.MAX_SPECTRA_MANUAL}",
             )
             return
-
         self._calculate_and_display_similarity()
 
-    def _cancel_calculation(self):
-        """Cancel ongoing calculation."""
-        if self.calculation_thread and self.calculation_thread.is_alive():
-            self.cancel_calculation = True
-            # Wait a bit for thread to finish
-            self.after(100, self._check_cancellation)
-
-    def _check_cancellation(self):
-        """Check if calculation thread has finished after cancellation."""
-        if self.calculation_thread and self.calculation_thread.is_alive():
-            # Still running, check again later
-            self.after(100, self._check_cancellation)
-        else:
-            # Thread finished
-            self._reset_ui_after_calculation()
-
-    def _reset_ui_after_calculation(self):
-        """Reset UI state after calculation completes or is cancelled."""
-        self.cancel_calculation = False
-        self.calc_button.config(state="normal")
-        self.cancel_button.config(state="disabled")
-        self.progress_var.set("")
-
     def _calculate_and_display_similarity(self):
-        """Calculate and display the cosine similarity matrix and statistics."""
-        # Clear display first
         self.figure.clear()
-        self.stats_text.delete(1.0, tk.END)
-
+        self._stats_text.clear()
         if not self.parser or len(self.selected_spectrum_ids) < 2:
             ax = self.figure.add_subplot(111)
-            if len(self.selected_spectrum_ids) == 1:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "Select 2+ spectra\nfor similarity comparison",
-                    ha="center",
-                    va="center",
-                    transform=ax.transAxes,
-                )
-                self.stats_text.insert(
-                    tk.END,
-                    "Single spectrum selected.\nSimilarity: 1.0 (self-similarity)",
-                )
-            else:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No spectra selected",
-                    ha="center",
-                    va="center",
-                    transform=ax.transAxes,
-                )
-                self.stats_text.insert(tk.END, "No spectra selected for comparison.")
+            ax.text(
+                0.5,
+                0.5,
+                "Select 2+ spectra for comparison",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
             self.canvas.draw()
             return
 
-        # For large calculations, use threading
+        # Special case: exactly 2 spectra → mirror plot
+        if len(self.selected_spectrum_ids) == 2:
+            specs = [
+                s
+                for s in self.parser.spectra
+                if s.spectrum_id in self.selected_spectrum_ids
+            ]
+            if len(specs) == 2:
+                self._display_mirror_plot(specs[0], specs[1])
+                return
+
         if len(self.selected_spectrum_ids) > 10:
             self._start_threaded_calculation()
         else:
             self._calculate_similarity_direct()
 
-    def _start_threaded_calculation(self):
-        """Start similarity calculation in a separate thread."""
-        # Update UI for calculation in progress
-        self.calc_button.config(state="disabled")
-        self.cancel_button.config(state="normal")
-        self.progress_var.set("Calculating...")
+    def _display_mirror_plot(self, spec1, spec2):
+        """Show a mirror plot for exactly two spectra with matched/unmatched fragment coloring."""
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        tol = self._tolerance_spin.value()
 
-        # Show placeholder while calculating
+        # Cosine similarity
+        sim = self.parser.calculate_cosine_similarity(spec1, spec2, tol)
+
+        def _norm_ions(ions):
+            if ions.size == 0:
+                return np.array([]), np.array([])
+            mz = ions[:, 0].copy()
+            inten = ions[:, 1].copy()
+            max_i = inten.max()
+            if max_i > 0:
+                inten = inten / max_i
+            return mz, inten
+
+        mz1, int1 = _norm_ions(spec1.ions)
+        mz2, int2 = _norm_ions(spec2.ions)
+
+        # Greedy matching
+        matched1: set = set()
+        matched2: set = set()
+        used2: set = set()
+        for i in range(len(mz1)):
+            best_j = None
+            best_dist = float("inf")
+            for j in range(len(mz2)):
+                if j in used2:
+                    continue
+                dist = abs(float(mz1[i]) - float(mz2[j]))
+                if dist <= tol and dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+            if best_j is not None:
+                matched1.add(i)
+                matched2.add(best_j)
+                used2.add(best_j)
+
+        # Plot spectrum 1 (positive, top)
+        for i, (m, inten) in enumerate(zip(mz1, int1)):
+            color = "steelblue" if i in matched1 else "firebrick"
+            ax.vlines(float(m), 0, float(inten), colors=color, linewidth=1.5)
+
+        # Plot spectrum 2 (negative, bottom)
+        for j, (m, inten) in enumerate(zip(mz2, int2)):
+            color = "steelblue" if j in matched2 else "firebrick"
+            ax.vlines(float(m), 0, -float(inten), colors=color, linewidth=1.5)
+
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("m/z")
+        ax.set_ylabel("Relative Intensity")
+
+        name1 = _format_spectrum_label(spec1, self.naming_scheme)
+        name2 = _format_spectrum_label(spec2, self.naming_scheme)
+        ax.set_title(
+            f"Mirror Plot: {name1}  ↑  /  ↓  {name2}\nCosine Similarity: {sim:.4f}",
+            fontsize=10,
+        )
+
+        # Fix y-axis tick labels to show absolute values
+        yticks = ax.get_yticks()
+        ax.set_yticklabels([f"{abs(v):.1f}" for v in yticks])
+
+        # Spectrum name annotations
+        ax.text(
+            0.01, 0.98, name1, transform=ax.transAxes, va="top", ha="left", fontsize=8
+        )
+        ax.text(
+            0.01,
+            0.02,
+            name2,
+            transform=ax.transAxes,
+            va="bottom",
+            ha="left",
+            fontsize=8,
+        )
+
+        legend_elements = [
+            Line2D([0], [0], color="steelblue", linewidth=2, label="Matched"),
+            Line2D([0], [0], color="firebrick", linewidth=2, label="Unmatched"),
+        ]
+        ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        self.figure.tight_layout()
+        self.canvas.draw()
+        self._stats_text.setPlainText(
+            f"Mirror Plot: {name1} vs {name2}  |  Cosine Similarity: {sim:.4f}"
+            f"  |  Tolerance: {tol:.3f} Da"
+            f"  |  Matched fragments: {len(matched1)}"
+            f" / spec1={len(mz1)}, spec2={len(mz2)}"
+        )
+
+    def _start_threaded_calculation(self):
+        self._calc_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._progress_label.setText("Calculating...")
         ax = self.figure.add_subplot(111)
         ax.text(
             0.5,
             0.5,
-            "Calculating similarity matrix...\nPlease wait",
+            "Calculating...\nPlease wait",
             ha="center",
             va="center",
             transform=ax.transAxes,
@@ -3655,82 +2151,70 @@ class CosineSimilarityVisualization(ttk.Frame):
         ax.set_xticks([])
         ax.set_yticks([])
         self.canvas.draw()
-
-        # Start calculation thread
         self.cancel_calculation = False
+        self._calculation_error = None
         self.calculation_thread = threading.Thread(
             target=self._calculate_similarity_threaded, daemon=True
         )
         self.calculation_thread.start()
-
-        # Start monitoring the calculation
         self._check_calculation_progress()
 
     def _calculate_similarity_threaded(self):
-        """Calculate similarity matrix in a separate thread with progress updates."""
         try:
-            tolerance = self.tolerance_var.get()
-            n_spectra = len(self.selected_spectrum_ids)
-
-            # Get spectra objects
+            tolerance = self._tolerance_spin.value()
             spectra = [
                 s
                 for s in self.parser.spectra
                 if s.spectrum_id in self.selected_spectrum_ids
             ]
-
-            if n_spectra < 2:
-                self.similarity_matrix = np.array([[1.0]] if n_spectra == 1 else [])
+            n = len(spectra)
+            if n < 2:
+                self.similarity_matrix = np.array([[1.0]] if n == 1 else [])
                 return
-
-            similarity_matrix = np.zeros((n_spectra, n_spectra))
-            total_calculations = n_spectra * (n_spectra - 1) // 2
+            sim_matrix = np.zeros((n, n))
+            total = n * (n - 1) // 2
             completed = 0
-
-            # Fill diagonal with 1.0
-            for i in range(n_spectra):
-                similarity_matrix[i, i] = 1.0
-
-            # Calculate upper triangle only
-            for i in range(n_spectra):
+            for i in range(n):
+                sim_matrix[i, i] = 1.0
+            for i in range(n):
                 if self.cancel_calculation:
                     return
-
-                for j in range(i + 1, n_spectra):
+                for j in range(i + 1, n):
                     if self.cancel_calculation:
                         return
-
-                    # Calculate similarity
                     sim = self.parser.calculate_cosine_similarity(
                         spectra[i], spectra[j], tolerance
                     )
-                    similarity_matrix[i, j] = sim
-                    similarity_matrix[j, i] = sim  # Symmetric
-
+                    sim_matrix[i, j] = sim
+                    sim_matrix[j, i] = sim
                     completed += 1
-
-                    # Update progress periodically
-                    if completed % max(1, total_calculations // 20) == 0:
-                        progress_pct = (completed / total_calculations) * 100
-                        self.after_idle(
-                            lambda p=progress_pct: self.progress_var.set(
+                    if completed % max(1, total // 20) == 0:
+                        pct = completed / total * 100
+                        QTimer.singleShot(
+                            0,
+                            lambda p=pct: self._progress_label.setText(
                                 f"Calculating... {p:.0f}%"
-                            )
+                            ),
                         )
-
             if not self.cancel_calculation:
-                self.similarity_matrix = similarity_matrix
-                # Schedule UI update on main thread
-                self.after_idle(self._display_similarity_results)
-
+                self.similarity_matrix = sim_matrix
         except Exception as e:
-            # Handle errors
-            self.after_idle(lambda: self._show_calculation_error(str(e)))
+            self._calculation_error = str(e)
+
+    def _check_calculation_progress(self):
+        if self.calculation_thread and self.calculation_thread.is_alive():
+            QTimer.singleShot(100, self._check_calculation_progress)
+        else:
+            self._reset_ui_after_calculation()
+            if self._calculation_error:
+                self._show_calculation_error(self._calculation_error)
+                self._calculation_error = None
+            elif self.similarity_matrix is not None:
+                self._display_similarity_results()
 
     def _calculate_similarity_direct(self):
-        """Calculate similarity matrix directly (for small datasets)."""
         try:
-            tolerance = self.tolerance_var.get()
+            tolerance = self._tolerance_spin.value()
             self.similarity_matrix = self.parser.calculate_similarity_matrix(
                 self.selected_spectrum_ids, tolerance
             )
@@ -3738,63 +2222,59 @@ class CosineSimilarityVisualization(ttk.Frame):
         except Exception as e:
             self._show_calculation_error(str(e))
 
-    def _show_calculation_error(self, error_msg: str):
-        """Show calculation error in the display."""
+    def _cancel_calculation(self):
+        self.cancel_calculation = True
+
+    def _reset_ui_after_calculation(self):
+        self.cancel_calculation = False
+        self._calc_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
+        self._progress_label.setText("")
+
+    def _show_calculation_error(self, msg: str):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         ax.text(
             0.5,
             0.5,
-            f"Calculation Error:\n{error_msg}",
+            f"Error:\n{msg}",
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=10,
             color="red",
         )
         ax.set_xticks([])
         ax.set_yticks([])
         self.canvas.draw()
-        self._reset_ui_after_calculation()
-
-    def _check_calculation_progress(self):
-        """Check if threaded calculation is complete."""
-        if self.calculation_thread and self.calculation_thread.is_alive():
-            # Still calculating, check again later
-            self.after(100, self._check_calculation_progress)
-        else:
-            # Calculation finished
-            self._reset_ui_after_calculation()
 
     def _display_similarity_results(self):
-        """Display the calculated similarity matrix and statistics."""
         if self.similarity_matrix is None or self.similarity_matrix.size == 0:
             return
-
-        # Create heatmap
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         im = ax.imshow(
             self.similarity_matrix, cmap="viridis", vmin=0, vmax=1, aspect="equal"
         )
-
-        # Add colorbar
         cbar = self.figure.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label("Cosine Similarity", rotation=270, labelpad=15)
 
-        # Set labels
-        spectrum_labels = [f"S{sid}" for sid in self.selected_spectrum_ids]
-        ax.set_xticks(range(len(spectrum_labels)))
-        ax.set_yticks(range(len(spectrum_labels)))
-        ax.set_xticklabels(spectrum_labels, rotation=45, ha="right")
-        ax.set_yticklabels(spectrum_labels)
+        # Get spectra and format labels
+        spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+        labels = [_format_spectrum_label(s, self.naming_scheme) for s in spectra]
 
-        # Add text annotations for values (only for smaller matrices)
+        ax.set_xticks(range(len(labels)))
+        ax.set_yticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_yticklabels(labels)
         n = self.similarity_matrix.shape[0]
-        if n <= 20:  # Only show values for matrices up to 20x20
+        if n <= 20:
             for i in range(n):
                 for j in range(n):
-                    text = ax.text(
+                    ax.text(
                         j,
                         i,
                         f"{self.similarity_matrix[i, j]:.3f}",
@@ -3803,3091 +2283,816 @@ class CosineSimilarityVisualization(ttk.Frame):
                         color="white",
                         fontsize=8,
                     )
-
-        tolerance = self.tolerance_var.get()
-        ax.set_title(f"Similarity Matrix (tolerance: {tolerance:.2f})")
-
-        # Adjust layout
+        tol = self._tolerance_spin.value()
+        ax.set_title(f"Similarity Matrix (tolerance: {tol:.2f})")
         self.figure.tight_layout()
         self.canvas.draw()
-
-        # Calculate and display statistics
         self._display_statistics()
 
     def _display_statistics(self):
-        """Display similarity statistics."""
-        if self.similarity_matrix is None or self.similarity_matrix.size == 0:
+        if self.similarity_matrix is None:
             return
-
-        # Get upper triangle (excluding diagonal) for statistics
         n = self.similarity_matrix.shape[0]
         if n < 2:
             return
-
-        # Extract unique pairwise similarities (upper triangle, no diagonal)
-        triu_indices = np.triu_indices(n, k=1)
-        similarities = self.similarity_matrix[triu_indices]
-
-        if len(similarities) == 0:
+        triu = np.triu_indices(n, k=1)
+        sims = self.similarity_matrix[triu]
+        if len(sims) == 0:
             return
-
-        # Calculate percentiles
-        percentiles = [0, 10, 25, 50, 75, 90, 100]
-        values = np.percentile(similarities, percentiles)
-
-        # Format statistics
-        stats_text = f"Pairwise Similarities (n={len(similarities)}):\n"
-        stats_text += (
-            f"Min:    {values[0]:.4f}   10%: {values[1]:.4f}   25%: {values[2]:.4f}\n"
+        pcts = np.percentile(sims, [0, 10, 25, 50, 75, 90, 100])
+        txt = (
+            f"Pairwise Similarities (n={len(sims)}):\n"
+            f"Min: {pcts[0]:.4f}  10%: {pcts[1]:.4f}  25%: {pcts[2]:.4f}\n"
+            f"Median: {pcts[3]:.4f}  75%: {pcts[4]:.4f}  90%: {pcts[5]:.4f}\n"
+            f"Max: {pcts[6]:.4f}  Mean: {np.mean(sims):.4f}"
         )
-        stats_text += (
-            f"Median: {values[3]:.4f}   75%: {values[4]:.4f}   90%: {values[5]:.4f}\n"
-        )
-        stats_text += f"Max:    {values[6]:.4f}   Mean: {np.mean(similarities):.4f}"
-
-        self.stats_text.delete(1.0, tk.END)
-        self.stats_text.insert(tk.END, stats_text)
-
-    def clear_data(self):
-        """Clear all data from the cosine similarity visualization."""
-        self.heatmap_canvas.delete("all")
-        self.stats_text.delete(1.0, tk.END)
-        self.similarity_matrix = None
-        self.selected_spectra = []
+        self._stats_text.setPlainText(txt)
 
 
-class FileLoadingDialog:
-    """Dialog for configuring file loading options including database identifier and prefix."""
+# ---------------------------------------------------------------------------
+# FileLoadingDialog
+# ---------------------------------------------------------------------------
+
+
+class FileLoadingDialog(QDialog):
+    """Dialog for file loading options: database identifier and prefix."""
 
     def __init__(self, parent, file_to_load, existing_prefixes=None):
-        self.parent = parent
+        super().__init__(parent)
         self.file_to_load = file_to_load
-        self.existing_prefixes = existing_prefixes or set()
+        self.existing_prefixes = set(existing_prefixes or [])
         self.result = None
+        self.setWindowTitle("File Loading Options")
+        self.setMinimumWidth(450)
+        self._build_ui()
+        self.exec()
 
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("File Loading Options")
-        self.dialog.geometry("450x400")
-        self.dialog.resizable(True, True)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
 
-        # Center the dialog
-        self.dialog.geometry(
-            "+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50)
+        lbl = QLabel(f"Configure options for:\n'{self.file_to_load}'\n(* = required)")
+        layout.addWidget(lbl)
+
+        db_box = QGroupBox("Database Information")
+        db_layout = QVBoxLayout(db_box)
+        db_layout.addWidget(QLabel("Database Identifier: *"))
+        self._db_edit = QLineEdit()
+        self._db_edit.textChanged.connect(self._validate)
+        db_layout.addWidget(self._db_edit)
+        layout.addWidget(db_box)
+
+        prefix_box = QGroupBox("Spectrum ID Prefix")
+        prefix_layout = QVBoxLayout(prefix_box)
+        prefix_layout.addWidget(QLabel("Prefix for spectrum IDs: *"))
+        self._prefix_edit = QLineEdit()
+        self._prefix_edit.textChanged.connect(self._validate)
+        prefix_layout.addWidget(self._prefix_edit)
+        self._prefix_status = QLabel("")
+        prefix_layout.addWidget(self._prefix_status)
+        layout.addWidget(prefix_box)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        self._ok_btn = bb.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok_btn.setEnabled(False)
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+        self._db_edit.setFocus()
 
-        self._create_widgets()
-        self.dialog.wait_window()
-
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=15)
-        main_frame.pack(fill="both", expand=True)
-
-        # Instructions
-        instructions = ttk.Label(
-            main_frame,
-            text=f"Configure metadata and naming options for the loaded spectra:\n(* indicates required fields)\nFile is: '{self.file_to_load}'",
-            font=("Arial", 10),
-        )
-        instructions.pack(anchor="w", pady=(0, 15))
-
-        # Database identifier section
-        db_frame = ttk.LabelFrame(main_frame, text="Database Information", padding=10)
-        db_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(db_frame, text="Database Identifier: *").pack(anchor="w")
-        self.database_identifier_var = tk.StringVar()
-        db_entry = ttk.Entry(
-            db_frame, textvariable=self.database_identifier_var, width=40
-        )
-        db_entry.pack(fill="x", pady=(5, 0))
-
-        # Bind validation to database identifier entry
-        self.database_identifier_var.trace_add("write", self._validate_database_id)
-
-        ttk.Label(
-            db_frame,
-            text="This identifier will be added to all spectra metadata (required)",
-            font=("Arial", 8),
-            foreground="gray",
-        ).pack(anchor="w", pady=(2, 0))
-
-        # Prefix section
-        prefix_frame = ttk.LabelFrame(main_frame, text="Spectrum ID Prefix", padding=10)
-        prefix_frame.pack(fill="x", pady=(0, 15))
-
-        ttk.Label(prefix_frame, text="Prefix for spectrum IDs: *").pack(anchor="w")
-        self.prefix_var = tk.StringVar()
-        self.prefix_entry = ttk.Entry(
-            prefix_frame, textvariable=self.prefix_var, width=40
-        )
-        self.prefix_entry.pack(fill="x", pady=(5, 0))
-
-        # Validation label for prefix
-        self.prefix_status_label = ttk.Label(
-            prefix_frame,
-            text="This prefix will be applied to each spectrum ID",
-            font=("Arial", 8),
-            foreground="gray",
-        )
-        self.prefix_status_label.pack(anchor="w", pady=(2, 0))
-
-        # Bind validation to prefix entry
-        self.prefix_var.trace_add("write", self._validate_prefix)
-
-        # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
-            side="right", padx=(5, 0)
-        )
-        self.ok_button = ttk.Button(button_frame, text="OK", command=self._ok)
-        self.ok_button.pack(side="right")
-
-        # Initially disable OK button since fields are required
-        self.ok_button.config(state="disabled")
-
-        # Bind Enter and Escape keys
-        self.dialog.bind("<Return>", lambda e: self._ok())
-        self.dialog.bind("<Escape>", lambda e: self._cancel())
-
-        # Focus on database identifier entry
-        db_entry.focus_set()
-
-    def _validate_prefix(self, *args):
-        """Validate the prefix to ensure it hasn't been used before."""
-        prefix = self.prefix_var.get().strip()
-
+    def _validate(self):
+        prefix = self._prefix_edit.text().strip()
+        db_id = self._db_edit.text().strip()
         if not prefix:
-            self.prefix_status_label.config(
-                text="⚠ Prefix is required",
-                foreground="red",
-            )
-            self._update_ok_button_state()
+            self._prefix_status.setText("⚠ Prefix is required")
+            self._ok_btn.setEnabled(False)
         elif prefix in self.existing_prefixes:
-            self.prefix_status_label.config(
-                text="⚠ This prefix has already been used!", foreground="red"
-            )
-            self._update_ok_button_state()
+            self._prefix_status.setText("⚠ Prefix already used")
+            self._ok_btn.setEnabled(False)
         else:
-            self.prefix_status_label.config(
-                text="✓ Prefix is available", foreground="green"
-            )
-            self._update_ok_button_state()
+            self._prefix_status.setText("✓ Available")
+            self._ok_btn.setEnabled(bool(db_id))
 
-    def _validate_database_id(self, *args):
-        """Validate the database identifier."""
-        self._update_ok_button_state()
-
-    def _update_ok_button_state(self):
-        """Update the OK button state based on validation."""
-        prefix = self.prefix_var.get().strip()
-        database_id = self.database_identifier_var.get().strip()
-
-        # Both fields are required and prefix must not be used
-        if database_id and prefix and prefix not in self.existing_prefixes:
-            self.ok_button.config(state="normal")
-        else:
-            self.ok_button.config(state="disabled")
-
-    def _ok(self):
-        """Handle OK button."""
-        prefix = self.prefix_var.get().strip()
-        database_id = self.database_identifier_var.get().strip()
-
-        # Validate required fields
-        if not database_id:
-            messagebox.showerror(
-                "Missing Information", "Database identifier is required."
-            )
+    def _on_ok(self):
+        prefix = self._prefix_edit.text().strip()
+        db_id = self._db_edit.text().strip()
+        if not db_id:
+            QMessageBox.critical(self, "Missing", "Database identifier is required.")
             return
-
         if not prefix:
-            messagebox.showerror("Missing Information", "Prefix is required.")
+            QMessageBox.critical(self, "Missing", "Prefix is required.")
             return
-
-        # Final validation
         if prefix in self.existing_prefixes:
-            messagebox.showerror(
-                "Invalid Prefix",
-                f"The prefix '{prefix}' has already been used. Please choose a different prefix.",
-            )
+            QMessageBox.critical(self, "Invalid", f"Prefix '{prefix}' already used.")
             return
-
-        self.result = {
-            "database_identifier": database_id,
-            "prefix": prefix,
-        }
-        self.dialog.destroy()
-
-    def _cancel(self):
-        """Handle Cancel button."""
-        self.result = None
-        self.dialog.destroy()
+        self.result = {"database_identifier": db_id, "prefix": prefix}
+        self.accept()
 
 
-class AverageSpectrumDialog:
-    """Dialog for configuring spectrum averaging parameters."""
+# ---------------------------------------------------------------------------
+# AverageSpectrumDialog
+# ---------------------------------------------------------------------------
+
+
+class AverageSpectrumDialog(QDialog):
+    """Dialog for average spectrum parameters."""
 
     def __init__(self, parent):
+        super().__init__(parent)
         self.result = None
+        self.setWindowTitle("Calculate Average Spectrum per Group")
+        self.setMinimumWidth(420)
+        self._build_ui()
+        self.exec()
 
-        # Create dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Calculate Average Spectrum per Group")
-        self.dialog.geometry("450x450")
-        self.dialog.resizable(True, True)
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
 
-        # Make dialog modal
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
+        title = QLabel("Average Spectrum Parameters")
+        title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(title)
 
-        # Center dialog on parent
-        self.dialog.geometry(
-            "+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50)
+        params_box = QGroupBox("Parameters")
+        grid = QGridLayout(params_box)
+
+        grid.addWidget(QLabel("Binning m/z tolerance:"), 0, 0)
+        self._binning_edit = QDoubleSpinBox()
+        self._binning_edit.setRange(0.001, 10.0)
+        self._binning_edit.setValue(0.1)
+        self._binning_edit.setDecimals(3)
+        grid.addWidget(self._binning_edit, 0, 1)
+
+        grid.addWidget(QLabel("Averaging method:"), 1, 0)
+        self._method_combo = QComboBox()
+        self._method_combo.addItems(["average", "median"])
+        grid.addWidget(self._method_combo, 1, 1)
+
+        grid.addWidget(QLabel("New metadata key:"), 2, 0)
+        self._key_edit = QLineEdit("group_average")
+        grid.addWidget(self._key_edit, 2, 1)
+
+        grid.addWidget(QLabel("New metadata value:"), 3, 0)
+        self._value_edit = QLineEdit("averaged_spectrum")
+        grid.addWidget(self._value_edit, 3, 1)
+
+        layout.addWidget(params_box)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
 
-        self._create_widgets()
-
-        # Wait for dialog to close
-        self.dialog.wait_window()
-
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill="both", expand=True)
-
-        # Title
-        title_label = ttk.Label(
-            main_frame,
-            text="Average Spectrum Parameters",
-            font=("TkDefaultFont", 12, "bold"),
-        )
-        title_label.pack(pady=(0, 20))
-
-        # Parameters frame
-        params_frame = ttk.Frame(main_frame)
-        params_frame.pack(fill="x", pady=(0, 20))
-
-        # Binning m/z
-        binning_frame = ttk.Frame(params_frame)
-        binning_frame.pack(fill="x", pady=5)
-
-        ttk.Label(
-            binning_frame, text="Binning m/z tolerance:", width=20, anchor="w"
-        ).pack(side="left")
-        self.binning_var = tk.StringVar(value="0.1")
-        binning_entry = ttk.Entry(
-            binning_frame, textvariable=self.binning_var, width=12
-        )
-        binning_entry.pack(side="right")
-
-        # Averaging method
-        method_frame = ttk.Frame(params_frame)
-        method_frame.pack(fill="x", pady=5)
-
-        ttk.Label(method_frame, text="Averaging method:", width=20, anchor="w").pack(
-            side="left"
-        )
-        self.method_var = tk.StringVar(value="average")
-        method_combo = ttk.Combobox(
-            method_frame,
-            textvariable=self.method_var,
-            values=["average", "median"],
-            state="readonly",
-            width=10,
-        )
-        method_combo.pack(side="right")
-
-        # New key
-        key_frame = ttk.Frame(params_frame)
-        key_frame.pack(fill="x", pady=5)
-
-        ttk.Label(key_frame, text="New metadata key:", width=20, anchor="w").pack(
-            side="left"
-        )
-        self.key_var = tk.StringVar(value="SPECTYPE")
-        key_entry = ttk.Entry(key_frame, textvariable=self.key_var, width=12)
-        key_entry.pack(side="right")
-
-        # New value
-        value_frame = ttk.Frame(params_frame)
-        value_frame.pack(fill="x", pady=5)
-
-        ttk.Label(value_frame, text="New metadata value:", width=20, anchor="w").pack(
-            side="left"
-        )
-        self.value_var = tk.StringVar(value="Averaged")
-        value_entry = ttk.Entry(value_frame, textvariable=self.value_var, width=12)
-        value_entry.pack(side="right")
-
-        # Info text
-        info_text = (
-            "This will create average spectra for each group at the same level.\n"
-            "Spectra will be normalized using common peaks and then averaged.\n"
-            "Groups with only one spectrum will be skipped.\n\n"
-            "Peak combining: Peaks with similar m/z values (within tolerance)\n"
-            "will be combined into single peaks with weighted average m/z."
-        )
-        info_label = ttk.Label(
-            main_frame,
-            text=info_text,
-            wraplength=400,
-            justify="left",
-            foreground="gray",
-        )
-        info_label.pack(pady=(0, 20))
-
-        # Buttons - try a completely different approach with regular tkinter buttons
-        button_frame = tk.Frame(main_frame, height=60, bg="SystemButtonFace")
-
-        # Use regular tk.Button instead of ttk.Button
-        cancel_btn = tk.Button(
-            button_frame,
-            text="Cancel",
-            command=self._cancel,
-            width=12,
-            height=2,
-            font=("TkDefaultFont", 9),
-        )
-        cancel_btn.pack(side="right", padx=10, pady=15)
-
-        calculate_btn = tk.Button(
-            button_frame,
-            text="Calculate",
-            command=self._ok,
-            width=12,
-            height=2,
-            font=("TkDefaultFont", 9),
-        )
-        calculate_btn.pack(side="right", padx=5, pady=15)
-        button_frame.pack(fill="x", pady=20)
-        button_frame.pack_propagate(False)
-
-    def _ok(self):
-        """Handle OK button."""
+    def _on_ok(self):
         try:
-            binning_mz = float(self.binning_var.get())
-            if binning_mz <= 0:
-                raise ValueError("Binning m/z must be positive")
-        except ValueError:
-            messagebox.showerror("Error", "Invalid binning m/z value")
+            binning = self._binning_edit.value()
+        except Exception:
+            QMessageBox.critical(self, "Error", "Invalid binning value.")
             return
-
-        new_key = self.key_var.get().strip()
-        new_value = self.value_var.get().strip()
-
-        if not new_key:
-            messagebox.showerror("Error", "New metadata key cannot be empty")
-            return
-
-        if not new_value:
-            messagebox.showerror("Error", "New metadata value cannot be empty")
-            return
-
         self.result = {
-            "binning_mz": binning_mz,
-            "averaging_method": self.method_var.get(),
-            "new_key": new_key,
-            "new_value": new_value,
+            "binning_mz": binning,
+            "averaging_method": self._method_combo.currentText(),
+            "new_key": self._key_edit.text().strip(),
+            "new_value": self._value_edit.text().strip(),
         }
+        self.accept()
 
-        self.dialog.destroy()
 
-    def _cancel(self):
-        """Handle Cancel button."""
-        self.result = None
-        self.dialog.destroy()
+# ---------------------------------------------------------------------------
+# SmartsFilterDialog
+# ---------------------------------------------------------------------------
 
 
 class SmartsFilterDialog:
-    """Dialog for SMARTS substructure filtering."""
+    """SMARTS substructure filter dialog (non-modal)."""
 
     def __init__(self, parent, spectra, apply_callback):
         self.parent = parent
         self.spectra = spectra
         self.apply_callback = apply_callback
-        self.matching_spectra = []
-        self.unique_smiles = []
-        self.smiles_to_spectra = {}
-
-        # Create dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("SMARTS Substructure Filter")
-        self.dialog.geometry("1200x800")
-        self.dialog.resizable(True, True)
-        self.dialog.grab_set()  # Make dialog modal
-
-        self._create_widgets()
-
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        # Main frame
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # SMARTS input section
-        input_frame = ttk.LabelFrame(main_frame, text="SMARTS Pattern", padding=5)
-        input_frame.pack(fill="x", pady=(0, 10))
-
-        # SMARTS input section
-        input_frame = ttk.LabelFrame(main_frame, text="SMARTS Pattern", padding=5)
-        input_frame.pack(fill="x", pady=(0, 10))
-
-        # Label and Examples button frame
-        label_frame = ttk.Frame(input_frame)
-        label_frame.pack(fill="x", anchor="w")
-
-        ttk.Label(label_frame, text="Enter SMARTS pattern(s):").pack(side="left")
-        ttk.Button(
-            label_frame, text="Examples", command=self._show_examples_menu, width=10
-        ).pack(side="left", padx=(10, 0))
-
-        ttk.Label(
-            input_frame,
-            text="Use ' ' to separate multiple patterns for OR logic (e.g., 'c1ccccc1 C=O N')",
-            font=("Arial", 9),
-            foreground="gray",
-        ).pack(anchor="w", pady=(5, 5))
-
-        # SMARTS entry and Generate Overview button frame
-        entry_frame = ttk.Frame(input_frame)
-        entry_frame.pack(fill="x", pady=(0, 10))
-
-        self.smarts_var = tk.StringVar()
-        self.smarts_entry = ttk.Entry(
-            entry_frame, textvariable=self.smarts_var, font=("Courier", 12)
-        )
-        self.smarts_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        ttk.Button(
-            entry_frame, text="Generate Overview", command=self._generate_overview
-        ).pack(side="right")
-        self.smarts_entry.bind("<KeyRelease>", self._on_smarts_change)
-
-        # Store examples for context menu
-        self.examples = [
+        self.matching_spectra: List = []
+        self._dialog = QDialog(parent)
+        self._dialog.setWindowTitle("SMARTS Substructure Filter")
+        self._dialog.resize(1000, 700)
+        self._examples = [
             ("Benzene ring", "c1ccccc1"),
             ("Carbonyl", "C=O"),
             ("Hydroxyl", "O"),
             ("Ester", "C(=O)O"),
-            (
-                "Flavone or Iso-Flavone",
-                "[O,o]~[C,c]~1~[C,c]~[C,c](~[O,o]~[C,c]2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~1~2)~[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]3  [C,c]~1~[C,c]~[C,c](~[O,o]~[C,c]2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~1~2)~[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]3  [O,o]~[C,c]~1~[C,c]~2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~2~[O,o]~[C,c]~[C,c]~1[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~3  [C,c]~1~[C,c]~2~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~2~[O,o]~[C,c]~[C,c]~1[C,c]~3~[C,c]~[C,c]~[C,c]~[C,c]~[C,c]~3",
-            ),
         ]
+        self._build_ui()
+        self._dialog.show()
 
-        # SMARTS visualization frame
-        viz_frame = ttk.LabelFrame(main_frame, text="Pattern Visualization", padding=5)
-        viz_frame.pack(fill="x", pady=(0, 10))
+    def _build_ui(self):
+        layout = QVBoxLayout(self._dialog)
 
-        self.pattern_canvas = tk.Canvas(viz_frame, height=150, bg="white")
-        self.pattern_canvas.pack(fill="x")
+        # SMARTS input
+        input_box = QGroupBox("SMARTS Pattern")
+        input_layout = QVBoxLayout(input_box)
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Enter SMARTS pattern(s) (space-separated for OR):"))
+        ex_btn = QPushButton("Examples")
+        ex_btn.clicked.connect(self._show_examples_menu)
+        top_row.addWidget(ex_btn)
+        input_layout.addLayout(top_row)
+        self._smarts_edit = QLineEdit()
+        self._smarts_edit.setFont(QFont("Courier", 12))
+        self._smarts_edit.textChanged.connect(self._on_smarts_change)
+        input_layout.addWidget(self._smarts_edit)
+        layout.addWidget(input_box)
 
-        # Results section
-        results_frame = ttk.LabelFrame(main_frame, text="Filtering Results", padding=5)
-        results_frame.pack(fill="both", expand=True, pady=(0, 10))
+        # Results
+        results_box = QGroupBox("Results")
+        results_layout = QHBoxLayout(results_box)
+        self._matched_list = QListWidget()
+        matched_group = QGroupBox("Matched (0)")
+        ml = QVBoxLayout(matched_group)
+        ml.addWidget(self._matched_list)
+        results_layout.addWidget(matched_group)
+        self._matched_group_label = matched_group
 
-        # Create paned window for matched/unmatched structures
-        paned_window = ttk.PanedWindow(results_frame, orient="horizontal")
-        paned_window.pack(fill="both", expand=True)
+        self._unmatched_list = QListWidget()
+        unmatched_group = QGroupBox("Unmatched (0)")
+        ul = QVBoxLayout(unmatched_group)
+        ul.addWidget(self._unmatched_list)
+        results_layout.addWidget(unmatched_group)
+        self._unmatched_group_label = unmatched_group
+        layout.addWidget(results_box)
 
-        # Matched structures frame
-        matched_frame = ttk.LabelFrame(
-            paned_window, text="Matched Structures (0)", padding=5
-        )
-        paned_window.add(matched_frame, weight=1)
-
-        # Create scrollable frame for matched structures
-        self.matched_canvas = tk.Canvas(matched_frame, bg="white")
-        matched_scrollbar = ttk.Scrollbar(
-            matched_frame, orient="vertical", command=self.matched_canvas.yview
-        )
-        self.matched_scrollable_frame = ttk.Frame(self.matched_canvas)
-
-        self.matched_scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.matched_canvas.configure(
-                scrollregion=self.matched_canvas.bbox("all")
-            ),
-        )
-
-        self.matched_canvas.create_window(
-            (0, 0), window=self.matched_scrollable_frame, anchor="nw"
-        )
-        self.matched_canvas.configure(yscrollcommand=matched_scrollbar.set)
-
-        self.matched_canvas.pack(side="left", fill="both", expand=True)
-        matched_scrollbar.pack(side="right", fill="y")
-
-        # Unmatched structures frame
-        unmatched_frame = ttk.LabelFrame(
-            paned_window, text="Unmatched Structures (0)", padding=5
-        )
-        paned_window.add(unmatched_frame, weight=1)
-
-        # Create scrollable frame for unmatched structures
-        self.unmatched_canvas = tk.Canvas(unmatched_frame, bg="white")
-        unmatched_scrollbar = ttk.Scrollbar(
-            unmatched_frame, orient="vertical", command=self.unmatched_canvas.yview
-        )
-        self.unmatched_scrollable_frame = ttk.Frame(self.unmatched_canvas)
-
-        self.unmatched_scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.unmatched_canvas.configure(
-                scrollregion=self.unmatched_canvas.bbox("all")
-            ),
-        )
-
-        self.unmatched_canvas.create_window(
-            (0, 0), window=self.unmatched_scrollable_frame, anchor="nw"
-        )
-        self.unmatched_canvas.configure(yscrollcommand=unmatched_scrollbar.set)
-
-        self.unmatched_canvas.pack(side="left", fill="both", expand=True)
-        unmatched_scrollbar.pack(side="right", fill="y")
-
-        # Bind mouse wheel to canvases
-        self._bind_mousewheel(self.matched_canvas)
-        self._bind_mousewheel(self.unmatched_canvas)
-
-        # Button frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(button_frame, text="Apply Filter", command=self._apply_filter).pack(
-            side="right", padx=(5, 0)
-        )
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(side="right")
-
-        # Status label
-        self.status_var = tk.StringVar(
-            value="Enter a SMARTS pattern and click 'Generate Overview' to begin"
-        )
-        ttk.Label(button_frame, textvariable=self.status_var).pack(side="left")
-
-    def _bind_mousewheel(self, canvas):
-        """Bind mouse wheel scrolling to canvas."""
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_to_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        def _unbind_from_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
-
-        canvas.bind("<Enter>", _bind_to_mousewheel)
-        canvas.bind("<Leave>", _unbind_from_mousewheel)
-
-    def _set_smarts_pattern(self, pattern):
-        """Set SMARTS pattern from example button."""
-        self.smarts_var.set(pattern)
-        self._on_smarts_change()
-        # Automatically generate overview when using example patterns
-        self._generate_overview()
+        # Buttons
+        btn_row = QHBoxLayout()
+        self._status_lbl = QLabel("Enter a SMARTS pattern to begin")
+        btn_row.addWidget(self._status_lbl, stretch=1)
+        apply_btn = QPushButton("Apply Filter")
+        apply_btn.clicked.connect(self._apply_filter)
+        btn_row.addWidget(apply_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self._dialog.close)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
 
     def _show_examples_menu(self):
-        """Show context menu with example SMARTS patterns."""
-        # Create context menu
-        context_menu = tk.Menu(self.dialog, tearoff=0)
+        menu = QMenu(self._dialog)
+        for name, pattern in self._examples:
+            act = menu.addAction(f"{name} ({pattern})")
+            act.triggered.connect(lambda checked, p=pattern: self._set_pattern(p))
+        menu.exec(QCursor.pos())
 
-        # Add examples to menu
-        for name, pattern in self.examples:
-            # Truncate long patterns for display
-            display_pattern = pattern if len(pattern) <= 50 else pattern[:47] + "..."
-            menu_text = f"{name} ({display_pattern})"
-            context_menu.add_command(
-                label=menu_text, command=lambda p=pattern: self._set_smarts_pattern(p)
-            )
-
-        # Show menu at mouse position
-        try:
-            context_menu.tk_popup(
-                self.dialog.winfo_pointerx(), self.dialog.winfo_pointery()
-            )
-        finally:
-            context_menu.grab_release()
-
-    def _on_smarts_change(self, event=None):
-        """Handle SMARTS pattern change."""
-        pattern = self.smarts_var.get().strip()
-
-        if not pattern:
-            self._clear_visualization()
-            return
-
-        # Only visualize the SMARTS pattern, don't perform filtering yet
-        self._visualize_smarts_pattern(pattern)
-
-        # Update status to prompt user to generate overview
-        self.status_var.set("Pattern loaded. Click 'Generate Overview' to see matches.")
-
-    def _generate_overview(self):
-        """Generate overview of matching and non-matching structures."""
-        pattern = self.smarts_var.get().strip()
-
-        if not pattern:
-            messagebox.showwarning("No Pattern", "Please enter a SMARTS pattern first.")
-            return
-
-        # Perform filtering and display results
+    def _set_pattern(self, pattern: str):
+        self._smarts_edit.setText(pattern)
         self._perform_filtering(pattern)
 
-    def _visualize_smarts_pattern(self, pattern):
-        """Visualize the SMARTS pattern(s)."""
-        self.pattern_canvas.delete("all")
-
-        if not RDKIT_AVAILABLE:
-            self.pattern_canvas.create_text(
-                150, 75, text="RDKit not available", font=("Arial", 12), fill="red"
-            )
+    def _on_smarts_change(self, text: str):
+        if not text.strip():
+            self._matched_list.clear()
+            self._unmatched_list.clear()
             return
 
-        try:
-            # Split patterns by $$$
-            patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
-
-            if not patterns:
-                self.pattern_canvas.create_text(
-                    150,
-                    75,
-                    text="No valid patterns found",
-                    font=("Arial", 12),
-                    fill="red",
-                )
-                return
-
-            # Get canvas dimensions
-            canvas_width = self.pattern_canvas.winfo_width()
-            if canvas_width <= 1:  # Canvas not yet drawn
-                canvas_width = 800  # Assume larger width for multiple patterns
-            canvas_height = 150
-
-            # Calculate layout for multiple patterns
-            num_patterns = len(patterns)
-            if num_patterns == 1:
-                # Single pattern - center it
-                pattern_width = 300
-                x_positions = [canvas_width // 2]
-            else:
-                # Multiple patterns - distribute them
-                pattern_width = min(250, (canvas_width - 40) // num_patterns)
-                spacing = canvas_width / (num_patterns + 1)
-                x_positions = [int(spacing * (i + 1)) for i in range(num_patterns)]
-
-            # Generate and display each pattern
-            images = []
-            for i, single_pattern in enumerate(patterns):
-                try:
-                    mol = Chem.MolFromSmarts(single_pattern)
-                    if mol is None:
-                        # Show error for this specific pattern
-                        self.pattern_canvas.create_text(
-                            x_positions[i],
-                            40,
-                            text=f"Invalid:\n{single_pattern[:15]}...",
-                            font=("Arial", 9),
-                            fill="red",
-                            justify="center",
-                        )
-                        continue
-
-                    # Generate image
-                    img = Draw.MolToImage(mol, size=(pattern_width, 100))
-
-                    # Convert PIL image to PhotoImage
-                    from PIL import ImageTk
-
-                    photo = ImageTk.PhotoImage(img)
-                    images.append(photo)  # Keep reference
-
-                    # Display image
-                    self.pattern_canvas.create_image(x_positions[i], 60, image=photo)
-
-                    # Add pattern text below image
-                    pattern_text = (
-                        single_pattern
-                        if len(single_pattern) <= 15
-                        else single_pattern[:12] + "..."
-                    )
-                    self.pattern_canvas.create_text(
-                        x_positions[i],
-                        120,
-                        text=pattern_text,
-                        font=("Courier", 8),
-                        justify="center",
-                    )
-
-                except Exception as e:
-                    # Show error for this specific pattern
-                    self.pattern_canvas.create_text(
-                        x_positions[i],
-                        60,
-                        text=f"Error:\n{str(e)[:20]}",
-                        font=("Arial", 9),
-                        fill="red",
-                        justify="center",
-                    )
-
-            # Store images to prevent garbage collection
-            self.pattern_canvas.images = images
-
-            # Add OR indicator if multiple patterns
-            if num_patterns > 1:
-                for i in range(num_patterns - 1):
-                    or_x = (x_positions[i] + x_positions[i + 1]) // 2
-                    self.pattern_canvas.create_text(
-                        or_x, 75, text="OR", font=("Arial", 12, "bold"), fill="blue"
-                    )
-
-        except Exception as e:
-            self.pattern_canvas.create_text(
-                150, 75, text=f"Error: {str(e)}", font=("Arial", 10), fill="red"
-            )
-
-    def _clear_visualization(self):
-        """Clear pattern visualization."""
-        self.pattern_canvas.delete("all")
-
-        # Clear results
-        for widget in self.matched_scrollable_frame.winfo_children():
-            widget.destroy()
-        for widget in self.unmatched_scrollable_frame.winfo_children():
-            widget.destroy()
-
-        self.status_var.set(
-            "Enter a SMARTS pattern and click 'Generate Overview' to begin"
-        )
-
-    def _perform_filtering(self, pattern):
-        """Perform SMARTS filtering on spectra with support for multiple patterns (OR logic)."""
+    def _perform_filtering(self, pattern: str):
         if not RDKIT_AVAILABLE:
+            self._status_lbl.setText("RDKit not available")
+            return
+        patterns_list = [p.strip() for p in pattern.split() if p.strip()]
+        query_mols = []
+        for p in patterns_list:
+            mol = Chem.MolFromSmarts(p)
+            if mol:
+                query_mols.append(mol)
+        if not query_mols:
+            self._status_lbl.setText("Invalid SMARTS pattern")
             return
 
-        try:
-            # Split patterns by $$$
-            patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
-
-            if not patterns:
-                self.status_var.set("No valid patterns found")
-                return
-
-            # Parse all SMARTS patterns
-            smarts_mols = []
-            valid_patterns = []
-
-            for single_pattern in patterns:
-                smarts_mol = Chem.MolFromSmarts(single_pattern)
-                if smarts_mol is not None:
-                    smarts_mols.append(smarts_mol)
-                    valid_patterns.append(single_pattern)
-                else:
-                    self.status_var.set(f"Invalid SMARTS pattern: {single_pattern}")
-                    return
-
-            if not smarts_mols:
-                self.status_var.set("No valid SMARTS patterns found")
-                return
-
-            # Collect unique SMILES from spectra
-            smiles_to_spectra = {}
-            unique_smiles = []
-
-            for spectrum in self.spectra:
-                smiles = (
-                    spectrum.metadata.get("SMILES")
-                    if "SMILES" in spectrum.metadata
-                    else spectrum.metadata.get("smiles")
-                    if "smiles" in spectrum.metadata
-                    else ""
-                )
-                if not smiles:
-                    continue
-
-                if smiles not in smiles_to_spectra:
-                    smiles_to_spectra[smiles] = []
-                    unique_smiles.append(smiles)
-                smiles_to_spectra[smiles].append(spectrum)
-
-            if not unique_smiles:
-                self.status_var.set("No SMILES found in spectra")
-                return
-
-            # Test each unique SMILES against all patterns (OR logic)
-            matched_smiles = []
-            unmatched_smiles = []
-
-            for smiles in unique_smiles:
+        self.matching_spectra = []
+        unmatched = []
+        smiles_keys = ["smiles", "SMILES", "Smiles"]
+        for s in self.spectra:
+            smiles = None
+            for k in smiles_keys:
+                v = s.metadata.get(k)
+                if v and str(v).strip():
+                    smiles = str(v).strip()
+                    break
+            if smiles:
                 mol = Chem.MolFromSmiles(smiles)
-                if mol is not None:
-                    # Check if ANY of the SMARTS patterns match (OR logic)
-                    has_match = any(
-                        mol.HasSubstructMatch(smarts_mol) for smarts_mol in smarts_mols
-                    )
-                    if has_match:
-                        matched_smiles.append(smiles)
+                if mol:
+                    matched = any(mol.HasSubstructMatch(q) for q in query_mols)
+                    if matched:
+                        self.matching_spectra.append(s)
                     else:
-                        unmatched_smiles.append(smiles)
+                        unmatched.append(s)
                 else:
-                    unmatched_smiles.append(smiles)
-
-            # Update display
-            self._display_results(matched_smiles, unmatched_smiles, smiles_to_spectra)
-
-            # Store results
-            self.matching_spectra = []
-            for smiles in matched_smiles:
-                self.matching_spectra.extend(smiles_to_spectra[smiles])
-
-            # Update status
-            total_matched_spectra = sum(
-                len(smiles_to_spectra[smiles]) for smiles in matched_smiles
-            )
-            pattern_count = len(valid_patterns)
-            pattern_text = f"{pattern_count} pattern{'s' if pattern_count > 1 else ''}"
-            self.status_var.set(
-                f"Found {len(matched_smiles)} matching structures using {pattern_text} "
-                f"({total_matched_spectra} spectra)"
-            )
-
-        except Exception as e:
-            self.status_var.set(f"Error during filtering: {str(e)}")
-
-    def _display_results(self, matched_smiles, unmatched_smiles, smiles_to_spectra):
-        """Display matched and unmatched structures."""
-        # Clear previous results
-        for widget in self.matched_scrollable_frame.winfo_children():
-            widget.destroy()
-        for widget in self.unmatched_scrollable_frame.winfo_children():
-            widget.destroy()
-
-        # Update frame titles
-        total_matched_spectra = sum(
-            len(smiles_to_spectra[smiles]) for smiles in matched_smiles
-        )
-        total_unmatched_spectra = sum(
-            len(smiles_to_spectra[smiles]) for smiles in unmatched_smiles
-        )
-
-        matched_frame = self.matched_canvas.master
-        unmatched_frame = self.unmatched_canvas.master
-        matched_frame.configure(
-            text=f"Matched Structures ({len(matched_smiles)} unique, {total_matched_spectra} spectra)"
-        )
-        unmatched_frame.configure(
-            text=f"Unmatched Structures ({len(unmatched_smiles)} unique, {total_unmatched_spectra} spectra)"
-        )
-
-        # Display matched structures
-        self._display_smiles_grid(
-            self.matched_scrollable_frame, matched_smiles, smiles_to_spectra, True
-        )
-
-        # Display unmatched structures
-        self._display_smiles_grid(
-            self.unmatched_scrollable_frame, unmatched_smiles, smiles_to_spectra, False
-        )
-
-    def _display_smiles_grid(
-        self, parent_frame, smiles_list, smiles_to_spectra, highlight_match
-    ):
-        """Display SMILES structures in a grid layout."""
-        if not RDKIT_AVAILABLE:
-            return
-
-        # Create grid of structures (6 per row)
-        for i, smiles in enumerate(smiles_list):
-            row = i // 6
-            col = i % 6
-
-            try:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is None:
-                    continue
-
-                # Create frame for this structure
-                struct_frame = ttk.Frame(parent_frame, padding=2)
-                struct_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
-
-                # Generate structure image
-                img_size = (150, 150)
-                if highlight_match and hasattr(self, "smarts_var"):
-                    # Highlight substructure match for multiple patterns
-                    pattern = self.smarts_var.get().strip()
-                    if pattern:
-                        try:
-                            # Split patterns by $$$
-                            patterns = [
-                                p.strip() for p in pattern.split(" ") if p.strip()
-                            ]
-                            highlight_atoms = set()
-
-                            # Collect all matching atoms from all patterns
-                            for single_pattern in patterns:
-                                smarts_mol = Chem.MolFromSmarts(single_pattern)
-                                if smarts_mol is not None:
-                                    match = mol.GetSubstructMatch(smarts_mol)
-                                    if match:
-                                        highlight_atoms.update(match)
-
-                            if highlight_atoms:
-                                img = Draw.MolToImage(
-                                    mol,
-                                    size=img_size,
-                                    highlightAtoms=list(highlight_atoms),
-                                )
-                            else:
-                                img = Draw.MolToImage(mol, size=img_size)
-                        except:
-                            img = Draw.MolToImage(mol, size=img_size)
-                    else:
-                        img = Draw.MolToImage(mol, size=img_size)
-                else:
-                    img = Draw.MolToImage(mol, size=img_size)
-
-                # Convert to PhotoImage
-                from PIL import ImageTk
-
-                photo = ImageTk.PhotoImage(img)
-
-                # Create label with image
-                img_label = ttk.Label(struct_frame, image=photo)
-                img_label.image = photo  # Keep reference
-                img_label.pack()
-
-                # Add click binding to show enlarged structure
-                img_label.bind(
-                    "<Button-1>",
-                    lambda e,
-                    s=smiles,
-                    h=highlight_match: self._show_enlarged_structure(s, h),
-                )
-                img_label.configure(
-                    cursor="hand2"
-                )  # Change cursor to indicate clickable
-
-                # Add SMILES text (truncated if too long)
-                smiles_text = smiles if len(smiles) <= 20 else smiles[:17] + "..."
-                ttk.Label(struct_frame, text=smiles_text, font=("Courier", 8)).pack()
-
-                # Add spectrum count
-                spectrum_count = len(smiles_to_spectra[smiles])
-                ttk.Label(
-                    struct_frame, text=f"({spectrum_count} spectra)", font=("Arial", 8)
-                ).pack()
-
-            except Exception as e:
-                # Create error frame
-                struct_frame = ttk.Frame(parent_frame, padding=2)
-                struct_frame.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
-                ttk.Label(struct_frame, text="Error", foreground="red").pack()
-                ttk.Label(struct_frame, text=str(e)[:20], font=("Arial", 8)).pack()
-
-        # Configure column weights
-        for col in range(6):
-            parent_frame.columnconfigure(col, weight=1)
-
-    def _show_enlarged_structure(self, smiles, highlight_match):
-        """Show an enlarged view of the structure in a popup window."""
-        if not RDKIT_AVAILABLE:
-            return
-
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                messagebox.showerror("Error", "Cannot parse SMILES structure")
-                return
-
-            # Create popup window
-            popup = tk.Toplevel(self.dialog)
-            popup.title(f"Structure View - {smiles}")
-            popup.geometry("600x700")
-            popup.resizable(True, True)
-            popup.grab_set()  # Make modal
-
-            # Main frame
-            main_frame = ttk.Frame(popup, padding=10)
-            main_frame.pack(fill="both", expand=True)
-
-            # Title
-            ttk.Label(
-                main_frame, text="Molecular Structure", font=("Arial", 14, "bold")
-            ).pack(pady=(0, 10))
-
-            # SMILES text
-            smiles_frame = ttk.LabelFrame(main_frame, text="SMILES", padding=5)
-            smiles_frame.pack(fill="x", pady=(0, 10))
-
-            # Create a text widget for SMILES so it's selectable
-            smiles_text = tk.Text(
-                smiles_frame, height=2, wrap="word", font=("Courier", 10)
-            )
-            smiles_text.insert("1.0", smiles)
-            smiles_text.config(state="disabled")  # Make read-only
-            smiles_text.pack(fill="x")
-
-            # Structure frame
-            struct_frame = ttk.LabelFrame(main_frame, text="Structure", padding=5)
-            struct_frame.pack(fill="both", expand=True, pady=(0, 10))
-
-            # Generate large structure image
-            img_size = (500, 400)
-            if highlight_match and hasattr(self, "smarts_var"):
-                # Highlight substructure match for multiple patterns
-                pattern = self.smarts_var.get().strip()
-                if pattern:
-                    try:
-                        # Split patterns by $$$
-                        patterns = [p.strip() for p in pattern.split(" ") if p.strip()]
-                        highlight_atoms = set()
-
-                        # Collect all matching atoms from all patterns
-                        for single_pattern in patterns:
-                            smarts_mol = Chem.MolFromSmarts(single_pattern)
-                            if smarts_mol is not None:
-                                match = mol.GetSubstructMatch(smarts_mol)
-                                if match:
-                                    highlight_atoms.update(match)
-
-                        if highlight_atoms:
-                            img = Draw.MolToImage(
-                                mol,
-                                size=img_size,
-                                highlightAtoms=list(highlight_atoms),
-                            )
-                        else:
-                            img = Draw.MolToImage(mol, size=img_size)
-                    except:
-                        img = Draw.MolToImage(mol, size=img_size)
-                else:
-                    img = Draw.MolToImage(mol, size=img_size)
+                    unmatched.append(s)
             else:
-                img = Draw.MolToImage(mol, size=img_size)
+                unmatched.append(s)
 
-            # Convert to PhotoImage
-            from PIL import ImageTk
-
-            photo = ImageTk.PhotoImage(img)
-
-            # Create canvas to display the image
-            canvas = tk.Canvas(struct_frame, width=500, height=400, bg="white")
-            canvas.pack(expand=True)
-            canvas.create_image(250, 200, image=photo)
-            canvas.image = photo  # Keep reference
-
-            # Info frame
-            info_frame = ttk.LabelFrame(
-                main_frame, text="Molecular Information", padding=5
-            )
-            info_frame.pack(fill="x", pady=(0, 10))
-
-            # Add molecular properties
-            try:
-                from rdkit.Chem import Descriptors
-
-                mol_weight = Descriptors.MolWt(mol)
-                num_atoms = mol.GetNumAtoms()
-                num_bonds = mol.GetNumBonds()
-
-                info_text = f"Molecular Weight: {mol_weight:.2f} Da\n"
-                info_text += f"Number of Atoms: {num_atoms}\n"
-                info_text += f"Number of Bonds: {num_bonds}"
-
-                ttk.Label(info_frame, text=info_text, font=("Arial", 10)).pack(
-                    anchor="w"
-                )
-            except:
-                ttk.Label(
-                    info_frame,
-                    text="Molecular properties unavailable",
-                    font=("Arial", 10),
-                ).pack(anchor="w")
-
-            # Button frame
-            button_frame = ttk.Frame(main_frame)
-            button_frame.pack(fill="x", pady=(10, 0))
-
-            # Save image button
-            ttk.Button(
-                button_frame,
-                text="Save Image",
-                command=lambda: self._save_structure_image(img, smiles),
-            ).pack(side="left")
-
-            # Close button
-            ttk.Button(button_frame, text="Close", command=popup.destroy).pack(
-                side="right"
-            )
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to display structure: {str(e)}")
-
-    def _save_structure_image(self, img, smiles):
-        """Save the structure image to a file."""
-        try:
-            # Ask user for file location
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".png",
-                filetypes=[
-                    ("PNG files", "*.png"),
-                    ("JPEG files", "*.jpg"),
-                    ("All files", "*.*"),
-                ],
-                title="Save Structure Image",
-            )
-
-            if filename:
-                img.save(filename)
-                messagebox.showinfo("Success", f"Structure image saved to {filename}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save image: {str(e)}")
+        self._matched_list.clear()
+        for s in self.matching_spectra:
+            self._matched_list.addItem(f"Spectrum {s.spectrum_id}")
+        self._unmatched_list.clear()
+        for s in unmatched:
+            self._unmatched_list.addItem(f"Spectrum {s.spectrum_id}")
+        self._matched_group_label.setTitle(f"Matched ({len(self.matching_spectra)})")
+        self._unmatched_group_label.setTitle(f"Unmatched ({len(unmatched)})")
+        self._status_lbl.setText(f"Found {len(self.matching_spectra)} matching spectra")
 
     def _apply_filter(self):
-        """Apply the SMARTS filter."""
-        if not self.matching_spectra:
-            messagebox.showwarning(
-                "No Matches", "No spectra match the current SMARTS pattern."
-            )
-            return
-
-        # Call the callback with matching spectra
-        self.apply_callback(self.matching_spectra)
-        self.dialog.destroy()
-
-    def _cancel(self):
-        """Cancel the dialog."""
-        self.dialog.destroy()
-
-
-class FragmentAnnotationDialog:
-    """Dialog for configuring fragment annotation parameters."""
-
-    def __init__(self, parent, callback=None, spectra=None):
-        self.parent = parent
-        self.callback = callback
-        self.spectra = spectra or []
-        self.dialog = None
-        self.result = None
-        # Interactive PPM tolerance function
-        self.ppm_points = []  # List of (mz, ppm) points
-        self.figure = None
-        self.canvas = None
-        self.ax = None
-        self.plot_initialized = False  # Track if plot limits have been set
-        self.max_precursor_mz = self._calculate_max_precursor_mz()
-
-    def show(self):
-        """Show the fragment annotation dialog."""
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title("Fragment Annotation - Generate Subformulas")
-        self.dialog.geometry("900x800")
-        self.dialog.resizable(True, True)
-        self.dialog.transient(self.parent)
-        self.dialog.grab_set()
-
-        # Center the dialog
-        self.dialog.update_idletasks()
-        x = (self.dialog.winfo_screenwidth() // 2) - (900 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (800 // 2)
-        self.dialog.geometry(f"900x800+{x}+{y}")
-
-        self._create_widgets()
-
-        # Wait for dialog to close
-        self.dialog.wait_window()
-        return self.result
-
-    def _calculate_max_precursor_mz(self):
-        """Calculate the maximum precursor m/z from the spectra."""
-        if not self.spectra:
-            return 1000  # Default fallback value
-
-        max_mz = 0
-        for spectrum in self.spectra:
-            # Try to get precursor m/z from metadata
-            precursor_mz = None
-
-            # Common metadata keys for precursor m/z
-            for key in ["PEPMASS", "pepmass", "precursor_mz", "PRECURSOR_MZ"]:
-                value = spectrum.metadata.get(key)
-                if value:
-                    try:
-                        # PEPMASS might be "123.456 1+" format, so take first part
-                        precursor_mz = float(str(value).split()[0])
-                        break
-                    except (ValueError, IndexError):
-                        continue
-
-            # If not found in metadata, use the highest m/z from ions as approximation
-            if precursor_mz is None and spectrum.ions:
-                precursor_mz = max(ion[0] for ion in spectrum.ions)
-
-            if precursor_mz and precursor_mz > max_mz:
-                max_mz = precursor_mz
-
-        return max_mz if max_mz > 0 else 1000  # Fallback to 1000 if no valid m/z found
-
-    def _create_widgets(self):
-        """Create the dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # Title
-        title_label = ttk.Label(
-            main_frame,
-            text="Fragment Annotation Configuration",
-            font=("Arial", 12, "bold"),
-        )
-        title_label.pack(pady=(0, 15))
-
-        # Create a paned window to split the dialog
-        paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
-        paned_window.pack(fill="both", expand=True, pady=(0, 10))
-
-        # Left frame for configuration options
-        config_frame = ttk.Frame(paned_window, padding=5)
-        paned_window.add(config_frame, weight=1)
-
-        # Right frame for the interactive plot
-        plot_frame = ttk.Frame(paned_window, padding=5)
-        paned_window.add(plot_frame, weight=2)
-
-        # Configure the left side (configuration options)
-        self._create_config_widgets(config_frame)
-
-        # Configure the right side (interactive plot)
-        self._create_plot_widgets(plot_frame)
-
-        # Buttons at the bottom
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
-            side="right", padx=(10, 0)
-        )
-        ttk.Button(button_frame, text="OK", command=self._ok).pack(side="right")
-
-    def _create_config_widgets(self, parent_frame):
-        """Create the configuration widgets on the left side."""
-        # Formula tag order section
-        formula_frame = ttk.LabelFrame(
-            parent_frame, text="Formula Tag Order", padding=10
-        )
-        formula_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(
-            formula_frame,
-            text="Specify the order of metadata tags to search for molecular formulas:",
-            wraplength=300,
-        ).pack(anchor="w")
-
-        self.formula_tags_var = tk.StringVar(value="formula, FORMULA, smiles, SMILES")
-        formula_entry = ttk.Entry(formula_frame, textvariable=self.formula_tags_var)
-        formula_entry.pack(fill="x", pady=(5, 0))
-
-        ttk.Label(
-            formula_frame,
-            text="(Comma-separated list, will try in order until a formula is found)",
-            font=("Arial", 8),
-            foreground="gray",
-            wraplength=300,
-        ).pack(anchor="w")
-
-        # Default PPM tolerance section
-        default_ppm_frame = ttk.LabelFrame(
-            parent_frame, text="Default PPM Tolerance", padding=10
-        )
-        default_ppm_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(
-            default_ppm_frame,
-            text="This value is used when no custom function is defined:",
-            wraplength=300,
-        ).pack(anchor="w")
-
-        ppm_input_frame = ttk.Frame(default_ppm_frame)
-        ppm_input_frame.pack(fill="x", pady=(5, 0))
-
-        ttk.Label(ppm_input_frame, text="PPM deviation:").pack(side="left")
-        self.ppm_var = tk.StringVar(value="50")
-        ppm_spinbox = ttk.Spinbox(
-            ppm_input_frame, from_=1, to=1000, textvariable=self.ppm_var, width=10
-        )
-        ppm_spinbox.pack(side="left", padx=(10, 0))
-
-        # Additional elements section
-        elements_frame = ttk.LabelFrame(
-            parent_frame, text="Additional Elements", padding=10
-        )
-        elements_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(
-            elements_frame,
-            text="Additional elements that might be added during fragmentation:",
-            wraplength=300,
-        ).pack(anchor="w")
-
-        # Common additional elements with checkboxes
-        self.additional_elements = {}
-        elements_grid = ttk.Frame(elements_frame)
-        elements_grid.pack(fill="x", pady=(5, 0))
-
-        common_elements = [
-            ("H", "Hydrogen"),
-            ("O", "Oxygen"),
-            ("Na", "Sodium"),
-            ("K", "Potassium"),
-            ("NH3", "Ammonia"),
-            ("H2O", "Water"),
-        ]
-
-        row = 0
-        for element, description in common_elements:
-            var = tk.BooleanVar()
-            self.additional_elements[element] = var
-            cb = ttk.Checkbutton(
-                elements_grid, text=f"{element} ({description})", variable=var
-            )
-            cb.grid(row=row, column=0, sticky="w", pady=1)
-            row += 1
-
-        # Custom additional elements
-        custom_frame = ttk.Frame(elements_frame)
-        custom_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Label(
-            custom_frame, text="Custom elements (comma-separated):", wraplength=300
-        ).pack(anchor="w")
-        self.custom_elements_var = tk.StringVar()
-        custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_elements_var)
-        custom_entry.pack(fill="x", pady=(5, 0))
-
-        # Max workers section
-        workers_frame = ttk.LabelFrame(
-            parent_frame, text="Parallel Processing", padding=10
-        )
-        workers_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Label(
-            workers_frame,
-            text="Maximum worker threads for parallel processing:",
-            wraplength=300,
-        ).pack(anchor="w")
-
-        workers_input_frame = ttk.Frame(workers_frame)
-        workers_input_frame.pack(fill="x", pady=(5, 0))
-
-        ttk.Label(workers_input_frame, text="Max workers:").pack(side="left")
-        self.max_workers_var = tk.StringVar(value="600")
-        workers_spinbox = ttk.Spinbox(
-            workers_input_frame,
-            from_=1,
-            to=9000,
-            textvariable=self.max_workers_var,
-            width=10,
-        )
-        workers_spinbox.pack(side="left", padx=(10, 0))
-
-        ttk.Label(
-            workers_frame,
-            text="Higher values may speed up processing but use more system resources.\nAllows up to 9000 workers for very large datasets.",
-            font=("Arial", 8),
-            foreground="gray",
-            wraplength=300,
-        ).pack(anchor="w", pady=(5, 0))
-
-    def _create_plot_widgets(self, parent_frame):
-        """Create the interactive plot widgets on the right side."""
-        # Instructions
-        instructions_frame = ttk.LabelFrame(
-            parent_frame, text="Interactive PPM Tolerance Function", padding=5
-        )
-        instructions_frame.pack(fill="x", pady=(0, 10))
-
-        instructions_text = (
-            "Define a custom PPM tolerance function:\n"
-            "• Left-click to add points\n"
-            "• Right-click on points to remove them\n"
-            "• Function interpolates linearly between points\n"
-            "• Constant values outside the range\n"
-            "• Use toolbar below to zoom/pan the plot"
-        )
-        ttk.Label(
-            instructions_frame,
-            text=instructions_text,
-            font=("Arial", 9),
-            justify="left",
-        ).pack(anchor="w")
-
-        # Plot frame
-        plot_container = ttk.Frame(parent_frame)
-        plot_container.pack(fill="both", expand=True)
-
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(8, 5), dpi=80)
-        self.canvas = FigureCanvasTkAgg(self.figure, plot_container)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
-        # Add navigation toolbar for zoom/pan functionality
-        toolbar_frame = ttk.Frame(plot_container)
-        toolbar_frame.pack(fill="x")
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
-
-        # Initialize the plot
-        self._init_plot()
-
-        # Control buttons
-        controls_frame = ttk.Frame(parent_frame)
-        controls_frame.pack(fill="x", pady=(5, 0))
-
-        ttk.Button(
-            controls_frame, text="Clear All Points", command=self._clear_all_points
-        ).pack(side="left", padx=(0, 5))
-
-        ttk.Button(
-            controls_frame, text="Add Default Points", command=self._add_default_points
-        ).pack(side="left")
-
-    def _init_plot(self):
-        """Initialize the interactive plot."""
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_xlabel("m/z", fontsize=12)
-        self.ax.set_ylabel("PPM Tolerance", fontsize=12)
-        self.ax.set_title(
-            "Interactive PPM Tolerance Function", fontsize=14, fontweight="bold"
-        )
-        self.ax.grid(True, alpha=0.3)
-
-        # Set initial axis limits
-        max_x = self.max_precursor_mz * 1.15  # Add 15% to maximum precursor m/z
-        self.ax.set_xlim(0, max_x)
-        self.ax.set_ylim(0, 55)
-
-        # Connect mouse events
-        # Use press+release to detect a "real" single click and ignore press-and-hold.
-        # Store reference to original handler and replace with a no-op so any direct
-        # bindings to button_press_event (later in this method) won't trigger behavior.
-        self._raw_on_click = self._on_click
-        self._on_click = lambda event: None  # temporarily disable direct press handling
-
-        # State for detecting short clicks
-        self._mouse_press_time = None
-        self._mouse_press_event = None
-        self._click_threshold = 0.35  # seconds - max duration to consider a click
-        self._move_threshold = 5  # pixels - max movement to consider a click
-
-        def _on_mouse_press(event):
-            # Only track presses inside the axes
-            if event.inaxes != self.ax:
-                self._mouse_press_time = None
-                self._mouse_press_event = None
-                return
-            self._mouse_press_time = time.time()
-            self._mouse_press_event = event
-
-        def _on_mouse_release(event):
-            # Only consider releases inside the axes and if we previously recorded a press
-            if self._mouse_press_time is None or event.inaxes != self.ax:
-                self._mouse_press_time = None
-                self._mouse_press_event = None
-                return
-
-            duration = time.time() - self._mouse_press_time
-
-            # Compute movement in display (pixel) coordinates if available
-            try:
-                dx = abs(event.x - self._mouse_press_event.x)
-                dy = abs(event.y - self._mouse_press_event.y)
-            except Exception:
-                dx = dy = 0
-
-            moved = max(dx, dy)
-
-            # Ignore double-click events and long presses or significant movement
-            if getattr(event, "dblclick", False):
-                pass
-            elif duration <= self._click_threshold and moved <= self._move_threshold:
-                # Treat as a single click -> call original handler with the release event
-                try:
-                    self._raw_on_click(event)
-                except Exception:
-                    # Be conservative: swallow exceptions from callback to avoid crashing UI
-                    pass
-
-                # Reset press state
-                self._mouse_press_time = None
-                self._mouse_press_event = None
-
-        # Connect press/release handlers instead of direct press handling
-        self.canvas.mpl_connect("button_press_event", _on_mouse_press)
-        self.canvas.mpl_connect("button_release_event", _on_mouse_release)
-
-        # Mark plot as initialized before the first update
-        self.plot_initialized = True
-
-        # Initial plot update
-        self._update_plot()
-
-    def _on_click(self, event):
-        """Handle mouse clicks on the plot."""
-        if event.inaxes != self.ax:
-            return
-
-        if event.button == 1:  # Left click - add point
-            self._add_point(event.xdata, event.ydata)
-        elif event.button == 3:  # Right click - remove point
-            self._remove_nearest_point(event.xdata, event.ydata)
-
-    def _add_point(self, mz, ppm):
-        """Add a point to the PPM function."""
-        if mz is None or ppm is None:
-            return
-
-        # Ensure positive PPM values
-        ppm = max(1, ppm)
-
-        # Add the point
-        self.ppm_points.append((mz, ppm))
-
-        # Sort points by m/z
-        self.ppm_points.sort(key=lambda x: x[0])
-
-        self._update_plot()
-
-    def _remove_nearest_point(self, mz, ppm):
-        """Remove the nearest point to the click location."""
-        if not self.ppm_points or mz is None or ppm is None:
-            return
-
-        # Find the nearest point
-        min_distance = float("inf")
-        nearest_index = -1
-
-        for i, (point_mz, point_ppm) in enumerate(self.ppm_points):
-            # Calculate distance (normalized by axis ranges)
-            mz_range = self.ax.get_xlim()[1] - self.ax.get_xlim()[0]
-            ppm_range = self.ax.get_ylim()[1] - self.ax.get_ylim()[0]
-
-            normalized_mz_dist = (mz - point_mz) / mz_range
-            normalized_ppm_dist = (ppm - point_ppm) / ppm_range
-
-            distance = (normalized_mz_dist**2 + normalized_ppm_dist**2) ** 0.5
-
-            if distance < min_distance:
-                min_distance = distance
-                nearest_index = i
-
-        # Remove the nearest point if it's close enough (within 5% of the plot)
-        if nearest_index >= 0 and min_distance < 0.05:
-            self.ppm_points.pop(nearest_index)
-            self._update_plot()
-
-    def _clear_all_points(self):
-        """Clear all points from the function."""
-        self.ppm_points.clear()
-        self._update_plot()
-
-    def _add_default_points(self):
-        """Add some default points to demonstrate the function."""
-        self.ppm_points = [(100, 50), (300, 30), (500, 20), (800, 40)]
-        self._update_plot()
-
-    def _update_plot(self):
-        """Update the plot display."""
-
-        xlim = self.ax.get_xlim()
-        ylim = self.ax.get_ylim()
-
-        self.ax.clear()
-        self.ax.set_xlabel("m/z", fontsize=12)
-        self.ax.set_ylabel("PPM Tolerance", fontsize=12)
-        self.ax.set_title(
-            "Interactive PPM Tolerance Function", fontsize=14, fontweight="bold"
-        )
-        self.ax.grid(True, alpha=0.3)
-
-        if not self.ppm_points:
-            # No points - show default constant function
-            default_ppm = (
-                float(self.ppm_var.get())
-                if self.ppm_var.get().replace(".", "").isdigit()
-                else 50
-            )
-            self.ax.axhline(
-                y=default_ppm,
-                color="blue",
-                linestyle="--",
-                alpha=0.7,
-                label=f"Default: {default_ppm} PPM",
-            )
-            self.ax.legend()
-        else:
-            # Plot the function
-            if len(self.ppm_points) == 1:
-                # Single point - constant function
-                mz, ppm = self.ppm_points[0]
-                self.ax.axhline(
-                    y=ppm,
-                    color="blue",
-                    linestyle="-",
-                    linewidth=2,
-                    label=f"Constant: {ppm:.1f} PPM",
-                )
-                self.ax.plot(mz, ppm, "ro", markersize=8, label="Control Point")
-            else:
-                # Multiple points - interpolated function
-                mz_values = [point[0] for point in self.ppm_points]
-                ppm_values = [point[1] for point in self.ppm_points]
-
-                # Create continuous function across the full x-axis range
-                max_x = self.max_precursor_mz * 1.15
-                mz_extended = list(range(0, int(max_x) + 1, 10))
-
-                ppm_extended = []
-                for mz in mz_extended:
-                    ppm_extended.append(self._interpolate_ppm(mz))
-
-                # Plot the function
-                self.ax.plot(
-                    mz_extended, ppm_extended, "b-", linewidth=2, label="PPM Function"
-                )
-                self.ax.plot(
-                    mz_values, ppm_values, "ro", markersize=8, label="Control Points"
-                )
-
-            self.ax.legend()
-
-        # Set reasonable axis limits only during initial setup
-        if not self.plot_initialized:
-            max_x = self.max_precursor_mz * 1.15  # Add 15% to maximum precursor m/z
-            self.ax.set_xlim(
-                0, max_x
-            )  # Always use full range from 0 to max precursor + 15%
-            self.ax.set_ylim(0, 52)
-
-            self.plot_initialized = True
-
-        else:
-            self.ax.set_xlim(*xlim)
-            self.ax.set_ylim(*ylim)
-
-        self.canvas.draw()
-
-    def _interpolate_ppm(self, mz):
-        """Interpolate PPM value for a given m/z using the defined function."""
-        if not self.ppm_points:
-            return (
-                float(self.ppm_var.get())
-                if self.ppm_var.get().replace(".", "").isdigit()
-                else 50
-            )
-
-        if len(self.ppm_points) == 1:
-            return self.ppm_points[0][1]
-
-        # Sort points by m/z
-        sorted_points = sorted(self.ppm_points, key=lambda x: x[0])
-
-        # Check if mz is before the first point
-        if mz <= sorted_points[0][0]:
-            return sorted_points[0][1]
-
-        # Check if mz is after the last point
-        if mz >= sorted_points[-1][0]:
-            return sorted_points[-1][1]
-
-        # Find the two points to interpolate between
-        for i in range(len(sorted_points) - 1):
-            mz1, ppm1 = sorted_points[i]
-            mz2, ppm2 = sorted_points[i + 1]
-
-            if mz1 <= mz <= mz2:
-                # Linear interpolation
-                if mz2 == mz1:
-                    return ppm1
-                t = (mz - mz1) / (mz2 - mz1)
-                return ppm1 + t * (ppm2 - ppm1)
-
-        # Fallback (should not reach here)
-        return sorted_points[0][1]
-
-    def _ok(self):
-        """Handle OK button click."""
-        try:
-            # Validate PPM value
-            ppm_value = float(self.ppm_var.get())
-            if ppm_value <= 0:
-                raise ValueError("PPM deviation must be positive")
-
-            # Validate max_workers value
-            max_workers = int(self.max_workers_var.get())
-            if max_workers <= 0:
-                raise ValueError("Max workers must be positive")
-            if max_workers > 9000:
-                raise ValueError("Max workers cannot exceed 9000")
-
-            # Parse formula tags
-            formula_tags = [
-                tag.strip()
-                for tag in self.formula_tags_var.get().split(",")
-                if tag.strip()
-            ]
-            if not formula_tags:
-                raise ValueError("At least one formula tag must be specified")
-
-            # Get selected additional elements
-            selected_elements = []
-            for element, var in self.additional_elements.items():
-                if var.get():
-                    selected_elements.append(element)
-
-            # Add custom elements
-            custom_elements = [
-                elem.strip()
-                for elem in self.custom_elements_var.get().split(",")
-                if elem.strip()
-            ]
-            selected_elements.extend(custom_elements)
-
-            # Prepare result
-            self.result = {
-                "formula_tags": formula_tags,
-                "ppm_tolerance": ppm_value,
-                "additional_elements": selected_elements,
-                "ppm_function_points": self.ppm_points.copy(),  # Include the custom function
-                "max_workers": max_workers,
-            }
-
-            self.dialog.destroy()
-
-        except ValueError as e:
-            messagebox.showerror("Invalid Input", str(e))
-
-    def _cancel(self):
-        """Handle Cancel button click."""
-        self.result = None
-        self.dialog.destroy()
-
-
-class CanonicalSmilesDialog:
-    """Dialog for displaying canonical SMILES conversion results."""
-
-    def __init__(self, parent):
-        self.parent = parent
-        self.dialog = None
-        self.on_key_change = None
-        self.key_var: Optional[tk.StringVar] = None
-        self.summary_label: Optional[ttk.Label] = None
-        self.table_frame: Optional[ttk.Frame] = None
-        self._canvas: Optional[tk.Canvas] = None
-        self._table_window = None
-        self._last_successful_key: Optional[str] = None
-
-    def show(
-        self,
-        rows: List[Dict[str, Any]],
-        summary_text: Optional[str] = None,
-        initial_key: str = "smiles",
-        on_key_change=None,
-    ) -> None:
-        """Display the canonical SMILES conversion table."""
-        self.on_key_change = on_key_change
-        self._last_successful_key = initial_key
-
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title("Canonical SMILES Preview")
-        self.dialog.transient(self.parent)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        self.dialog.geometry("720x360")
-
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        controls_frame = ttk.Frame(main_frame)
-        controls_frame.pack(fill="x", pady=(0, 10))
-
-        ttk.Label(controls_frame, text="SMILES metadata key:").pack(side="left")
-
-        self.key_var = tk.StringVar(value=initial_key)
-        key_entry = ttk.Entry(controls_frame, textvariable=self.key_var, width=24)
-        key_entry.pack(side="left", padx=(5, 0))
-        key_entry.bind("<Return>", self._apply_key_change)
-
-        ttk.Button(controls_frame, text="Apply", command=self._apply_key_change).pack(
-            side="left", padx=(5, 0)
-        )
-
-        self.summary_label = ttk.Label(
-            main_frame,
-            justify="left",
-            wraplength=600,
-        )
-        if summary_text:
-            self._update_summary(summary_text)
-
-        table_container = ttk.Frame(main_frame)
-        table_container.pack(fill="both", expand=True)
-
-        self._canvas = tk.Canvas(table_container, highlightthickness=0)
-        v_scroll = ttk.Scrollbar(
-            table_container, orient="vertical", command=self._canvas.yview
-        )
-        self._canvas.configure(yscrollcommand=v_scroll.set)
-        self._canvas.pack(side="left", fill="both", expand=True)
-        v_scroll.pack(side="right", fill="y")
-
-        self.table_frame = ttk.Frame(self._canvas)
-        self._table_window = self._canvas.create_window(
-            (0, 0), window=self.table_frame, anchor="nw"
-        )
-
-        def _configure_scrollregion(event):
-            if self._canvas:
-                self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-        def _resize_table(event):
-            if self._canvas and self._table_window is not None:
-                self._canvas.itemconfigure(self._table_window, width=event.width)
-
-        self.table_frame.bind("<Configure>", _configure_scrollregion)
-        table_container.bind("<Configure>", _resize_table)
-
-        def _on_mousewheel(event):
-            if self._canvas:
-                self._canvas.yview_scroll(-1 * int(event.delta / 120), "units")
-
-        self._canvas.bind("<MouseWheel>", _on_mousewheel)
-        self.table_frame.bind("<MouseWheel>", _on_mousewheel)
-
-        self._populate_table(rows)
-
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-        ttk.Button(button_frame, text="Close", command=self.dialog.destroy).pack(
-            side="right"
-        )
-
-        key_entry.focus_set()
-        self._center_dialog()
-        self.dialog.wait_window()
-
-    def _populate_table(self, rows: List[Dict[str, Any]]) -> None:
-        if not self.table_frame:
-            return
-
-        for child in self.table_frame.winfo_children():
-            child.destroy()
-
-        headings = ["Original SMILES", "Canonical SMILES"]
-        header_bg = "#f0f0f0"
-        for col_index, heading in enumerate(headings):
-            header = tk.Label(
-                self.table_frame,
-                text=heading,
-                font=("Segoe UI", 10, "bold"),
-                anchor="w",
-                padx=8,
-                pady=4,
-                bd=1,
-                relief="solid",
-                bg=header_bg,
-            )
-            header.grid(row=0, column=col_index, sticky="nsew")
-            self.table_frame.grid_columnconfigure(col_index, weight=1)
-
-        if not rows:
-            empty_label = tk.Label(
-                self.table_frame,
-                text="No SMILES values to display for the selected key.",
-                anchor="w",
-                justify="left",
-                wraplength=600,
-                padx=8,
-                pady=4,
-                bd=1,
-                relief="solid",
-                bg="white",
-            )
-            empty_label.grid(row=1, column=0, columnspan=2, sticky="nsew")
-            return
-
-        default_bg = "white"
-        mismatch_bg = "#ffb3b3"
-
-        for row_index, row in enumerate(rows, start=1):
-            original_text = row.get("original", "")
-            canonical_value = row.get("canonical")
-            error_text = row.get("error")
-            canonical_text = (
-                canonical_value
-                if canonical_value is not None
-                else (error_text if error_text else "")
-            )
-            highlight_original = row.get("highlight", False)
-            highlight_canonical = row.get("highlight_canonical", highlight_original)
-
-            original_label = tk.Label(
-                self.table_frame,
-                text=original_text if original_text else "<empty>",
-                anchor="w",
-                justify="left",
-                wraplength=600,
-                padx=8,
-                pady=4,
-                bd=1,
-                relief="solid",
-                bg=mismatch_bg if highlight_original else default_bg,
-            )
-            original_label.grid(row=row_index, column=0, sticky="nsew")
-            self.table_frame.grid_rowconfigure(row_index, weight=0)
-
-            canonical_label = tk.Label(
-                self.table_frame,
-                text=canonical_text if canonical_text else "<empty>",
-                anchor="w",
-                justify="left",
-                wraplength=600,
-                padx=8,
-                pady=4,
-                bd=1,
-                relief="solid",
-                bg=mismatch_bg if highlight_canonical else default_bg,
-            )
-            canonical_label.grid(row=row_index, column=1, sticky="nsew")
-
-    def _update_summary(self, summary_text: Optional[str]) -> None:
-        if not self.summary_label:
-            return
-
-        if summary_text:
-            self.summary_label.config(text=summary_text)
-            if not self.summary_label.winfo_ismapped():
-                self.summary_label.pack(fill="x", pady=(0, 10))
-        else:
-            self.summary_label.config(text="")
-            if self.summary_label.winfo_ismapped():
-                self.summary_label.pack_forget()
-
-    def _apply_key_change(self, event=None):
-        if not self.on_key_change or not self.key_var:
-            return
-
-        key_value = self.key_var.get().strip()
-        if not key_value:
-            messagebox.showwarning(
-                "Canonical SMILES", "Please provide a metadata key for SMILES values."
-            )
-            if self._last_successful_key is not None:
-                self.key_var.set(self._last_successful_key)
-            return
-
-        result = self.on_key_change(key_value)
-        if not result:
-            if self._last_successful_key is not None:
-                self.key_var.set(self._last_successful_key)
-            return
-
-        if result.get("error"):
-            messagebox.showinfo("Canonical SMILES", result["error"])
-            if self._last_successful_key is not None:
-                self.key_var.set(self._last_successful_key)
-            return
-
-        self._last_successful_key = key_value
-        self._populate_table(result.get("rows", []))
-        self._update_summary(result.get("summary"))
-
-    def _center_dialog(self) -> None:
-        """Center the dialog on the screen."""
-        if not self.dialog:
-            return
-
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        x = (self.dialog.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (height // 2)
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-
-
-class ProgressDialog:
-    """Dialog for showing progress during long-running operations."""
-
-    def __init__(self, parent, title="Processing...", message="Please wait..."):
-        self.parent = parent
-        self.title = title
-        self.message = message
-        self.dialog = None
-        self.progress_var = None
-        self.progress_bar = None
-        self.status_label = None
-        self.cancelled = False
-
-    def show(self, max_value=100):
-        """Show the progress dialog."""
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title(self.title)
-        self.dialog.geometry("400x220")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(self.parent)
-        self.dialog.grab_set()
-
-        # Center the dialog
-        self.dialog.update_idletasks()
-        x = (self.dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (220 // 2)
-        self.dialog.geometry(f"400x220+{x}+{y}")
-
-        # Prevent closing with X button
-        self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self._create_widgets(max_value)
-
-    def _create_widgets(self, max_value):
-        """Create the progress dialog widgets."""
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill="both", expand=True)
-
-        # Message label
-        message_label = ttk.Label(main_frame, text=self.message, font=("Arial", 10))
-        message_label.pack(pady=(0, 15))
-
-        # Progress bar
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            main_frame,
-            variable=self.progress_var,
-            maximum=max_value,
-            length=350,
-            mode="determinate",
-        )
-        self.progress_bar.pack(pady=(0, 10))
-
-        # Status label
-        self.status_label = ttk.Label(main_frame, text="Starting...", font=("Arial", 9))
-        self.status_label.pack(pady=(0, 15))
-
-        # Cancel button
-        cancel_button = ttk.Button(main_frame, text="Cancel", command=self._cancel)
-        cancel_button.pack()
-
-    def update_progress(self, value, status_text=""):
-        """Update the progress bar and status text."""
-        if self.dialog and self.progress_var:
-            self.progress_var.set(value)
-            if status_text and self.status_label:
-                self.status_label.config(text=status_text)
-            self.dialog.update()
-
-    def _cancel(self):
-        """Handle cancel button click."""
-        self.cancelled = True
-
-    def _on_close(self):
-        """Handle dialog close attempt."""
-        self.cancelled = True
-
-    def close(self):
-        """Close the progress dialog."""
-        if self.dialog:
-            self.dialog.destroy()
-            self.dialog = None
-
-    def is_cancelled(self):
-        """Check if the operation was cancelled."""
-        return self.cancelled
-
-
-class PPMDeviationPlotDialog:
-    """Dialog for displaying a plot of m/z vs PPM deviation for annotated fragments."""
-
-    def __init__(self, parent):
-        """Initialize the dialog."""
-        self.parent = parent
-        self.dialog = None
-
-    def show(self, annotated_data):
-        """
-        Show the PPM deviation plot dialog.
-
-        Args:
-            annotated_data: List of dictionaries containing:
-                - mz: m/z value
-                - ppm_error: PPM deviation
-                - formula: molecular formula
-                - spectrum_id: spectrum ID (optional)
-        """
-        if not annotated_data:
-            messagebox.showinfo("No Data", "No annotated fragments to display.")
-            return
-
-        # Create dialog window
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title("PPM Deviation Plot - Annotated Fragments")
-        self.dialog.geometry("800x600")
-        self.dialog.resizable(True, True)
-        self.dialog.grab_set()  # Make modal
-
-        # Main frame
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # Title
-        title_label = ttk.Label(
-            main_frame,
-            text="PPM Deviation vs m/z for Annotated Fragments",
-            font=("Arial", 14, "bold"),
-        )
-        title_label.pack(pady=(0, 10))
-
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(10, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, main_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
-
-        # Add navigation toolbar for zoom/pan functionality
-        toolbar_frame = ttk.Frame(main_frame)
-        toolbar_frame.pack(fill="x", pady=(0, 10))
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
-
-        # Plot the data
-        self._plot_ppm_deviation(annotated_data)
-
-        # Info frame with statistics
-        info_frame = ttk.LabelFrame(main_frame, text="Statistics", padding=5)
-        info_frame.pack(fill="x", pady=(0, 10))
-
-        self._display_statistics(annotated_data, info_frame)
-
-        # Button frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x")
-
-        # Save plot button
-        ttk.Button(
-            button_frame,
-            text="Save Plot",
-            command=lambda: self._save_plot(annotated_data),
-        ).pack(side="left", padx=(0, 5))
-
-        # Close button
-        ttk.Button(button_frame, text="Close", command=self._close).pack(side="right")
-
-        # Center the dialog
-        self.dialog.transient(self.parent)
-        self.dialog.wait_window()
-
-    def _plot_ppm_deviation(self, annotated_data):
-        """Create the PPM deviation plot."""
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-
-        # Extract data
-        mz_values = [item["mz"] for item in annotated_data]
-        ppm_errors = [item["ppm_error"] for item in annotated_data]
-        formulas = [item.get("formula", "") for item in annotated_data]
-        annotation_ranks = [item.get("annotation_rank", 0) for item in annotated_data]
-
-        # Define colors based on annotation rank with 30% transparency (alpha=0.3)
-        def get_color(rank):
-            if rank == 0:
-                return (0.0, 0.8, 0.0, 0.3)  # Green for 1st (best match)
-            elif rank == 1:
-                return (0.0, 0.0, 1.0, 0.3)  # Blue for 2nd
-            elif rank == 2:
-                return (1.0, 0.65, 0.0, 0.3)  # Orange for 3rd
-            else:
-                return (1.0, 0.0, 0.0, 0.3)  # Red for 4th and beyond
-
-        # Create colors array
-        colors = [get_color(rank) for rank in annotation_ranks]
-
-        # Create scatter plot with color coding
-        scatter = ax.scatter(
-            mz_values,
-            ppm_errors,
-            alpha=1.0,  # Set to 1.0 since alpha is included in colors
-            s=50,
-            c=colors,
-            edgecolors="black",
-            linewidth=0.5,
-        )
-
-        # Set labels and title
-        ax.set_xlabel("m/z", fontsize=12)
-        ax.set_ylabel("PPM Deviation", fontsize=12)
-        ax.set_title(
-            "PPM Deviation vs m/z for Annotated Fragments",
-            fontsize=14,
-            fontweight="bold",
-        )
-
-        # Create legend for color coding
-        from matplotlib.patches import Patch
-
-        legend_elements = [
-            Patch(
-                facecolor=(0.0, 0.8, 0.0, 0.3),
-                edgecolor="black",
-                label="1st match (best)",
-            ),
-            Patch(facecolor=(0.0, 0.0, 1.0, 0.3), edgecolor="black", label="2nd match"),
-            Patch(
-                facecolor=(1.0, 0.65, 0.0, 0.3), edgecolor="black", label="3rd match"
-            ),
-            Patch(
-                facecolor=(1.0, 0.0, 0.0, 0.3), edgecolor="black", label="4th+ match"
-            ),
-        ]
-
-        # Check if PPM tolerance function was used and plot it
-        ppm_tolerances_used = [
-            item.get("ppm_tolerance_used") for item in annotated_data
-        ]
-        unique_tolerances = set(filter(None, ppm_tolerances_used))
-
-        if len(unique_tolerances) > 1:
-            # Variable tolerance was used - try to reconstruct and show the function
-            # Group by m/z ranges to show the tolerance function
-            mz_tolerance_pairs = []
-            for item in annotated_data:
-                mz = item["mz"]
-                tolerance = item.get("ppm_tolerance_used")
-                if tolerance is not None:
-                    mz_tolerance_pairs.append((mz, tolerance))
-
-            if mz_tolerance_pairs:
-                # Sort by m/z and create a smooth tolerance line
-                mz_tolerance_pairs.sort()
-                tolerance_mz = [pair[0] for pair in mz_tolerance_pairs]
-                tolerance_values = [pair[1] for pair in mz_tolerance_pairs]
-
-                # Plot tolerance function as positive and negative bounds
-                ax.plot(
-                    tolerance_mz,
-                    tolerance_values,
-                    "r--",
-                    alpha=0.7,
-                    linewidth=2,
-                    label="PPM Tolerance (upper limit)",
-                )
-                ax.plot(
-                    tolerance_mz,
-                    [-t for t in tolerance_values],
-                    "r--",
-                    alpha=0.7,
-                    linewidth=2,
-                    label="PPM Tolerance (lower limit)",
-                )
-
-                # Add to legend
-                legend_elements.append(
-                    Patch(
-                        facecolor="none",
-                        edgecolor="red",
-                        linestyle="--",
-                        label="PPM tolerance function",
-                    )
-                )
-
-        ax.legend(handles=legend_elements, loc="upper right")
-
-        # Add grid
-        ax.grid(True, alpha=0.3)
-
-        # Add horizontal line at y=0 for reference
-        ax.axhline(y=0, color="red", linestyle="--", alpha=0.7, linewidth=1)
-
-        # Set axis limits with some padding
-        if mz_values and ppm_errors:
-            mz_range = max(mz_values) - min(mz_values)
-            ppm_range = max(ppm_errors) - min(ppm_errors)
-
-            ax.set_xlim(
-                min(mz_values) - mz_range * 0.05, max(mz_values) + mz_range * 0.05
-            )
-            ax.set_ylim(
-                min(ppm_errors) - ppm_range * 0.1, max(ppm_errors) + ppm_range * 0.1
-            )
-
-        # Add annotation on hover (if matplotlib supports it)
-        try:
-            # Create annotation box
-            self.annot = ax.annotate(
-                "",
-                xy=(0, 0),
-                xytext=(20, 20),
-                textcoords="offset points",
-                bbox=dict(boxstyle="round", fc="w", alpha=0.8),
-                arrowprops=dict(arrowstyle="->"),
-            )
-            self.annot.set_visible(False)
-
-            def update_annot(ind):
-                """Update annotation with point information."""
-                pos = scatter.get_offsets()[ind["ind"][0]]
-                self.annot.xy = pos
-                idx = ind["ind"][0]
-                rank = annotation_ranks[idx] + 1  # Convert to 1-based for display
-                text = f"m/z: {mz_values[idx]:.4f}\nPPM: {ppm_errors[idx]:.2f}\nFormula: {formulas[idx]}\nRank: {rank}"
-                self.annot.set_text(text)
-                self.annot.get_bbox_patch().set_facecolor("white")
-                self.annot.get_bbox_patch().set_alpha(0.8)
-
-            def hover(event):
-                """Handle hover events over data points."""
-                if event.inaxes == ax:
-                    cont, ind = scatter.contains(event)
-                    if cont:
-                        update_annot(ind)
-                        self.annot.set_visible(True)
-                        self.figure.canvas.draw()
-                    else:
-                        if self.annot.get_visible():
-                            self.annot.set_visible(False)
-                            self.figure.canvas.draw()
-
-            self.figure.canvas.mpl_connect("motion_notify_event", hover)
-        except:
-            # If hover annotation fails, continue without it
-            pass
-
-        # Adjust layout
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-    def _display_statistics(self, annotated_data, parent_frame):
-        """Display statistics about the annotated data."""
-        if not annotated_data:
-            return
-
-        ppm_errors = [item["ppm_error"] for item in annotated_data]
-        annotation_ranks = [item.get("annotation_rank", 0) for item in annotated_data]
-
-        # Calculate statistics
-        min_ppm = min(ppm_errors)
-        max_ppm = max(ppm_errors)
-        mean_ppm = sum(ppm_errors) / len(ppm_errors)
-
-        # Calculate median
-        sorted_ppm = sorted(ppm_errors)
-        n = len(sorted_ppm)
-        median_ppm = (
-            sorted_ppm[n // 2]
-            if n % 2 == 1
-            else (sorted_ppm[n // 2 - 1] + sorted_ppm[n // 2]) / 2
-        )
-
-        # Calculate rank distribution
-        rank_counts = {}
-        for rank in annotation_ranks:
-            rank_display = rank + 1  # Convert to 1-based for display
-            if rank_display <= 3:
-                rank_counts[rank_display] = rank_counts.get(rank_display, 0) + 1
-            else:
-                rank_counts["4+"] = rank_counts.get("4+", 0) + 1
-
-        # Create statistics text
-        stats_text = (
-            f"Total annotated fragments: {len(annotated_data)}\n"
-            f"PPM deviation range: {min_ppm:.2f} - {max_ppm:.2f}\n"
-            f"Mean PPM deviation: {mean_ppm:.2f}\n"
-            f"Median PPM deviation: {median_ppm:.2f}\n\n"
-            f"Annotation rank distribution:\n"
-        )
-
-        # Add rank distribution
-        for rank in [1, 2, 3, "4+"]:
-            count = rank_counts.get(rank, 0)
-            percentage = (count / len(annotated_data)) * 100
-            stats_text += f"  Rank {rank}: {count} ({percentage:.1f}%)\n"
-
-        stats_label = ttk.Label(parent_frame, text=stats_text, font=("Arial", 10))
-        stats_label.pack(anchor="w")
-
-    def _save_plot(self, annotated_data):
-        """Save the plot to a file."""
-        from tkinter import filedialog
-
-        filename = filedialog.asksaveasfilename(
-            title="Save PPM Deviation Plot",
-            defaultextension=".png",
-            filetypes=[
-                ("PNG files", "*.png"),
-                ("PDF files", "*.pdf"),
-                ("SVG files", "*.svg"),
-                ("All files", "*.*"),
-            ],
-        )
-
-        if filename:
-            try:
-                self.figure.savefig(filename, dpi=300, bbox_inches="tight")
-                messagebox.showinfo(
-                    "Success", f"Plot saved successfully to:\n{filename}"
-                )
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save plot:\n{str(e)}")
-
-    def _close(self):
-        """Close the dialog."""
-        if self.dialog:
-            self.dialog.destroy()
-
-
-class SpectrumPopupWindow:
-    """Popup window for displaying selected spectra and metadata."""
-
-    def __init__(
-        self,
-        parent,
-        parser: MGFParser,
-        selected_spectrum_ids: List[int],
-        naming_scheme: str = "Numbered",
-    ):
-        self.parent = parent
-        self.parser = parser
-        self.selected_spectrum_ids = selected_spectrum_ids[:]  # Create a copy
-        self.naming_scheme = naming_scheme
-        self.popup = None
-
-    def show(self):
-        """Show the popup window."""
-        if not self.parser or not self.selected_spectrum_ids:
-            return
-
-        # Create popup window
-        self.popup = tk.Toplevel(self.parent)
-        self.popup.title(f"Spectrum Popup - {len(self.selected_spectrum_ids)} Spectra")
-        self.popup.geometry("1200x800")
-        self.popup.resizable(True, True)
-
-        # Make it a regular window (not modal)
-        # self.popup.transient(self.parent)
-        # self.popup.grab_set()
-
-        # Create main frame
-        main_frame = ttk.Frame(self.popup, padding=10)
-        main_frame.pack(fill="both", expand=True)
-
-        # Create paned window for layout
-        paned_window = ttk.PanedWindow(main_frame, orient="horizontal")
-        paned_window.pack(fill="both", expand=True)
-
-        # Left side: Spectrum visualization
-        viz_frame = ttk.LabelFrame(
-            paned_window, text="Spectrum Visualization", padding=5
-        )
-        paned_window.add(viz_frame, weight=2)
-
-        # Create spectrum visualization for popup
-        self.spectrum_viz = SpectrumVisualizationPopup(viz_frame)
-        self.spectrum_viz.naming_scheme = self.naming_scheme  # Set the naming scheme
-        self.spectrum_viz.pack(fill="both", expand=True)
-        self.spectrum_viz.load_data(self.parser, self.selected_spectrum_ids)
-
-        # Right side: Metadata and ion data
-        right_frame = ttk.Frame(paned_window)
-        paned_window.add(right_frame, weight=1)
-
-        # Metadata section
-        metadata_frame = ttk.LabelFrame(right_frame, text="Metadata", padding=5)
-        metadata_frame.pack(fill="both", expand=True, pady=(0, 5))
-
-        # Create text widget with scrollbar for metadata
-        metadata_text_frame = ttk.Frame(metadata_frame)
-        metadata_text_frame.pack(fill="both", expand=True)
-
-        self.metadata_text = tk.Text(metadata_text_frame, wrap="word", height=15)
-        metadata_scrollbar = ttk.Scrollbar(
-            metadata_text_frame, orient="vertical", command=self.metadata_text.yview
-        )
-        self.metadata_text.configure(yscrollcommand=metadata_scrollbar.set)
-
-        self.metadata_text.pack(side="left", fill="both", expand=True)
-        metadata_scrollbar.pack(side="right", fill="y")
-
-        # Ion data section
-        ion_frame = ttk.LabelFrame(right_frame, text="Ion Data Summary", padding=5)
-        ion_frame.pack(fill="both", expand=True)
-
-        # Create text widget with scrollbar for ion data
-        ion_text_frame = ttk.Frame(ion_frame)
-        ion_text_frame.pack(fill="both", expand=True)
-
-        self.ion_text = tk.Text(ion_text_frame, wrap="word", height=15)
-        ion_scrollbar = ttk.Scrollbar(
-            ion_text_frame, orient="vertical", command=self.ion_text.yview
-        )
-        self.ion_text.configure(yscrollcommand=ion_scrollbar.set)
-
-        self.ion_text.pack(side="left", fill="both", expand=True)
-        ion_scrollbar.pack(side="right", fill="y")
-
-        # Populate metadata and ion data
-        self._populate_metadata()
-        self._populate_ion_data()
-
-        # Button frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(button_frame, text="Close", command=self._close_popup).pack(
-            side="right"
-        )
-
-        # Center the window
-        self.popup.update_idletasks()
-        width = self.popup.winfo_width()
-        height = self.popup.winfo_height()
-        x = (self.popup.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.popup.winfo_screenheight() // 2) - (height // 2)
-        self.popup.geometry(f"{width}x{height}+{x}+{y}")
-
-    def _populate_metadata(self):
-        """Populate the metadata text widget."""
-        self.metadata_text.delete(1.0, tk.END)
-
-        # Get selected spectra
-        selected_spectra = [
-            s
-            for s in self.parser.spectra
-            if s.spectrum_id in self.selected_spectrum_ids
-        ]
-
-        for i, spectrum in enumerate(selected_spectra):
-            self.metadata_text.insert(
-                tk.END, f"=== Spectrum {spectrum.spectrum_id} ===\n"
-            )
-
-            if spectrum.metadata:
-                for key, value in spectrum.metadata.items():
-                    self.metadata_text.insert(tk.END, f"{key}: {value}\n")
-            else:
-                self.metadata_text.insert(tk.END, "No metadata available\n")
-
-            if i < len(selected_spectra) - 1:
-                self.metadata_text.insert(tk.END, "\n")
-
-        self.metadata_text.config(state="disabled")
-
-    def _populate_ion_data(self):
-        """Populate the ion data text widget with summary."""
-        self.ion_text.delete(1.0, tk.END)
-
-        # Get selected spectra
-        selected_spectra = [
-            s
-            for s in self.parser.spectra
-            if s.spectrum_id in self.selected_spectrum_ids
-        ]
-
-        for i, spectrum in enumerate(selected_spectra):
-            self.ion_text.insert(tk.END, f"=== Spectrum {spectrum.spectrum_id} ===\n")
-
-            if spectrum.ions.size > 0:
-                self.ion_text.insert(tk.END, f"Number of ions: {len(spectrum.ions)}\n")
-
-                # Basic statistics
-                mz_values = spectrum.ions[:, 0]
-                intensity_values = spectrum.ions[:, 1]
-
-                self.ion_text.insert(
-                    tk.END,
-                    f"m/z range: {mz_values.min():.4f} - {mz_values.max():.4f}\n",
-                )
-                self.ion_text.insert(
-                    tk.END,
-                    f"Intensity range: {intensity_values.min():.2f} - {intensity_values.max():.2f}\n",
-                )
-
-                # Top 5 most intense ions
-                sorted_indices = np.argsort(intensity_values)[::-1]
-                self.ion_text.insert(tk.END, "\nTop 5 most intense ions:\n")
-                for j in range(min(5, len(sorted_indices))):
-                    idx = sorted_indices[j]
-                    mz = mz_values[idx]
-                    intensity = intensity_values[idx]
-                    self.ion_text.insert(
-                        tk.END, f"  {j + 1}. m/z {mz:.4f}, intensity {intensity:.2f}\n"
-                    )
-            else:
-                self.ion_text.insert(tk.END, "No ion data available\n")
-
-            if i < len(selected_spectra) - 1:
-                self.ion_text.insert(tk.END, "\n")
-
-        self.ion_text.config(state="disabled")
-
-    def _close_popup(self):
-        """Close the popup window."""
-        if self.popup:
-            self.popup.destroy()
+        pattern = self._smarts_edit.text().strip()
+        if pattern:
+            self._perform_filtering(pattern)
+        if self.apply_callback:
+            self.apply_callback(self.matching_spectra)
+        self._dialog.close()
+
+    def destroy(self):
+        self._dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# IntensityFilterDialog
+# ---------------------------------------------------------------------------
 
 
 class IntensityFilterDialog:
-    """Dialog for intensity filtering of spectra."""
+    """Intensity filter dialog (non-modal)."""
 
     def __init__(self, parent, spectra, apply_callback):
         self.parent = parent
         self.spectra = spectra
         self.apply_callback = apply_callback
+        self._dialog = QDialog(parent)
+        self._dialog.setWindowTitle("Intensity Filter")
+        self._dialog.resize(450, 350)
+        self._build_ui()
+        self._dialog.show()
 
-        # Create dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Intensity Filter")
-        self.dialog.geometry("500x550")
-        self.dialog.resizable(False, False)
-        self.dialog.grab_set()  # Make dialog modal
+    def _build_ui(self):
+        layout = QVBoxLayout(self._dialog)
 
-        # Center the dialog
-        self.dialog.transient(parent)
-        self.dialog.update_idletasks()
-        x = (self.dialog.winfo_screenwidth() // 2) - (500 // 2)
-        y = (self.dialog.winfo_screenheight() // 2) - (550 // 2)
-        self.dialog.geometry(f"500x550+{x}+{y}")
+        # Global threshold
+        gt_box = QGroupBox("Global Threshold")
+        gt_layout = QGridLayout(gt_box)
+        self._gt_enable = QCheckBox("Enable")
+        gt_layout.addWidget(self._gt_enable, 0, 0)
+        gt_layout.addWidget(QLabel("Min intensity:"), 1, 0)
+        self._gt_spin = QDoubleSpinBox()
+        self._gt_spin.setRange(0.0, 1e12)
+        self._gt_spin.setValue(0.0)
+        gt_layout.addWidget(self._gt_spin, 1, 1)
+        layout.addWidget(gt_box)
 
-        self._create_widgets()
+        # Relative to max
+        rm_box = QGroupBox("Relative to Maximum")
+        rm_layout = QGridLayout(rm_box)
+        self._rm_enable = QCheckBox("Enable")
+        rm_layout.addWidget(self._rm_enable, 0, 0)
+        rm_layout.addWidget(QLabel("Min % of max:"), 1, 0)
+        self._rm_spin = QDoubleSpinBox()
+        self._rm_spin.setRange(0.0, 100.0)
+        self._rm_spin.setValue(1.0)
+        rm_layout.addWidget(self._rm_spin, 1, 1)
+        layout.addWidget(rm_box)
 
-    def _create_widgets(self):
-        """Create dialog widgets."""
-        # Main frame
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill="both", expand=True)
-
-        # Title label
-        title_label = ttk.Label(
-            main_frame, text="Intensity Filter Options", font=("Arial", 14, "bold")
-        )
-        title_label.pack(pady=(0, 20))
-
-        # Filter 1: Global intensity threshold
-        self.global_enabled = tk.BooleanVar()
-        global_frame = ttk.LabelFrame(
-            main_frame, text="Global Intensity Threshold", padding=10
-        )
-        global_frame.pack(fill="x", pady=(0, 15))
-
-        global_check_frame = ttk.Frame(global_frame)
-        global_check_frame.pack(fill="x")
-
-        self.global_checkbox = ttk.Checkbutton(
-            global_check_frame,
-            text="Enable global intensity filter",
-            variable=self.global_enabled,
-            command=self._on_global_enabled_change,
-        )
-        self.global_checkbox.pack(side="left")
-
-        global_input_frame = ttk.Frame(global_frame)
-        global_input_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Label(global_input_frame, text="Minimum intensity:").pack(side="left")
-        self.global_value = tk.StringVar(value="1000")
-        self.global_entry = ttk.Entry(
-            global_input_frame,
-            textvariable=self.global_value,
-            width=15,
-            state="disabled",
-        )
-        self.global_entry.pack(side="left", padx=(10, 0))
-
-        # Filter 2: Relative to most abundant
-        self.relative_max_enabled = tk.BooleanVar()
-        relative_max_frame = ttk.LabelFrame(
-            main_frame, text="Relative to Most Abundant Signal", padding=10
-        )
-        relative_max_frame.pack(fill="x", pady=(0, 15))
-
-        relative_max_check_frame = ttk.Frame(relative_max_frame)
-        relative_max_check_frame.pack(fill="x")
-
-        self.relative_max_checkbox = ttk.Checkbutton(
-            relative_max_check_frame,
-            text="Enable relative filter (most abundant)",
-            variable=self.relative_max_enabled,
-            command=self._on_relative_max_enabled_change,
-        )
-        self.relative_max_checkbox.pack(side="left")
-
-        relative_max_input_frame = ttk.Frame(relative_max_frame)
-        relative_max_input_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Label(relative_max_input_frame, text="Minimum percentage:").pack(
-            side="left"
-        )
-        self.relative_max_value = tk.DoubleVar(value=5.0)
-        self.relative_max_spinbox = ttk.Spinbox(
-            relative_max_input_frame,
-            from_=0.0,
-            to=100.0,
-            increment=0.01,
-            textvariable=self.relative_max_value,
-            width=15,
-            format="%.2f",
-            state="disabled",
-        )
-        self.relative_max_spinbox.pack(side="left", padx=(10, 0))
-        ttk.Label(relative_max_input_frame, text="%").pack(side="left", padx=(5, 0))
-
-        # Filter 3: Relative to sum of all signals
-        self.relative_sum_enabled = tk.BooleanVar()
-        relative_sum_frame = ttk.LabelFrame(
-            main_frame, text="Relative to Sum of All Signals", padding=10
-        )
-        relative_sum_frame.pack(fill="x", pady=(0, 20))
-
-        relative_sum_check_frame = ttk.Frame(relative_sum_frame)
-        relative_sum_check_frame.pack(fill="x")
-
-        self.relative_sum_checkbox = ttk.Checkbutton(
-            relative_sum_check_frame,
-            text="Enable relative filter (total sum)",
-            variable=self.relative_sum_enabled,
-            command=self._on_relative_sum_enabled_change,
-        )
-        self.relative_sum_checkbox.pack(side="left")
-
-        relative_sum_input_frame = ttk.Frame(relative_sum_frame)
-        relative_sum_input_frame.pack(fill="x", pady=(10, 0))
-
-        ttk.Label(relative_sum_input_frame, text="Minimum percentage:").pack(
-            side="left"
-        )
-        self.relative_sum_value = tk.DoubleVar(value=1.0)
-        self.relative_sum_spinbox = ttk.Spinbox(
-            relative_sum_input_frame,
-            from_=0.0,
-            to=100.0,
-            increment=0.01,
-            textvariable=self.relative_sum_value,
-            width=15,
-            format="%.2f",
-            state="disabled",
-        )
-        self.relative_sum_spinbox.pack(side="left", padx=(10, 0))
-        ttk.Label(relative_sum_input_frame, text="%").pack(side="left", padx=(5, 0))
+        # Relative to sum
+        rs_box = QGroupBox("Relative to Sum")
+        rs_layout = QGridLayout(rs_box)
+        self._rs_enable = QCheckBox("Enable")
+        rs_layout.addWidget(self._rs_enable, 0, 0)
+        rs_layout.addWidget(QLabel("Min % of sum:"), 1, 0)
+        self._rs_spin = QDoubleSpinBox()
+        self._rs_spin.setRange(0.0, 100.0)
+        self._rs_spin.setValue(0.1)
+        rs_layout.addWidget(self._rs_spin, 1, 1)
+        layout.addWidget(rs_box)
 
         # Buttons
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x", pady=(20, 0))
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self._apply)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self._dialog.close)
+        btn_row.addStretch()
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
 
-        ttk.Button(button_frame, text="Cancel", command=self._cancel).pack(
-            side="right", padx=(10, 0)
-        )
-        ttk.Button(button_frame, text="Apply Filter", command=self._apply_filter).pack(
-            side="right"
-        )
-
-    def _on_global_enabled_change(self):
-        """Handle global filter checkbox change."""
-        if self.global_enabled.get():
-            self.global_entry.config(state="normal")
-        else:
-            self.global_entry.config(state="disabled")
-
-    def _on_relative_max_enabled_change(self):
-        """Handle relative max filter checkbox change."""
-        if self.relative_max_enabled.get():
-            self.relative_max_spinbox.config(state="normal")
-        else:
-            self.relative_max_spinbox.config(state="disabled")
-
-    def _on_relative_sum_enabled_change(self):
-        """Handle relative sum filter checkbox change."""
-        if self.relative_sum_enabled.get():
-            self.relative_sum_spinbox.config(state="normal")
-        else:
-            self.relative_sum_spinbox.config(state="disabled")
-
-    def _validate_inputs(self):
-        """Validate user inputs."""
-        # Check if at least one filter is enabled
-        if not (
-            self.global_enabled.get()
-            or self.relative_max_enabled.get()
-            or self.relative_sum_enabled.get()
-        ):
-            messagebox.showerror("Error", "Please enable at least one filter.")
-            return False
-
-        # Validate global intensity value
-        if self.global_enabled.get():
-            try:
-                value = float(self.global_value.get())
-                if value < 0:
-                    messagebox.showerror(
-                        "Error", "Global intensity threshold must be non-negative."
-                    )
-                    return False
-            except ValueError:
-                messagebox.showerror(
-                    "Error", "Global intensity threshold must be a valid number."
-                )
-                return False
-
-        # Validate relative percentages
-        if self.relative_max_enabled.get():
-            value = self.relative_max_value.get()
-            if value < 0 or value > 100:
-                messagebox.showerror(
-                    "Error",
-                    "Relative percentage (most abundant) must be between 0 and 100.",
-                )
-                return False
-
-        if self.relative_sum_enabled.get():
-            value = self.relative_sum_value.get()
-            if value < 0 or value > 100:
-                messagebox.showerror(
-                    "Error",
-                    "Relative percentage (total sum) must be between 0 and 100.",
-                )
-                return False
-
-        return True
-
-    def _apply_filter(self):
-        """Apply the intensity filter."""
-        if not self._validate_inputs():
-            return
-
-        # Prepare filter parameters
-        filter_params = {
-            "global_enabled": self.global_enabled.get(),
-            "global_threshold": float(self.global_value.get())
-            if self.global_enabled.get()
-            else None,
-            "relative_max_enabled": self.relative_max_enabled.get(),
-            "relative_max_percentage": self.relative_max_value.get()
-            if self.relative_max_enabled.get()
-            else None,
-            "relative_sum_enabled": self.relative_sum_enabled.get(),
-            "relative_sum_percentage": self.relative_sum_value.get()
-            if self.relative_sum_enabled.get()
-            else None,
-        }
-
-        # Apply filter to all spectra
-        filtered_count = 0
-        total_fragments_before = 0
-        total_fragments_after = 0
-
+    def _apply(self):
         for spectrum in self.spectra:
             if spectrum.ions.size == 0:
                 continue
+            ions = spectrum.ions
+            mask = np.ones(len(ions), dtype=bool)
+            intensities = ions[:, 1]
+            if self._gt_enable.isChecked():
+                mask &= intensities >= self._gt_spin.value()
+            if self._rm_enable.isChecked():
+                max_inten = intensities.max()
+                if max_inten > 0:
+                    mask &= (intensities / max_inten * 100) >= self._rm_spin.value()
+            if self._rs_enable.isChecked():
+                total = intensities.sum()
+                if total > 0:
+                    mask &= (intensities / total * 100) >= self._rs_spin.value()
+            spectrum.ions = ions[mask]
+        if self.apply_callback:
+            self.apply_callback()
+        self._dialog.close()
 
-            original_count = len(spectrum.ions)
-            total_fragments_before += original_count
-
-            # Get current ions
-            mz_values = spectrum.ions[:, 0]
-            intensity_values = spectrum.ions[:, 1]
-
-            # Create mask for fragments to keep
-            keep_mask = np.ones(len(intensity_values), dtype=bool)
-
-            # Apply global intensity filter
-            if filter_params["global_enabled"]:
-                global_mask = intensity_values >= filter_params["global_threshold"]
-                keep_mask = keep_mask & global_mask
-
-            # Apply relative to most abundant filter
-            if filter_params["relative_max_enabled"]:
-                max_intensity = np.max(intensity_values)
-                threshold = max_intensity * (
-                    filter_params["relative_max_percentage"] / 100.0
-                )
-                relative_max_mask = intensity_values >= threshold
-                keep_mask = keep_mask & relative_max_mask
-
-            # Apply relative to sum filter
-            if filter_params["relative_sum_enabled"]:
-                sum_intensity = np.sum(intensity_values)
-                threshold = sum_intensity * (
-                    filter_params["relative_sum_percentage"] / 100.0
-                )
-                relative_sum_mask = intensity_values >= threshold
-                keep_mask = keep_mask & relative_sum_mask
-
-            # Filter the ions
-            if np.any(~keep_mask):  # If any fragments were filtered out
-                filtered_mz = mz_values[keep_mask]
-                filtered_intensities = intensity_values[keep_mask]
-                spectrum.ions = np.column_stack((filtered_mz, filtered_intensities))
-
-                # Also filter fragment annotations if they exist
-                if spectrum.fragment_annotations:
-                    # Get the indices of kept fragments
-                    kept_indices = np.where(keep_mask)[0]
-                    new_annotations = {}
-                    for new_idx, old_idx in enumerate(kept_indices):
-                        if old_idx in spectrum.fragment_annotations:
-                            new_annotations[new_idx] = spectrum.fragment_annotations[
-                                old_idx
-                            ]
-                    spectrum.fragment_annotations = new_annotations
-
-                filtered_count += 1
-
-            total_fragments_after += len(spectrum.ions)
-
-        # Show warning about re-normalization
-        fragments_removed = total_fragments_before - total_fragments_after
-        if fragments_removed > 0:
-            message = (
-                f"Intensity filtering completed!\n\n"
-                f"Spectra processed: {len(self.spectra)}\n"
-                f"Spectra modified: {filtered_count}\n"
-                f"Total fragments removed: {fragments_removed}\n\n"
-                f"Warning: It might be necessary to re-normalize the intensity values\n"
-                f"after filtering to ensure proper relative intensities."
-            )
-            messagebox.showinfo("Filter Applied", message)
-        else:
-            messagebox.showinfo(
-                "Filter Applied",
-                "No fragments were removed with the current filter settings.",
-            )
-
-        # Close dialog immediately after user sees the message
-        self.dialog.destroy()
-
-        # Call the callback to update the GUI
-        self.apply_callback()
-
-    def _cancel(self):
-        """Cancel the dialog."""
-        self.dialog.destroy()
+    def destroy(self):
+        self._dialog.close()
 
 
-class SpectrumVisualizationPopup(ttk.Frame):
-    """Spectrum visualization component for popup windows (simplified version)."""
+# ---------------------------------------------------------------------------
+# FragmentAnnotationDialog
+# ---------------------------------------------------------------------------
+
+
+class FragmentAnnotationDialog:
+    """Dialog for fragment annotation configuration."""
+
+    def __init__(
+        self,
+        parent,
+        callback=None,
+        spectra=None,
+        selected_ids: Optional[List] = None,
+        filtered_ids: Optional[List] = None,
+    ):
+        self.parent = parent
+        self.callback = callback
+        self.spectra = spectra or []
+        self._selected_ids: List = selected_ids or []
+        self._filtered_ids: List = filtered_ids or []
+        self.result = None
+        self._window: Optional[QDialog] = None
+
+    def show(self):
+        self._window = QDialog(self.parent)
+        self._window.setWindowTitle("Fragment Annotation")
+        self._window.resize(600, 560)
+        self._build_ui()
+        self._window.exec()
+        return self.result
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self._window)
+
+        # Scope selection
+        scope_box = QGroupBox("Calculate for")
+        scope_layout = QVBoxLayout(scope_box)
+        self._rb_all = QRadioButton(f"All spectra ({len(self.spectra)})")
+        self._rb_selected = QRadioButton(
+            f"Selected spectra ({len(self._selected_ids)})"
+        )
+        self._rb_filtered = QRadioButton(
+            f"Filtered spectra ({len(self._filtered_ids)})"
+        )
+        self._rb_all.setChecked(True)
+        if not self._selected_ids:
+            self._rb_selected.setEnabled(False)
+        if not self._filtered_ids:
+            self._rb_filtered.setEnabled(False)
+        scope_layout.addWidget(self._rb_all)
+        scope_layout.addWidget(self._rb_selected)
+        scope_layout.addWidget(self._rb_filtered)
+        layout.addWidget(scope_box)
+
+        # Formula tags
+        tags_box = QGroupBox("Formula Tags (comma-separated)")
+        tags_layout = QVBoxLayout(tags_box)
+        self._formula_tags_edit = QLineEdit("formula")
+        tags_layout.addWidget(self._formula_tags_edit)
+        layout.addWidget(tags_box)
+
+        # PPM tolerance
+        ppm_box = QGroupBox("PPM Tolerance")
+        ppm_layout = QHBoxLayout(ppm_box)
+        ppm_layout.addWidget(QLabel("PPM tolerance:"))
+        self._ppm_spin = QDoubleSpinBox()
+        self._ppm_spin.setRange(0.1, 1000.0)
+        self._ppm_spin.setValue(10.0)
+        ppm_layout.addWidget(self._ppm_spin)
+        ppm_layout.addStretch()
+        layout.addWidget(ppm_box)
+
+        # Additional elements
+        elem_box = QGroupBox("Additional Elements")
+        elem_layout = QVBoxLayout(elem_box)
+        self._add_elements_edit = QLineEdit("")
+        self._add_elements_edit.setPlaceholderText("e.g. Na, K (optional)")
+        elem_layout.addWidget(self._add_elements_edit)
+        layout.addWidget(elem_box)
+
+        # Max workers
+        workers_box = QGroupBox("Processing")
+        workers_layout = QHBoxLayout(workers_box)
+        workers_layout.addWidget(QLabel("Max workers:"))
+        self._workers_spin = QSpinBox()
+        self._workers_spin.setRange(1, 32)
+        self._workers_spin.setValue(4)
+        workers_layout.addWidget(self._workers_spin)
+        workers_layout.addStretch()
+        layout.addWidget(workers_box)
+
+        # PPM function points
+        points_box = QGroupBox("PPM Function Points (m/z:ppm, comma-separated)")
+        points_layout = QVBoxLayout(points_box)
+        self._points_edit = QLineEdit("")
+        self._points_edit.setPlaceholderText("e.g. 100:20, 500:10, 1000:5")
+        points_layout.addWidget(self._points_edit)
+        layout.addWidget(points_box)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self._window.reject)
+        layout.addWidget(bb)
+
+    def _on_ok(self):
+        tags_raw = self._formula_tags_edit.text()
+        formula_tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+        extra_raw = self._add_elements_edit.text()
+        additional_elements = [e.strip() for e in extra_raw.split(",") if e.strip()]
+
+        points_raw = self._points_edit.text().strip()
+        ppm_points = []
+        if points_raw:
+            try:
+                for pair in points_raw.split(","):
+                    mz_str, ppm_str = pair.strip().split(":")
+                    ppm_points.append((float(mz_str.strip()), float(ppm_str.strip())))
+            except Exception:
+                ppm_points = []
+
+        self.result = {
+            "formula_tags": formula_tags,
+            "ppm_tolerance": self._ppm_spin.value(),
+            "additional_elements": additional_elements,
+            "ppm_function_points": ppm_points,
+            "max_workers": self._workers_spin.value(),
+            "scope": (
+                "selected"
+                if self._rb_selected.isChecked()
+                else "filtered"
+                if self._rb_filtered.isChecked()
+                else "all"
+            ),
+            "selected_ids": list(self._selected_ids),
+            "filtered_ids": list(self._filtered_ids),
+        }
+        if self.callback:
+            self.callback(self.result)
+        self._window.accept()
+
+
+# ---------------------------------------------------------------------------
+# CanonicalSmilesDialog
+# ---------------------------------------------------------------------------
+
+
+class CanonicalSmilesDialog:
+    """Non-modal dialog showing canonical SMILES results."""
 
     def __init__(self, parent):
-        super().__init__(parent)
-        self.parser: Optional[MGFParser] = None
-        self.selected_spectrum_ids: List[int] = []
-        self.show_combined_plot = tk.BooleanVar(value=False)
-        self.ppm_tolerance = tk.DoubleVar(value=20.0)
-        self.top_fragments_count = tk.IntVar(
-            value=15
-        )  # Number of top fragments to show
-        self.naming_scheme = "Numbered"  # Current spectrum naming scheme
+        self.parent = parent
+        self._window: Optional[QDialog] = None
+        self._on_key_change = None
 
+    def show(
+        self, rows, summary_text=None, initial_key: str = "smiles", on_key_change=None
+    ):
+        self._on_key_change = on_key_change
+        if self._window and not self._window.isHidden():
+            self._window.close()
+        self._window = QDialog(self.parent)
+        self._window.setWindowTitle("Canonical SMILES")
+        self._window.resize(900, 500)
+        layout = QVBoxLayout(self._window)
+
+        if summary_text:
+            lbl = QLabel(summary_text)
+            lbl.setWordWrap(True)
+            layout.addWidget(lbl)
+
+        # Key selector
+        key_row = QHBoxLayout()
+        key_row.addWidget(QLabel("Metadata key:"))
+        self._key_edit = QLineEdit(initial_key)
+        self._key_edit.returnPressed.connect(self._on_key_changed)
+        key_row.addWidget(self._key_edit)
+        update_btn = QPushButton("Update")
+        update_btn.clicked.connect(self._on_key_changed)
+        key_row.addWidget(update_btn)
+        key_row.addStretch()
+        layout.addLayout(key_row)
+
+        # Table
+        self._table = QTreeWidget()
+        self._table.setHeaderLabels(
+            ["Spectrum ID", "Original SMILES", "Canonical SMILES", "Error"]
+        )
+        self._table.setColumnWidth(0, 100)
+        self._table.setColumnWidth(1, 220)
+        self._table.setColumnWidth(2, 220)
+        self._table.setColumnWidth(3, 200)
+        for row in rows:
+            item = QTreeWidgetItem()
+            item.setText(0, str(row.get("spectrum_id", "")))
+            item.setText(1, str(row.get("original", "")))
+            item.setText(2, str(row.get("canonical", "")))
+            item.setText(3, str(row.get("error", "")))
+            if row.get("highlighted"):
+                for col in range(4):
+                    item.setBackground(col, Qt.GlobalColor.yellow)
+            self._table.addTopLevelItem(item)
+        layout.addWidget(self._table)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self._window.close)
+        layout.addWidget(close_btn)
+        self._window.show()
+
+    def _on_key_changed(self):
+        if self._on_key_change:
+            self._on_key_change(self._key_edit.text().strip())
+
+    def close(self):
+        if self._window:
+            self._window.close()
+
+
+# ---------------------------------------------------------------------------
+# ProgressDialog
+# ---------------------------------------------------------------------------
+
+
+class ProgressDialog:
+    """Modal progress dialog."""
+
+    def __init__(
+        self, parent, title: str = "Processing...", message: str = "Please wait..."
+    ):
+        self.parent = parent
+        self._title = title
+        self._message = message
+        self.cancelled = False
+        self._dialog: Optional[QDialog] = None
+
+    def show(self, max_value: int = 100):
+        self._dialog = QDialog(self.parent)
+        self._dialog.setWindowTitle(self._title)
+        self._dialog.setModal(True)
+        self._dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(self._dialog)
+        self._msg_label = QLabel(self._message)
+        self._msg_label.setWordWrap(True)
+        layout.addWidget(self._msg_label)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, max_value)
+        self._bar.setValue(0)
+        layout.addWidget(self._bar)
+        self._status_label = QLabel("")
+        layout.addWidget(self._status_label)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self._on_cancel)
+        layout.addWidget(cancel_btn)
+        self._dialog.show()
+        QApplication.processEvents()
+
+    def update_progress(self, value: int, status_text: str = ""):
+        if self._dialog is None:
+            return
+        self._bar.setValue(value)
+        if status_text:
+            self._status_label.setText(status_text)
+        QApplication.processEvents()
+
+    def _on_cancel(self):
+        self.cancelled = True
+
+    def close(self):
+        if self._dialog:
+            self._dialog.close()
+            self._dialog = None
+
+    def is_cancelled(self) -> bool:
+        return self.cancelled
+
+
+# ---------------------------------------------------------------------------
+# PPMDeviationPlotDialog
+# ---------------------------------------------------------------------------
+
+
+class PPMDeviationPlotDialog:
+    """Dialog showing a PPM deviation scatter plot for annotated fragments."""
+
+    def __init__(self, parent):
+        self.parent = parent
+
+    def show(self, annotated_data):
+        dialog = QDialog(self.parent)
+        dialog.setWindowTitle("PPM Deviation Plot")
+        dialog.resize(800, 600)
+        layout = QVBoxLayout(dialog)
+
+        fig = Figure(figsize=(8, 5), dpi=100)
+        canvas = FigureCanvasQTAgg(fig)
+        layout.addWidget(canvas)
+        toolbar = NavigationToolbar2QT(canvas, dialog)
+        layout.addWidget(toolbar)
+
+        # Stats panel
+        stats_edit = QTextEdit()
+        stats_edit.setReadOnly(True)
+        stats_edit.setMaximumHeight(80)
+        layout.addWidget(stats_edit)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+
+        ax = fig.add_subplot(111)
+        if annotated_data:
+            all_mz = []
+            all_ppm = []
+            all_rank = []
+            for entry in annotated_data:
+                mz = entry.get("mz", 0)
+                ppm = entry.get("ppm_error", 0)
+                rank = entry.get("annotation_rank", 0)
+                all_mz.append(mz)
+                all_ppm.append(ppm)
+                all_rank.append(rank)
+            sc = ax.scatter(
+                all_mz, all_ppm, c=all_rank, cmap="coolwarm", alpha=0.7, s=20
+            )
+            fig.colorbar(sc, ax=ax, label="Annotation Rank")
+            ax.axhline(0, color="black", linestyle="--", linewidth=0.8)
+            ax.set_xlabel("m/z")
+            ax.set_ylabel("PPM Error")
+            ax.set_title("PPM Deviation vs m/z")
+            ax.grid(True, alpha=0.3)
+            ppm_arr = np.array(all_ppm)
+            stats_edit.setPlainText(
+                f"N={len(ppm_arr)}  Mean PPM={np.mean(ppm_arr):.2f}"
+                f"  Std={np.std(ppm_arr):.2f}  "
+                f"Min={np.min(ppm_arr):.2f}  Max={np.max(ppm_arr):.2f}"
+            )
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No annotated data available",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.axis("off")
+        canvas.draw()
+        dialog.exec()
+
+
+# ---------------------------------------------------------------------------
+# SpectrumVisualizationPopup
+# ---------------------------------------------------------------------------
+
+
+class SpectrumVisualizationPopup(QWidget):
+    """Simplified spectrum visualization for popup windows."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.naming_scheme: str = "Numbered"
+        self.parser: Optional[MGFParser] = None
+        self.selected_spectrum_ids: List = []
+        self._syncing_zoom = False
+        self.axes: List = []
         self._create_widgets()
 
     def _create_widgets(self):
-        """Create the visualization widgets."""
-        # Header with controls
-        header_frame = ttk.Frame(self)
-        header_frame.pack(fill="x", padx=5, pady=5)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        self.figure = Figure(figsize=(8, 6), dpi=90)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, stretch=1)
+        toolbar = NavigationToolbar2QT(self.canvas, self)
+        layout.addWidget(toolbar)
 
-        ttk.Label(
-            header_frame, text="Spectrum Visualization", font=("Arial", 12, "bold")
-        ).pack(side="left")
-
-        # Controls frame
-        controls_frame = ttk.Frame(header_frame)
-        controls_frame.pack(side="right")
-
-        # Combined plot checkbox
-        ttk.Checkbutton(
-            controls_frame,
-            text="Show Combined Plot",
-            variable=self.show_combined_plot,
-            command=self._plot_spectra,
-        ).pack(side="left", padx=(0, 10))
-
-        # PPM tolerance for fragment matching in combined plot
-        ttk.Label(controls_frame, text="PPM tolerance:").pack(side="left", padx=(0, 2))
-        ppm_spinbox = ttk.Spinbox(
-            controls_frame,
-            from_=1.0,
-            to=100.0,
-            increment=1.0,
-            width=8,
-            textvariable=self.ppm_tolerance,
-            command=self._on_ppm_change,
-        )
-        ppm_spinbox.pack(side="left", padx=(0, 10))
-        ppm_spinbox.bind("<KeyRelease>", self._on_ppm_change)
-
-        # Top fragments count for combined plot
-        ttk.Label(controls_frame, text="Top fragments:").pack(side="left", padx=(0, 2))
-        fragments_spinbox = ttk.Spinbox(
-            controls_frame,
-            from_=5,
-            to=50,
-            increment=1,
-            width=6,
-            textvariable=self.top_fragments_count,
-            command=self._on_fragments_count_change,
-        )
-        fragments_spinbox.pack(side="left")
-        fragments_spinbox.bind("<KeyRelease>", self._on_fragments_count_change)
-
-        # Matplotlib figure
-        self.figure = Figure(figsize=(10, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, self)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=(5, 0))
-
-        # Add navigation toolbar
-        toolbar_frame = ttk.Frame(self)
-        toolbar_frame.pack(fill="x", padx=5, pady=(0, 5))
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
-
-    def _get_spectrum_display_name(self, spectrum_or_id):
-        """Get the display name for a spectrum based on the current naming scheme."""
-        # Handle both spectrum objects and spectrum IDs
-        if isinstance(spectrum_or_id, (str, int)):
-            # It's a spectrum ID, find the spectrum object
-            spectrum_id = spectrum_or_id
-            if not self.parser:
-                return f"S {spectrum_id}"
-
-            spectrum = next(
-                (s for s in self.parser.spectra if s.spectrum_id == spectrum_id), None
-            )
-            if not spectrum:
-                return f"S {spectrum_id}"
-        else:
-            # It's already a spectrum object
-            spectrum = spectrum_or_id
-            spectrum_id = spectrum.spectrum_id
-
-        # Use the local naming scheme
-        if self.naming_scheme == "Numbered":
-            return f"S {spectrum_id}"
-        else:
-            # Use the metadata value for the naming key
-            name_value = spectrum.get_metadata_value(self.naming_scheme)
-            if name_value:
-                return str(name_value)
-            else:
-                return f"S {spectrum_id}"  # Fall back to numbered if key not found
-
-    def load_data(self, parser: MGFParser, selected_spectrum_ids: List[int]):
-        """Load and visualize selected spectra."""
+    def load_data(self, parser: MGFParser, selected_spectrum_ids: List):
         self.parser = parser
         self.selected_spectrum_ids = selected_spectrum_ids
         self._plot_spectra()
 
-    def _plot_spectra(self):
-        """Plot the selected spectra."""
-        self.figure.clear()
+    def _get_display_name(self, spectrum) -> str:
+        return _format_spectrum_label(spectrum, self.naming_scheme)
 
+    def _plot_spectra(self):
+        self.figure.clear()
+        self.axes = []
         if not self.parser or not self.selected_spectrum_ids:
             ax = self.figure.add_subplot(111)
             ax.text(
@@ -6898,974 +3103,394 @@ class SpectrumVisualizationPopup(ttk.Frame):
                 va="center",
                 transform=ax.transAxes,
             )
+            ax.axis("off")
             self.canvas.draw()
             return
-
-        # Get selected spectra
-        selected_spectra = [
+        spectra = [
             s
             for s in self.parser.spectra
             if s.spectrum_id in self.selected_spectrum_ids
         ]
-
-        if not selected_spectra:
+        if not spectra:
             return
-
-        if self.show_combined_plot.get() and len(selected_spectra) > 1:
-            self._plot_combined_spectra(selected_spectra)
-        else:
-            self._plot_individual_spectra(selected_spectra)
-
-    def _plot_individual_spectra(self, selected_spectra):
-        """Plot individual spectra in separate subplots."""
-        # Limit to 10 spectra for popup
-        if len(selected_spectra) > 10:
-            selected_spectra = selected_spectra[:10]
-
-        # Calculate global m/z limits
-        global_mz_min = float("inf")
-        global_mz_max = float("-inf")
-
-        for spectrum in selected_spectra:
-            if spectrum.ions.size > 0:
-                mz_values = spectrum.ions[:, 0]
-                global_mz_min = min(global_mz_min, mz_values.min())
-                global_mz_max = max(global_mz_max, mz_values.max())
-
-        # Add padding
-        if global_mz_min != float("inf") and global_mz_max != float("-inf"):
-            mz_range = global_mz_max - global_mz_min
-            padding = mz_range * 0.02
-            global_mz_min -= padding
-            global_mz_max += padding
-        else:
+        original_count = len(spectra)
+        if original_count > 10:
+            spectra = spectra[:5]
+        global_mz_min, global_mz_max = float("inf"), float("-inf")
+        for s in spectra:
+            if s.ions.size > 0:
+                global_mz_min = min(global_mz_min, s.ions[:, 0].min())
+                global_mz_max = max(global_mz_max, s.ions[:, 0].max())
+        if global_mz_min == float("inf"):
             global_mz_min, global_mz_max = 0, 1000
-
-        # Create subplots
-        n_spectra = len(selected_spectra)
-        for i, spectrum in enumerate(selected_spectra):
-            is_last = i == n_spectra - 1
-            ax = self.figure.add_subplot(n_spectra, 1, i + 1)
-            self._plot_single_spectrum(
-                ax, spectrum, (global_mz_min, global_mz_max), is_last
-            )
-
-        self.figure.tight_layout(pad=0.5, h_pad=0.2)
-        self.canvas.draw()
-
-    def _plot_single_spectrum(self, ax, spectrum, mz_limits=None, is_last=False):
-        """Plot a single spectrum as a stick chart."""
-        if spectrum.ions.size == 0:
-            ax.text(
-                0.5,
-                0.5,
-                "No ion data",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
-            if mz_limits:
-                ax.set_xlim(mz_limits)
-            return
-
-        mz_values = spectrum.ions[:, 0]
-        intensity_values = spectrum.ions[:, 1]
-
-        # Create stick plot
-        ax.vlines(mz_values, 0, intensity_values, colors="blue", linewidth=1.5)
-
-        # Only show x-axis label and ticks on the last spectrum
-        if is_last:
-            ax.set_xlabel("m/z")
-        else:
-            ax.set_xticklabels([])
-            ax.tick_params(axis="x", which="both", bottom=False)
-
-        ax.set_ylabel(f"S {spectrum.spectrum_id}\nIntensity", fontsize=9)
-        ax.grid(True, alpha=0.3)
-
-        # Set limits
-        if mz_limits:
-            ax.set_xlim(mz_limits)
-        elif len(mz_values) > 0:
-            ax.set_xlim(mz_values.min() * 0.95, mz_values.max() * 1.05)
-
-        if len(intensity_values) > 0:
-            ax.set_ylim(0, intensity_values.max() * 1.1)
-
-    def _plot_combined_spectra(self, selected_spectra):
-        """Plot all selected spectra in a combined plot with fragment matching."""
-        # Limit to 10 spectra
-        if len(selected_spectra) > 10:
-            selected_spectra = selected_spectra[:10]
-
-        ax = self.figure.add_subplot(111)
-
-        # Use the same combined plotting logic as the main visualization
-        all_fragments = {}
-        spectrum_colors = plt.cm.tab10(
-            np.linspace(0, 1, min(len(selected_spectra), 10))
-        )
-        spectrum_info = {}
-
-        for i, spectrum in enumerate(selected_spectra):
-            if spectrum.ions.size == 0:
-                continue
-
-            mz_values = spectrum.ions[:, 0]
-            intensity_values = spectrum.ions[:, 1]
-
-            # Sum-scale intensities
-            total_intensity = np.sum(intensity_values)
-            if total_intensity > 0:
-                relative_intensities = intensity_values / total_intensity
+        n = len(spectra)
+        for i, spectrum in enumerate(spectra):
+            ax = self.figure.add_subplot(n, 1, i + 1)
+            self.axes.append(ax)
+            if spectrum.ions.size > 0:
+                mz = spectrum.ions[:, 0]
+                intensity = spectrum.ions[:, 1]
+                ax.vlines(mz, 0, intensity, colors="blue", linewidth=1.5)
+                if len(mz) > 0:
+                    ax.set_xlim(global_mz_min * 0.98, global_mz_max * 1.02)
+                if len(intensity) > 0:
+                    ax.set_ylim(0, intensity.max() * 1.1)
             else:
-                relative_intensities = intensity_values
-
-            spectrum_info[spectrum.spectrum_id] = {
-                "color": spectrum_colors[i],
-                "index": i,
-                "label": self._get_spectrum_display_name(spectrum),
-            }
-
-            for mz, rel_intensity in zip(mz_values, relative_intensities):
-                if mz not in all_fragments:
-                    all_fragments[mz] = []
-                all_fragments[mz].append((spectrum.spectrum_id, rel_intensity))
-
-        # Group fragments by similar m/z values
-        fragment_groups = self._group_fragments_by_mz(
-            all_fragments, self.ppm_tolerance.get()
-        )
-
-        # Calculate total intensity for each fragment group and sort by intensity
-        fragment_intensities = []
-        for group_mz, fragments_in_group in fragment_groups.items():
-            if (
-                len(fragments_in_group) > 1
-            ):  # Only consider fragments present in multiple spectra
-                total_intensity = sum(
-                    rel_intensity for _, rel_intensity in fragments_in_group
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No ion data",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
                 )
-                fragment_intensities.append(
-                    (total_intensity, group_mz, fragments_in_group)
-                )
-
-        # Sort by total intensity (descending) and take top N
-        top_fragments_count = self.top_fragments_count.get()
-        fragment_intensities.sort(key=lambda x: x[0], reverse=True)
-        top_fragments = fragment_intensities[:top_fragments_count]
-
-        # Create a plot showing spectra on x-axis and relative abundance on y-axis
-
-        # Sort spectrum IDs by their display names using natural sorting
-        sorted_spec_ids = list(spectrum_info.keys())
-        try:
-            sorted_spec_ids = natsorted(
-                sorted_spec_ids,
-                key=lambda spec_id: self._get_spectrum_display_name(spec_id),
-            )
-        except NameError:
-            # Fallback to regular sorting if natsort is not available
-            sorted_spec_ids = sorted(
-                sorted_spec_ids,
-                key=lambda spec_id: self._get_spectrum_display_name(spec_id),
-            )
-
-        spectrum_positions = {spec_id: i for i, spec_id in enumerate(sorted_spec_ids)}
-        spectrum_labels = [
-            self._get_spectrum_display_name(spec_id) for spec_id in sorted_spec_ids
-        ]
-
-        # Plot each top fragment group as a line connecting spectra
-        for total_intensity, group_mz, fragments_in_group in top_fragments:
-            x_positions = []
-            y_intensities = []
-
-            sorted_fragments = sorted(
-                fragments_in_group,
-                key=lambda x: spectrum_info.get(x[0], {}).get("index", 999),
-            )
-
-            for spectrum_id, rel_intensity in sorted_fragments:
-                if spectrum_id in spectrum_info:
-                    x_positions.append(spectrum_positions[spectrum_id])
-                    y_intensities.append(rel_intensity)
-
-            if len(x_positions) > 1:
-                ax.plot(
-                    x_positions,
-                    y_intensities,
-                    "o-",
-                    alpha=0.7,
-                    linewidth=2,
-                    markersize=6,
-                    label=f"m/z {group_mz:.4f}",
-                )
-
-        # Set x-axis to show spectrum names
-        ax.set_xticks(range(len(spectrum_labels)))
-        ax.set_xticklabels(spectrum_labels, rotation=45, ha="right")
-        ax.set_xlabel("Spectra")
-        ax.set_ylabel("Relative Abundance (Sum-scaled)")
-        ax.set_title(
-            f"Combined Spectrum Plot - Fragment Matching ({len(selected_spectra)} spectra)"
-        )
-        ax.grid(True, alpha=0.3)
-
-        # Add legend for fragment m/z values
-        handles, labels = ax.get_legend_handles_labels()
-        if len(handles) > 0:
-            legend_title = (
-                f"Top {min(len(handles), top_fragments_count)} fragments (by intensity)"
-            )
-            ax.legend(loc="upper right", framealpha=0.9, fontsize=8, title=legend_title)
-
-        self.figure.tight_layout()
+            label = self._get_display_name(spectrum)
+            ax.set_ylabel(f"{label}\nIntensity", fontsize=8)
+            if i == n - 1:
+                ax.set_xlabel("m/z")
+            else:
+                ax.set_xticklabels([])
+            ax.grid(True, alpha=0.3)
+        self.figure.tight_layout(pad=0.5, h_pad=0.2)
+        self.figure.subplots_adjust(hspace=0.1)
         self.canvas.draw()
 
-    def _group_fragments_by_mz(self, all_fragments, ppm_tolerance):
-        """Group fragments by similar m/z values within PPM tolerance."""
-        fragment_groups = {}
-        sorted_mz_values = sorted(all_fragments.keys())
 
-        for mz in sorted_mz_values:
-            group_found = False
-            for group_mz in fragment_groups:
-                ppm_diff = abs(mz - group_mz) / group_mz * 1e6
-                if ppm_diff <= ppm_tolerance:
-                    fragment_groups[group_mz].extend(all_fragments[mz])
-                    group_found = True
-                    break
+# ---------------------------------------------------------------------------
+# SpectrumPopupWindow
+# ---------------------------------------------------------------------------
 
-            if not group_found:
-                fragment_groups[mz] = all_fragments[mz][:]
 
-        return fragment_groups
+class SpectrumPopupWindow:
+    """Non-modal popup window showing spectrum plot + metadata."""
 
-    def _on_ppm_change(self, event=None):
-        """Handle PPM tolerance change."""
-        if self.show_combined_plot.get():
-            self._plot_spectra()
+    def __init__(
+        self,
+        parent,
+        parser: MGFParser,
+        selected_spectrum_ids: List,
+        naming_scheme: str = "Numbered",
+    ):
+        self.parent = parent
+        self.parser = parser
+        self.selected_spectrum_ids = selected_spectrum_ids
+        self.naming_scheme = naming_scheme
+        self._window: Optional[QDialog] = None
 
-    def _on_fragments_count_change(self, event=None):
-        """Handle top fragments count change."""
-        if self.show_combined_plot.get():
-            self._plot_spectra()
+    def show(self):
+        self._window = QDialog(self.parent)
+        self._window.setWindowTitle("Spectrum Popup")
+        self._window.resize(1100, 700)
+        self._window.setModal(False)
+        layout = QHBoxLayout(self._window)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        # Left: visualization
+        viz = SpectrumVisualizationPopup()
+        viz.naming_scheme = self.naming_scheme
+        viz.load_data(self.parser, self.selected_spectrum_ids)
+        splitter.addWidget(viz)
+
+        # Right: text info
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        meta_edit = QTextEdit()
+        meta_edit.setReadOnly(True)
+        right_layout.addWidget(meta_edit)
+        ion_edit = QTextEdit()
+        ion_edit.setReadOnly(True)
+        right_layout.addWidget(ion_edit)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+
+        # Populate text
+        meta_lines = []
+        ion_lines = []
+        for sid in self.selected_spectrum_ids:
+            spectrum = next(
+                (s for s in self.parser.spectra if s.spectrum_id == sid), None
+            )
+            if spectrum:
+                meta_lines.append(f"=== Spectrum {sid} ===")
+                for k, v in spectrum.metadata.items():
+                    meta_lines.append(f"  {k}: {v}")
+                meta_lines.append("")
+                ion_lines.append(f"=== Spectrum {sid} ===")
+                if spectrum.ions.size > 0:
+                    for i, (m, inten) in enumerate(spectrum.ions):
+                        ion_lines.append(f"  {i}: m/z={m:.4f}  I={inten:.2f}")
+                else:
+                    ion_lines.append("  No ions")
+                ion_lines.append("")
+        meta_edit.setPlainText("\n".join(meta_lines))
+        ion_edit.setPlainText("\n".join(ion_lines))
+        self._window.show()
+
+
+# ---------------------------------------------------------------------------
+# FragmentDistributionDialog
+# ---------------------------------------------------------------------------
 
 
 class FragmentDistributionDialog:
-    """Dialog for analyzing fragment distribution across all spectra."""
+    """Dialog showing fragment distribution scatter plot with selection."""
 
     def __init__(self, parent):
-        """Initialize the dialog."""
         self.parent = parent
-        self.dialog = None
-        self.parser = None
-        self.fragments_data = []
-        self.selected_fragments = []
-        self.canvas = None
-        self.toolbar = None
-        self.figure = None
-        self.ax = None
-        self.intensity_mode_var = None
-        self.selector = None
-        self.selection_active = False
+        self._window: Optional[QDialog] = None
 
-    def show(self, parser, selected_spectrum_ids=None):
-        """Show the fragment distribution dialog."""
-        if not parser or not parser.spectra:
-            messagebox.showinfo("No Data", "No spectra data available.")
-            return
+    def show(self, parser: MGFParser, selected_ids: List):
+        self._window = QDialog(self.parent)
+        self._window.setWindowTitle("Fragment Distribution")
+        self._window.resize(1000, 700)
+        self._window.setModal(True)
+        layout = QVBoxLayout(self._window)
 
-        self.parser = parser
-        self.selected_spectrum_ids = selected_spectrum_ids or []
+        # Figure
+        fig = Figure(figsize=(9, 5), dpi=90)
+        canvas = FigureCanvasQTAgg(fig)
+        layout.addWidget(canvas)
+        toolbar = NavigationToolbar2QT(canvas, self._window)
+        layout.addWidget(toolbar)
 
-        # Create dialog window
-        self.dialog = tk.Toplevel(self.parent)
-        self.dialog.title("Fragment Distribution Analysis")
-        self.dialog.geometry("1200x800")
-        self.dialog.resizable(True, True)
-        self.dialog.grab_set()  # Make modal
+        # Result tables
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        frags_tree = QTreeWidget()
+        frags_tree.setHeaderLabels(["m/z", "Intensity", "Spectrum ID"])
+        frags_tree.setColumnWidth(0, 120)
+        frags_tree.setColumnWidth(1, 120)
+        ann_tree = QTreeWidget()
+        ann_tree.setHeaderLabels(["m/z", "Formula", "PPM", "Spectrum ID"])
+        ann_tree.setColumnWidth(0, 120)
+        ann_tree.setColumnWidth(1, 120)
+        splitter.addWidget(frags_tree)
+        splitter.addWidget(ann_tree)
+        layout.addWidget(splitter)
 
-        # Main frame
-        main_frame = ttk.Frame(self.dialog, padding=10)
-        main_frame.pack(fill="both", expand=True)
+        # Buttons
+        btn_row = QHBoxLayout()
+        remove_btn = QPushButton("Remove Selected Fragments")
+        export_btn = QPushButton("Export")
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self._window.close)
+        btn_row.addWidget(remove_btn)
+        btn_row.addWidget(export_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
 
-        # Title
-        title_label = ttk.Label(
-            main_frame,
-            text="Fragment Distribution Across All Spectra",
-            font=("Arial", 14, "bold"),
-        )
-        title_label.pack(pady=(0, 10))
+        # Gather data and plot
+        all_mz = []
+        all_inten = []
+        all_spec_ids = []
+        spectra = [s for s in parser.spectra if s.spectrum_id in selected_ids]
+        for s in spectra:
+            if s.ions.size > 0:
+                for m, inten in s.ions:
+                    all_mz.append(m)
+                    all_inten.append(inten)
+                    all_spec_ids.append(s.spectrum_id)
 
-        # Controls frame
-        controls_frame = ttk.LabelFrame(main_frame, text="Controls", padding=5)
-        controls_frame.pack(fill="x", pady=(0, 10))
+        ax = fig.add_subplot(111)
+        if all_mz:
+            ax.scatter(all_mz, all_inten, alpha=0.5, s=10, c="blue")
+            ax.set_xlabel("m/z")
+            ax.set_ylabel("Intensity")
+            ax.set_title(
+                f"Fragment Distribution ({len(all_mz)} fragments from "
+                f"{len(spectra)} spectra)"
+            )
+            ax.grid(True, alpha=0.3)
 
-        # Intensity mode selection
-        intensity_frame = ttk.Frame(controls_frame)
-        intensity_frame.pack(fill="x", pady=5)
+            # Rectangle selector
+            self._selected_rect: Optional[Tuple] = None
 
-        ttk.Label(intensity_frame, text="Intensity Mode:").pack(
-            side="left", padx=(0, 10)
-        )
-
-        self.intensity_mode_var = tk.StringVar(value="raw")
-        intensity_modes = [
-            ("Raw", "raw"),
-            ("Relative to Sum", "relative_sum"),
-            ("Relative to Most Abundant", "relative_max"),
-        ]
-
-        for text, value in intensity_modes:
-            ttk.Radiobutton(
-                intensity_frame,
-                text=text,
-                variable=self.intensity_mode_var,
-                value=value,
-                command=self._update_plot,
-            ).pack(side="left", padx=10)
-
-        # Spectrum selection frame
-        spectrum_frame = ttk.Frame(controls_frame)
-        spectrum_frame.pack(fill="x", pady=5)
-
-        ttk.Label(spectrum_frame, text="Spectra to Analyze:").pack(
-            side="left", padx=(0, 10)
-        )
-
-        self.spectrum_mode_var = tk.StringVar(value="all")
-
-        # Check if there are selected spectra to determine default
-        if self.selected_spectrum_ids:
-            default_mode = "selected"
-            self.spectrum_mode_var.set("selected")
-        else:
-            default_mode = "all"
-
-        ttk.Radiobutton(
-            spectrum_frame,
-            text=f"Use All Spectra ({len(self.parser.spectra)})",
-            variable=self.spectrum_mode_var,
-            value="all",
-            command=self._update_plot,
-        ).pack(side="left", padx=10)
-
-        selected_count = (
-            len(self.selected_spectrum_ids) if self.selected_spectrum_ids else 0
-        )
-        ttk.Radiobutton(
-            spectrum_frame,
-            text=f"Use Selected Spectra ({selected_count})",
-            variable=self.spectrum_mode_var,
-            value="selected",
-            command=self._update_plot,
-            state="normal" if selected_count > 0 else "disabled",
-        ).pack(side="left", padx=10)
-
-        # Selection info frame
-        selection_frame = ttk.Frame(controls_frame)
-        selection_frame.pack(fill="x", pady=5)
-
-        ttk.Label(selection_frame, text="Selection:").pack(side="left", padx=(0, 10))
-
-        ttk.Button(
-            selection_frame,
-            text="Enable Rectangle Selection",
-            command=self._toggle_selection,
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            selection_frame, text="Clear Selection", command=self._clear_selection
-        ).pack(side="left", padx=5)
-
-        # Plot frame
-        plot_frame = ttk.LabelFrame(
-            main_frame, text="Fragment Distribution Plot", padding=5
-        )
-        plot_frame.pack(fill="both", expand=True, pady=(0, 10))
-
-        # Create matplotlib figure
-        self.figure = Figure(figsize=(12, 6), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, plot_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(0, 5))
-
-        # Add navigation toolbar for zoom/pan functionality
-        toolbar_frame = ttk.Frame(plot_frame)
-        toolbar_frame.pack(fill="x", pady=(0, 5))
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
-
-        # Results frame
-        results_frame = ttk.LabelFrame(main_frame, text="Selection Results", padding=5)
-        results_frame.pack(fill="both", expand=True, pady=(0, 10))
-
-        # Create notebook for results
-        results_notebook = ttk.Notebook(results_frame)
-        results_notebook.pack(fill="both", expand=True)
-
-        # Fragments table tab
-        fragments_tab = ttk.Frame(results_notebook)
-        results_notebook.add(fragments_tab, text="Selected Fragments")
-
-        # Create fragments table
-        self._create_fragments_table(fragments_tab)
-
-        # Annotations tab
-        annotations_tab = ttk.Frame(results_notebook)
-        results_notebook.add(annotations_tab, text="Chemical Formulas")
-
-        # Create annotations table
-        self._create_annotations_table(annotations_tab)
-
-        # Button frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.pack(fill="x")
-
-        # Remove fragments button
-        ttk.Button(
-            button_frame,
-            text="Remove Selected Fragments",
-            command=self._remove_fragments,
-            style="Accent.TButton",
-        ).pack(side="left", padx=(0, 5))
-
-        # Export button
-        ttk.Button(
-            button_frame, text="Export Selection", command=self._export_selection
-        ).pack(side="left", padx=5)
-
-        # Close button
-        ttk.Button(button_frame, text="Close", command=self._close).pack(side="right")
-
-        # Prepare fragment data and initial plot
-        self._update_plot()
-
-        # Center the dialog
-        self.dialog.transient(self.parent)
-        self.dialog.wait_window()
-
-    def _prepare_fragment_data(self):
-        """Prepare fragment data from selected or all spectra."""
-        self.fragments_data = []
-
-        # Determine which spectra to use
-        if (
-            hasattr(self, "spectrum_mode_var")
-            and self.spectrum_mode_var.get() == "selected"
-        ):
-            # Use only selected spectra
-            spectra_to_use = [
-                spectrum
-                for spectrum in self.parser.spectra
-                if spectrum.spectrum_id in self.selected_spectrum_ids
-            ]
-        else:
-            # Use all spectra
-            spectra_to_use = self.parser.spectra
-
-        for spectrum in spectra_to_use:
-            if len(spectrum.ions) == 0:
-                continue
-
-            spectrum_id = spectrum.spectrum_id
-
-            for i, (mz, intensity) in enumerate(spectrum.ions):
-                # Get annotations if available
-                annotations = spectrum.get_fragment_annotations(i)
-
-                fragment_data = {
-                    "spectrum_id": spectrum_id,
-                    "ion_index": i,
-                    "mz": mz,
-                    "raw_intensity": intensity,
-                    "annotations": annotations,
-                }
-
-                self.fragments_data.append(fragment_data)
-
-    def _calculate_intensities(self):
-        """Calculate intensities based on selected mode."""
-        mode = self.intensity_mode_var.get()
-
-        if mode == "raw":
-            return [f["raw_intensity"] for f in self.fragments_data]
-
-        # Group fragments by spectrum for relative calculations
-        spectrum_data = {}
-        for fragment in self.fragments_data:
-            spec_id = fragment["spectrum_id"]
-            if spec_id not in spectrum_data:
-                spectrum_data[spec_id] = []
-            spectrum_data[spec_id].append(fragment)
-
-        intensities = []
-        for fragment in self.fragments_data:
-            spec_id = fragment["spectrum_id"]
-            spec_fragments = spectrum_data[spec_id]
-            raw_intensity = fragment["raw_intensity"]
-
-            if mode == "relative_sum":
-                total_intensity = sum(f["raw_intensity"] for f in spec_fragments)
-                if total_intensity > 0:
-                    intensities.append((raw_intensity / total_intensity) * 100)
-                else:
-                    intensities.append(0)
-            elif mode == "relative_max":
-                max_intensity = max(f["raw_intensity"] for f in spec_fragments)
-                if max_intensity > 0:
-                    intensities.append((raw_intensity / max_intensity) * 100)
-                else:
-                    intensities.append(0)
-            else:
-                intensities.append(raw_intensity)
-
-        return intensities
-
-    def _update_plot(self):
-        """Update the fragment distribution plot."""
-        # Prepare data first (this respects the spectrum selection mode)
-        self._prepare_fragment_data()
-
-        if not self.fragments_data:
-            return
-
-        self.figure.clear()
-        self.ax = self.figure.add_subplot(111)
-
-        # Get data
-        mz_values = [f["mz"] for f in self.fragments_data]
-        intensities = self._calculate_intensities()
-
-        # Create scatter plot
-        self.ax.scatter(
-            mz_values, intensities, alpha=0.6, s=20, c="blue", edgecolors="none"
-        )
-
-        # Set labels
-        self.ax.set_xlabel("m/z", fontsize=12)
-
-        mode = self.intensity_mode_var.get()
-        if mode == "raw":
-            ylabel = "Intensity"
-        elif mode == "relative_sum":
-            ylabel = "Relative Intensity (% of sum)"
-        else:  # relative_max
-            ylabel = "Relative Intensity (% of max)"
-
-        self.ax.set_ylabel(ylabel, fontsize=12)
-
-        # Dynamic title based on spectrum selection mode
-        if (
-            hasattr(self, "spectrum_mode_var")
-            and self.spectrum_mode_var.get() == "selected"
-        ):
-            spectra_count = len(self.selected_spectrum_ids)
-            title = f"Fragment Distribution Across {spectra_count} Selected Spectra"
-        else:
-            spectra_count = len(self.parser.spectra)
-            title = f"Fragment Distribution Across All {spectra_count} Spectra"
-
-        self.ax.set_title(title, fontsize=14, fontweight="bold")
-
-        # Add grid
-        self.ax.grid(True, alpha=0.3)
-
-        # Reset selector if it exists
-        if self.selector:
-            self.selector.disconnect_events()
-        self.selector = None
-
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-    def _toggle_selection(self):
-        """Toggle rectangle selection mode."""
-        if not self.selection_active:
-            from matplotlib.widgets import RectangleSelector
-
-            def onselect(eclick, erelease):
-                """Handle rectangle selection."""
+            def on_select(eclick, erelease):
                 x1, x2 = sorted([eclick.xdata, erelease.xdata])
                 y1, y2 = sorted([eclick.ydata, erelease.ydata])
+                frags_tree.clear()
+                for mz, inten, sid in zip(all_mz, all_inten, all_spec_ids):
+                    if x1 <= mz <= x2 and y1 <= inten <= y2:
+                        item = QTreeWidgetItem()
+                        item.setText(0, f"{mz:.4f}")
+                        item.setText(1, f"{inten:.2f}")
+                        item.setText(2, str(sid))
+                        frags_tree.addTopLevelItem(item)
 
-                if x1 is not None and y1 is not None:
-                    self._select_fragments_in_range(x1, x2, y1, y2)
-
-            self.selector = RectangleSelector(
-                self.ax,
-                onselect,
+            selector = RectangleSelector(
+                ax,
+                on_select,
                 useblit=True,
-                button=[1],  # Only left mouse button
+                button=[1],
                 minspanx=5,
                 minspany=5,
                 spancoords="pixels",
                 interactive=True,
             )
+            canvas._selector = selector  # keep reference
 
-            self.selection_active = True
-            self.toolbar.set_message(
-                "Rectangle selection enabled. Click and drag to select fragments."
-            )
+            # Populate fragments tree
+            for mz, inten, sid in zip(
+                all_mz[:500], all_inten[:500], all_spec_ids[:500]
+            ):
+                item = QTreeWidgetItem()
+                item.setText(0, f"{mz:.4f}")
+                item.setText(1, f"{inten:.2f}")
+                item.setText(2, str(sid))
+                frags_tree.addTopLevelItem(item)
         else:
-            if self.selector:
-                self.selector.disconnect_events()
-                self.selector = None
-            self.selection_active = False
-            self.toolbar.set_message("")
-
-    def _select_fragments_in_range(self, x1, x2, y1, y2):
-        """Select fragments within the specified range."""
-        intensities = self._calculate_intensities()
-
-        self.selected_fragments = []
-        for i, fragment in enumerate(self.fragments_data):
-            mz = fragment["mz"]
-            intensity = intensities[i]
-
-            if x1 <= mz <= x2 and y1 <= intensity <= y2:
-                self.selected_fragments.append(
-                    {**fragment, "calculated_intensity": intensity}
-                )
-
-        # Update tables
-        self._update_fragments_table()
-        self._update_annotations_table()
-
-        # Highlight selected points
-        self._highlight_selection()
-
-    def _highlight_selection(self):
-        """Highlight selected fragments on the plot."""
-        if not self.selected_fragments:
-            return
-
-        # Get selected data points
-        selected_mz = [f["mz"] for f in self.selected_fragments]
-        selected_intensity = [
-            f["calculated_intensity"] for f in self.selected_fragments
-        ]
-
-        # Note: Highlighting disabled per user request
-        # No visual highlighting of selected fragments
-
-        self.canvas.draw()
-
-    def _clear_selection(self):
-        """Clear current selection."""
-        self.selected_fragments = []
-        self._update_fragments_table()
-        self._update_annotations_table()
-        self._update_plot()  # Redraw without highlights
-
-    def _create_fragments_table(self, parent):
-        """Create the fragments table."""
-        # Table frame
-        table_frame = ttk.Frame(parent)
-        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Create treeview
-        columns = (
-            "Spectrum ID",
-            "m/z",
-            "Raw Intensity",
-            "Calculated Intensity",
-            "Annotations",
-            "PPM Deviation",
-        )
-        self.fragments_tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", height=8
-        )
-
-        # Configure columns
-        self.fragments_tree.heading("Spectrum ID", text="Spectrum ID")
-        self.fragments_tree.heading("m/z", text="m/z")
-        self.fragments_tree.heading("Raw Intensity", text="Raw Intensity")
-        self.fragments_tree.heading("Calculated Intensity", text="Calculated Intensity")
-        self.fragments_tree.heading("Annotations", text="Annotations")
-        self.fragments_tree.heading("PPM Deviation", text="PPM Deviation")
-
-        self.fragments_tree.column("Spectrum ID", width=100)
-        self.fragments_tree.column("m/z", width=100)
-        self.fragments_tree.column("Raw Intensity", width=120)
-        self.fragments_tree.column("Calculated Intensity", width=140)
-        self.fragments_tree.column("Annotations", width=200)
-        self.fragments_tree.column("PPM Deviation", width=120)
-
-        # Scrollbars
-        v_scrollbar = ttk.Scrollbar(
-            table_frame, orient="vertical", command=self.fragments_tree.yview
-        )
-        h_scrollbar = ttk.Scrollbar(
-            table_frame, orient="horizontal", command=self.fragments_tree.xview
-        )
-        self.fragments_tree.configure(
-            yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set
-        )
-
-        # Pack elements
-        self.fragments_tree.pack(side="left", fill="both", expand=True)
-        v_scrollbar.pack(side="right", fill="y")
-        h_scrollbar.pack(side="bottom", fill="x")
-
-    def _create_annotations_table(self, parent):
-        """Create the annotations table."""
-        # Table frame
-        table_frame = ttk.Frame(parent)
-        table_frame.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Create treeview
-        columns = (
-            "Formula",
-            "Count",
-            "Average PPM Error",
-            "Min PPM Error",
-            "Max PPM Error",
-            "StdDev PPM Error",
-        )
-        self.annotations_tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", height=8
-        )
-
-        # Configure columns
-        self.annotations_tree.heading("Formula", text="Chemical Formula")
-        self.annotations_tree.heading("Count", text="Occurrence Count")
-        self.annotations_tree.heading("Average PPM Error", text="Avg PPM Error")
-        self.annotations_tree.heading("Min PPM Error", text="Min PPM Error")
-        self.annotations_tree.heading("Max PPM Error", text="Max PPM Error")
-        self.annotations_tree.heading("StdDev PPM Error", text="StdDev PPM Error")
-
-        self.annotations_tree.column("Formula", width=200)
-        self.annotations_tree.column("Count", width=120)
-        self.annotations_tree.column("Average PPM Error", width=120)
-        self.annotations_tree.column("Min PPM Error", width=120)
-        self.annotations_tree.column("Max PPM Error", width=120)
-        self.annotations_tree.column("StdDev PPM Error", width=120)
-
-        # Scrollbars
-        v_scrollbar2 = ttk.Scrollbar(
-            table_frame, orient="vertical", command=self.annotations_tree.yview
-        )
-        h_scrollbar2 = ttk.Scrollbar(
-            table_frame, orient="horizontal", command=self.annotations_tree.xview
-        )
-        self.annotations_tree.configure(
-            yscrollcommand=v_scrollbar2.set, xscrollcommand=h_scrollbar2.set
-        )
-
-        # Pack elements
-        self.annotations_tree.pack(side="left", fill="both", expand=True)
-        v_scrollbar2.pack(side="right", fill="y")
-        h_scrollbar2.pack(side="bottom", fill="x")
-
-    def _update_fragments_table(self):
-        """Update the fragments table with selected data."""
-        # Clear existing items
-        for item in self.fragments_tree.get_children():
-            self.fragments_tree.delete(item)
-
-        # Add selected fragments
-        for fragment in self.selected_fragments:
-            # Format annotations
-            annotations_text = ""
-            ppm_deviations = []
-            if fragment["annotations"]:
-                formulas = [ann.get("formula", "") for ann in fragment["annotations"]]
-                annotations_text = ", ".join(filter(None, formulas))
-
-                # Collect PPM errors
-                for ann in fragment["annotations"]:
-                    ppm_error = ann.get("ppm_error")
-                    if ppm_error is not None:
-                        ppm_deviations.append(ppm_error)
-
-            # Format PPM deviation text
-            ppm_text = ""
-            if ppm_deviations:
-                if len(ppm_deviations) == 1:
-                    ppm_text = f"{ppm_deviations[0]:.2f}"
-                else:
-                    ppm_text = ", ".join([f"{ppm:.2f}" for ppm in ppm_deviations])
-
-            self.fragments_tree.insert(
-                "",
-                "end",
-                values=(
-                    fragment["spectrum_id"],
-                    f"{fragment['mz']:.4f}",
-                    f"{fragment['raw_intensity']:.2f}",
-                    f"{fragment['calculated_intensity']:.2f}",
-                    annotations_text,
-                    ppm_text,
-                ),
+            ax.text(
+                0.5,
+                0.5,
+                "No fragment data available",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
             )
+            ax.axis("off")
+        canvas.draw()
 
-    def _update_annotations_table(self):
-        """Update the annotations table with formula statistics."""
-        # Clear existing items
-        for item in self.annotations_tree.get_children():
-            self.annotations_tree.delete(item)
+        def _remove_selected():
+            # Gather selected m/z values from frags_tree
+            to_remove = set()
+            for item in frags_tree.selectedItems():
+                try:
+                    to_remove.add(float(item.text(0)))
+                except ValueError:
+                    pass
+            if not to_remove:
+                return
+            for s in spectra:
+                if s.ions.size == 0:
+                    continue
+                mask = np.array([m not in to_remove for m in s.ions[:, 0]])
+                s.ions = s.ions[mask]
+            frags_tree.clear()
 
-        # Collect annotation statistics
-        formula_stats = {}
-        for fragment in self.selected_fragments:
-            for annotation in fragment["annotations"]:
-                formula = annotation.get("formula", "")
-                if formula:
-                    if formula not in formula_stats:
-                        formula_stats[formula] = {"count": 0, "ppm_errors": []}
+        remove_btn.clicked.connect(_remove_selected)
+        self._window.exec()
 
-                    formula_stats[formula]["count"] += 1
-                    ppm_error = annotation.get("ppm_error")
-                    if ppm_error is not None:
-                        formula_stats[formula]["ppm_errors"].append(ppm_error)
 
-        # Add to table
-        for formula, stats in sorted(formula_stats.items()):
-            avg_ppm = ""
-            min_ppm = ""
-            max_ppm = ""
-            std_ppm = ""
+# ---------------------------------------------------------------------------
+# SimilarSpectraFilterDialog
+# ---------------------------------------------------------------------------
 
-            if stats["ppm_errors"]:
-                ppm_array = np.array(stats["ppm_errors"])
-                avg_ppm = f"{np.mean(ppm_array):.2f}"
-                min_ppm = f"{np.min(ppm_array):.2f}"
-                max_ppm = f"{np.max(ppm_array):.2f}"
 
-                if len(ppm_array) > 1:
-                    std_ppm = (
-                        f"{np.std(ppm_array, ddof=1):.2f}"  # Sample standard deviation
-                    )
-                else:
-                    std_ppm = "N/A"
+class SimilarSpectraFilterDialog(QDialog):
+    """Dialog for filtering tree-view to spectra similar to a reference spectrum."""
 
-            self.annotations_tree.insert(
-                "",
-                "end",
-                values=(formula, stats["count"], avg_ppm, min_ppm, max_ppm, std_ppm),
-            )
+    _METHOD_LABELS = [
+        ("standard", "All fragments (standard cosine)"),
+        ("forward", "Forward match (reference fragments only)"),
+        ("common", "Common fragments only"),
+    ]
 
-    def _remove_fragments(self):
-        """Remove selected fragments from their respective spectra."""
-        if not self.selected_fragments:
-            messagebox.showinfo("No Selection", "No fragments selected for removal.")
-            return
+    def __init__(
+        self,
+        parent,
+        parser: MGFParser,
+        reference_spectrum_id,
+        all_spectra_ids: List,
+    ):
+        super().__init__(parent)
+        self.parser = parser
+        self.reference_spectrum_id = reference_spectrum_id
+        self.all_spectra_ids = all_spectra_ids
+        self.result = None
+        self.setWindowTitle("Filter Similar Spectra")
+        self.resize(620, 520)
+        self._build_ui()
+        self.exec()
 
-        result = messagebox.askyesno(
-            "Confirm Removal",
-            f"Are you sure you want to remove {len(self.selected_fragments)} selected fragments from their spectra?\n\nThis action cannot be undone.",
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        ref_spectrum = next(
+            (
+                s
+                for s in self.parser.spectra
+                if s.spectrum_id == self.reference_spectrum_id
+            ),
+            None,
         )
 
-        if not result:
-            return
-
-        # Group fragments by spectrum for efficient removal
-        spectrum_fragments = {}
-        for fragment in self.selected_fragments:
-            spec_id = fragment["spectrum_id"]
-            if spec_id not in spectrum_fragments:
-                spectrum_fragments[spec_id] = []
-            spectrum_fragments[spec_id].append(fragment["ion_index"])
-
-        # Remove fragments (in reverse order to maintain indices)
-        removed_count = 0
-        for spectrum in self.parser.spectra:
-            if spectrum.spectrum_id in spectrum_fragments:
-                indices_to_remove = sorted(
-                    spectrum_fragments[spectrum.spectrum_id], reverse=True
-                )
-
-                for ion_index in indices_to_remove:
-                    if ion_index < len(spectrum.ions):
-                        # Remove from ions array
-                        spectrum.ions = np.delete(spectrum.ions, ion_index, axis=0)
-
-                        # Update fragment annotations (shift indices)
-                        new_annotations = {}
-                        for idx, annotations in spectrum.fragment_annotations.items():
-                            if idx < ion_index:
-                                new_annotations[idx] = annotations
-                            elif idx > ion_index:
-                                new_annotations[idx - 1] = annotations
-                            # Skip the removed index
-
-                        spectrum.fragment_annotations = new_annotations
-                        removed_count += 1
-
-        messagebox.showinfo(
-            "Fragments Removed",
-            f"Successfully removed {removed_count} fragments from the spectra.",
+        # Metadata matching table
+        meta_box = QGroupBox(
+            "Metadata fields that must be identical to the reference spectrum"
         )
-
-        # Refresh data and plot
-        self._clear_selection()
-        self._update_plot()
-
-        # Notify parent to refresh views if needed
-        if hasattr(self.parent, "_on_tree_selection"):
-            self.parent._on_tree_selection()
-
-    def _export_selection(self):
-        """Export selected fragments to a file."""
-        if not self.selected_fragments:
-            messagebox.showinfo("No Selection", "No fragments selected for export.")
-            return
-
-        from tkinter import filedialog
-
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[
-                ("CSV files", "*.csv"),
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ],
-            title="Export Selected Fragments",
+        meta_layout = QVBoxLayout(meta_box)
+        self._meta_table = QTreeWidget()
+        self._meta_table.setHeaderLabels(
+            ["Metadata Key", "Reference Value", "Must Match"]
         )
+        self._meta_table.setColumnWidth(0, 180)
+        self._meta_table.setColumnWidth(1, 220)
+        self._meta_table.setColumnWidth(2, 80)
+        self._meta_table.setAlternatingRowColors(True)
 
-        if not filename:
-            return
+        if ref_spectrum:
+            for key in sorted(ref_spectrum.metadata.keys()):
+                value = ref_spectrum.metadata.get(key, "")
+                item = QTreeWidgetItem(self._meta_table)
+                item.setText(0, key)
+                item.setText(1, str(value) if value is not None else "")
+                cb = QCheckBox()
+                self._meta_table.setItemWidget(item, 2, cb)
 
-        try:
-            with open(filename, "w", newline="", encoding="utf-8") as f:
-                f.write(
-                    "Spectrum_ID,m/z,Raw_Intensity,Calculated_Intensity,Annotations\n"
-                )
+        meta_layout.addWidget(self._meta_table)
+        layout.addWidget(meta_box)
 
-                for fragment in self.selected_fragments:
-                    annotations = []
-                    for ann in fragment["annotations"]:
-                        formula = ann.get("formula", "")
-                        if formula:
-                            ppm = ann.get("ppm_error", "")
-                            if ppm != "":
-                                annotations.append(f"{formula}({ppm:.2f}ppm)")
-                            else:
-                                annotations.append(formula)
+        # Similarity settings
+        sim_box = QGroupBox("Similarity Settings")
+        sim_grid = QGridLayout(sim_box)
 
-                    annotations_str = "; ".join(annotations)
+        sim_grid.addWidget(QLabel("Similarity threshold:"), 0, 0)
+        self._threshold_spin = QDoubleSpinBox()
+        self._threshold_spin.setRange(0.0, 1.0)
+        self._threshold_spin.setValue(0.7)
+        self._threshold_spin.setDecimals(3)
+        self._threshold_spin.setSingleStep(0.05)
+        sim_grid.addWidget(self._threshold_spin, 0, 1)
 
-                    f.write(
-                        f"{fragment['spectrum_id']},{fragment['mz']:.4f},"
-                        f"{fragment['raw_intensity']:.2f},{fragment['calculated_intensity']:.2f},"
-                        f'"{annotations_str}"\n'
-                    )
+        sim_grid.addWidget(QLabel("m/z tolerance (Da):"), 1, 0)
+        self._tol_spin = QDoubleSpinBox()
+        self._tol_spin.setRange(0.001, 2.0)
+        self._tol_spin.setValue(0.02)
+        self._tol_spin.setDecimals(3)
+        sim_grid.addWidget(self._tol_spin, 1, 1)
 
-            messagebox.showinfo(
-                "Export Complete", f"Selected fragments exported to:\n{filename}"
-            )
+        sim_grid.addWidget(QLabel("Matching method:"), 2, 0)
+        self._method_combo = QComboBox()
+        for _key, label in self._METHOD_LABELS:
+            self._method_combo.addItem(label)
+        sim_grid.addWidget(self._method_combo, 2, 1)
 
-        except Exception as e:
-            messagebox.showerror(
-                "Export Error", f"Failed to export fragments:\n{str(e)}"
-            )
+        layout.addWidget(sim_box)
 
-    def _close(self):
-        """Close the dialog."""
-        if self.selector:
-            self.selector.disconnect_events()
-        if self.dialog:
-            self.dialog.destroy()
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+    def _on_ok(self):
+        selected_keys: List[str] = []
+        for i in range(self._meta_table.topLevelItemCount()):
+            item = self._meta_table.topLevelItem(i)
+            cb = self._meta_table.itemWidget(item, 2)
+            if isinstance(cb, QCheckBox) and cb.isChecked():
+                selected_keys.append(item.text(0))
+
+        method_key = self._METHOD_LABELS[self._method_combo.currentIndex()][0]
+
+        self.result = {
+            "metadata_keys": selected_keys,
+            "threshold": self._threshold_spin.value(),
+            "tolerance": self._tol_spin.value(),
+            "method": method_key,
+        }
+        self.accept()
