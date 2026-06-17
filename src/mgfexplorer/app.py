@@ -520,6 +520,7 @@ class MGFExplorerApp(QMainWindow):
             on_metadata_changed=self._on_metadata_changed,
             on_set_spectrum_name=self._update_spectrum_names_with,
             on_filter_by_value=self._apply_metadata_filter,
+            on_add_grouping_tag=self._add_grouping_tag,
         )
         metadata_layout.addWidget(self.metadata_editor)
 
@@ -1043,6 +1044,10 @@ class MGFExplorerApp(QMainWindow):
         self.spectrum_tree.set_naming_scheme(key)
         if hasattr(self, "spectrum_viz") and self.spectrum_viz:
             self.spectrum_viz.set_naming_scheme(key)
+        if hasattr(self, "ion_table") and self.ion_table:
+            self.ion_table.set_naming_scheme(key)
+        if hasattr(self, "similarity_viz") and self.similarity_viz:
+            self.similarity_viz.set_naming_scheme(key)
         self.spectrum_tree.load_data(self.parser)
 
     def _update_spectrum_names(self):
@@ -1816,6 +1821,13 @@ class MGFExplorerApp(QMainWindow):
     def _apply_metadata_filter(self, filter_text: str):
         """Set the spectrum tree filter to the given text (called from metadata context menu)."""
         self.spectrum_tree.set_filter_text(filter_text)
+
+    def _add_grouping_tag(self, key: str):
+        """Add a metadata key as a grouping tag to the spectrum tree."""
+        current_tags = self.spectrum_tree.get_grouping_tags()
+        if key not in current_tags:
+            current_tags.append(key)
+            self.spectrum_tree.set_grouping_tags(current_tags)
 
     def _apply_smarts_filter(self, matching_spectra):
         """Apply SMARTS filter by keeping only matching spectra."""

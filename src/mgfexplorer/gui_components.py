@@ -153,6 +153,28 @@ def _compute_cosine_similarity_method(
     return 0.0
 
 
+# Helper function to format spectrum display names
+def _format_spectrum_label(
+    spectrum: "Spectrum", naming_scheme: str = "Numbered"
+) -> str:
+    """Format spectrum display name as 'ID: metadata-value' or just 'ID'.
+
+    Args:
+        spectrum: The spectrum object
+        naming_scheme: The metadata field to use for naming (or "Numbered" for ID only)
+
+    Returns:
+        Formatted label as "ID: value" (if naming_scheme != "Numbered") or "ID"
+    """
+    spectrum_id = spectrum.spectrum_id
+    if naming_scheme == "Numbered":
+        return str(spectrum_id)
+    val = spectrum.get_metadata_value(naming_scheme)
+    if val:
+        return f"{spectrum_id}: {val}"
+    return str(spectrum_id)
+
+
 # Natural sorting
 try:
     from natsort import natsorted
@@ -396,12 +418,7 @@ class SpectrumTreeView(QWidget):
         _populate_node(self._tree, nested)
 
     def _get_display_name(self, spectrum) -> str:
-        if self._naming_scheme == "Numbered":
-            return f"Spectrum {spectrum.spectrum_id}"
-        val = spectrum.get_metadata_value(self._naming_scheme)
-        if val:
-            return str(val)
-        return f"Spectrum {spectrum.spectrum_id}"
+        return _format_spectrum_label(spectrum, self._naming_scheme)
 
     # ------------------------------------------------------------------
     def _on_tree_selection(self):
@@ -589,11 +606,13 @@ class MetadataEditor(QWidget):
         on_metadata_changed=None,
         on_set_spectrum_name=None,
         on_filter_by_value=None,
+        on_add_grouping_tag=None,
     ):
         super().__init__(parent)
         self._on_metadata_changed_cb = on_metadata_changed
         self._on_set_spectrum_name_cb = on_set_spectrum_name
         self._on_filter_by_value_cb = on_filter_by_value
+        self._on_add_grouping_tag_cb = on_add_grouping_tag
         self.parser: Optional[MGFParser] = None
         self.selected_spectrum_ids: List = []
         self._pending_selection: Optional[List] = None
@@ -905,9 +924,8 @@ class MetadataEditor(QWidget):
             self._on_filter_by_value_cb(filter_text)
 
     def _add_as_grouping_tag(self, key: str):
-        # Try to notify main app callback
-        if self._on_metadata_changed_cb:
-            self._on_metadata_changed_cb()
+        if self._on_add_grouping_tag_cb:
+            self._on_add_grouping_tag_cb(key)
 
     def _set_as_spectrum_name(self, key: str):
         if self._on_set_spectrum_name_cb:
@@ -1251,10 +1269,7 @@ class SpectrumVisualization(QWidget):
         self.selected_spectrum_ids = []
 
     def _get_spectrum_display_name(self, spectrum) -> str:
-        if self.naming_scheme == "Numbered":
-            return f"Spectrum {spectrum.spectrum_id}"
-        val = spectrum.get_metadata_value(self.naming_scheme)
-        return str(val) if val else f"Spectrum {spectrum.spectrum_id}"
+        return _format_spectrum_label(spectrum, self.naming_scheme)
 
     def _plot_spectra(self):
         self.figure.clear()
@@ -1711,6 +1726,7 @@ class IonDataTable(QWidget):
         self.selected_spectrum_ids: List = []
         self.spectrum_viz_callback = None
         self._block_hover_highlight = False
+        self.naming_scheme: str = "Numbered"
         self._create_widgets()
 
     def _create_widgets(self):
@@ -1724,6 +1740,11 @@ class IonDataTable(QWidget):
 
     def set_spectrum_viz_callback(self, callback):
         self.spectrum_viz_callback = callback
+
+    def set_naming_scheme(self, scheme: str):
+        self.naming_scheme = scheme
+        if self.selected_spectrum_ids and self.parser:
+            self._populate_tables()
 
     def load_data(self, parser: MGFParser, selected_spectrum_ids: List):
         self.parser = parser
@@ -1763,7 +1784,8 @@ class IonDataTable(QWidget):
             lambda s=spectrum, t=tree: self._on_ion_selection(s, t)
         )
         self._populate_table_data(tree, spectrum)
-        self.notebook.addTab(tree, f"S {spectrum.spectrum_id}")
+        tab_label = _format_spectrum_label(spectrum, self.naming_scheme)
+        self.notebook.addTab(tree, tab_label)
 
     def _populate_table_data(self, tree: QTreeWidget, spectrum: "Spectrum"):
         tree.clear()
@@ -1878,6 +1900,7 @@ class CosineSimilarityVisualization(QWidget):
         self.calculation_thread: Optional[threading.Thread] = None
         self.cancel_calculation = False
         self._calculation_error: Optional[str] = None
+        self.naming_scheme: str = "Numbered"
         self._create_widgets()
 
     def _create_widgets(self):
@@ -1930,6 +1953,11 @@ class CosineSimilarityVisualization(QWidget):
             self._calculate_and_display_similarity()
         else:
             self._show_large_dataset_warning()
+
+    def set_naming_scheme(self, scheme: str):
+        self.naming_scheme = scheme
+        if self.similarity_matrix is not None:
+            self._display_similarity_results()
 
     def clear_data(self):
         self.figure.clear()
@@ -2066,8 +2094,8 @@ class CosineSimilarityVisualization(QWidget):
         ax.set_xlabel("m/z")
         ax.set_ylabel("Relative Intensity")
 
-        name1 = f"Spectrum {spec1.spectrum_id}"
-        name2 = f"Spectrum {spec2.spectrum_id}"
+        name1 = _format_spectrum_label(spec1, self.naming_scheme)
+        name2 = _format_spectrum_label(spec2, self.naming_scheme)
         ax.set_title(
             f"Mirror Plot: {name1}  ↑  /  ↓  {name2}\nCosine Similarity: {sim:.4f}",
             fontsize=10,
@@ -2229,7 +2257,15 @@ class CosineSimilarityVisualization(QWidget):
         )
         cbar = self.figure.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label("Cosine Similarity", rotation=270, labelpad=15)
-        labels = [f"S{sid}" for sid in self.selected_spectrum_ids]
+
+        # Get spectra and format labels
+        spectra = [
+            s
+            for s in self.parser.spectra
+            if s.spectrum_id in self.selected_spectrum_ids
+        ]
+        labels = [_format_spectrum_label(s, self.naming_scheme) for s in spectra]
+
         ax.set_xticks(range(len(labels)))
         ax.set_yticks(range(len(labels)))
         ax.set_xticklabels(labels, rotation=45, ha="right")
@@ -3052,10 +3088,7 @@ class SpectrumVisualizationPopup(QWidget):
         self._plot_spectra()
 
     def _get_display_name(self, spectrum) -> str:
-        if self.naming_scheme == "Numbered":
-            return f"Spectrum {spectrum.spectrum_id}"
-        val = spectrum.get_metadata_value(self.naming_scheme)
-        return str(val) if val else f"Spectrum {spectrum.spectrum_id}"
+        return _format_spectrum_label(spectrum, self.naming_scheme)
 
     def _plot_spectra(self):
         self.figure.clear()
