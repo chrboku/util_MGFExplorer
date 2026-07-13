@@ -3,7 +3,7 @@ Molecular formula utilities for fragment annotation.
 """
 
 import re
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List
 from collections import defaultdict
 import itertools
 

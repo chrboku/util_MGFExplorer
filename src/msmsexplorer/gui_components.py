@@ -3,9 +3,10 @@ GUI components for the MGF Explorer application.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 import numpy as np
 import matplotlib.pyplot as plt
+import pyperclip
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from typing import List, Dict, Any, Optional, Tuple
@@ -119,6 +120,9 @@ class ToolTip:
 class SpectrumTreeView(ttk.Frame):
     """Tree view component for displaying spectra list with tag-based grouping."""
 
+    # Separator used to combine multiple filter conditions with AND logic
+    FILTER_AND_SEPARATOR = " && "
+
     def __init__(self, parent, on_selection_changed=None):
         super().__init__(parent)
         self.on_selection_changed = on_selection_changed
@@ -166,7 +170,12 @@ class SpectrumTreeView(ttk.Frame):
         self.filter_entry.bind("<KeyRelease>", self._on_filter_entry_change)
 
         # Add tooltip to filter entry with help text
-        help_text = "Default: search all fields\n$$ key: value (exact)\n$$$ key: regex"
+        help_text = (
+            "Default: search all fields\n"
+            "$$ key: value (exact)\n"
+            "$$$ key: regex\n"
+            "Combine conditions with ' && ' (AND)"
+        )
         self.filter_tooltip = ToolTip(self.filter_entry, help_text)
 
         # Tree view frame
@@ -280,22 +289,53 @@ class SpectrumTreeView(ttk.Frame):
         self.filter_text = self.filter_var.get().strip()
         self._populate_tree()
 
+    def set_filter_text(self, filter_text: str):
+        """Replace the current filter with the given expression and apply it immediately."""
+        if self.filter_job:
+            self.after_cancel(self.filter_job)
+            self.filter_job = None
+        self.filter_var.set(filter_text)
+        self._apply_filter()
+
+    def add_filter_condition(self, condition: str):
+        """Append an additional AND-combined filter condition and apply it immediately."""
+        current_text = self.filter_var.get().strip()
+        if current_text:
+            new_text = f"{current_text}{self.FILTER_AND_SEPARATOR}{condition}"
+        else:
+            new_text = condition
+        self.set_filter_text(new_text)
+
     def _spectrum_matches_filter(self, spectrum):
         """Check if a spectrum matches the current filter."""
         if not self.filter_text:
             return True
 
+        conditions = [
+            condition.strip()
+            for condition in self.filter_text.split(self.FILTER_AND_SEPARATOR)
+            if condition.strip()
+        ]
+        if not conditions:
+            return True
+
+        return all(
+            self._condition_matches(spectrum, condition) for condition in conditions
+        )
+
+    def _condition_matches(self, spectrum, condition):
+        """Check if a spectrum matches a single filter condition."""
         # Check for special filtering syntax
-        if self.filter_text.startswith("$$$"):
+        if condition.startswith("$$$"):
             # Regex search in specific key: "$$$ key: regex"
-            return self._filter_by_key_regex(spectrum, self.filter_text[3:].strip())
-        elif self.filter_text.startswith("$$"):
+            return self._filter_by_key_regex(spectrum, condition[3:].strip())
+        elif condition.startswith("$$"):
             # Exact submatch in specific key: "$$ key: value"
-            return self._filter_by_key_exact(spectrum, self.filter_text[2:].strip())
+            return self._filter_by_key_exact(spectrum, condition[2:].strip())
         else:
             # Default: search in all metadata values
             for key, value in spectrum.metadata.items():
-                if value and self.filter_text in str(value).lower():
+                if value and condition in str(value).lower():
                     return True
             return False
 
@@ -1082,7 +1122,7 @@ class MetadataEditor(ttk.Frame):
         # Check if all non-None SMILES are the same
         non_none_smiles = [s for s in smiles_values if s is not None]
         if len(set(non_none_smiles)) > 1:
-            return None, f"Different SMILES codes found:\n" + "\n".join(
+            return None, "Different SMILES codes found:\n" + "\n".join(
                 set(non_none_smiles)
             ) + ("\n..." if len(set(non_none_smiles)) > 3 else "")
 
@@ -1330,12 +1370,31 @@ class MetadataEditor(ttk.Frame):
         # Create context menu
         context_menu = tk.Menu(self, tearoff=0)
 
+        # Copy options are always available for a valid row
+        context_menu.add_command(
+            label="Copy key name",
+            command=lambda: pyperclip.copy(key),
+        )
+        context_menu.add_command(
+            label="Copy value",
+            command=lambda: pyperclip.copy(value),
+        )
+        context_menu.add_separator()
+
         # Always show selection option for value column, including empty values
         if column == "#2":  # Value column
             display_value = value if value else "<empty>"
             context_menu.add_command(
                 label=f"Select all with '{key}' = '{display_value}'",
                 command=lambda: self._select_spectra_by_value(key, value),
+            )
+            context_menu.add_command(
+                label="Set Filter for Value",
+                command=lambda: self._set_filter_for_value(key, value),
+            )
+            context_menu.add_command(
+                label="Add Filter for Value",
+                command=lambda: self._add_filter_for_value(key, value),
             )
 
         # Add options for key column
@@ -1482,7 +1541,7 @@ class MetadataEditor(ttk.Frame):
                     self.parent.spectrum_tree.get_selected_spectrum_ids()
                 )
                 if set(current_selection) != set(expected_ids):
-                    print(f"Debug: Selection mismatch!")
+                    print("Debug: Selection mismatch!")
                     print(f"  Expected: {len(expected_ids)} spectra")
                     print(f"  Got: {len(current_selection)} spectra")
                     print(
@@ -1707,6 +1766,24 @@ class MetadataEditor(ttk.Frame):
         if self.on_metadata_changed:
             self.on_metadata_changed()
 
+    def _set_filter_for_value(self, key: str, value: str):
+        """Replace the spectrum tree filter with an exact-match filter for key/value."""
+        spectrum_tree = self._find_spectrum_tree_view(self.winfo_toplevel())
+        if not spectrum_tree:
+            messagebox.showwarning("Error", "Could not find spectrum tree view.")
+            return
+
+        spectrum_tree.set_filter_text(f"$$ {key}: {value}")
+
+    def _add_filter_for_value(self, key: str, value: str):
+        """Append an AND-combined exact-match filter for key/value to the current filter."""
+        spectrum_tree = self._find_spectrum_tree_view(self.winfo_toplevel())
+        if not spectrum_tree:
+            messagebox.showwarning("Error", "Could not find spectrum tree view.")
+            return
+
+        spectrum_tree.add_filter_condition(f"$$ {key}: {value}")
+
     def _add_key_as_grouping_tag(self, key: str):
         """Add the selected key as a grouping tag in the spectrum tree view."""
         # Find the spectrum tree view in the parent application
@@ -1911,6 +1988,9 @@ class MetadataEditor(ttk.Frame):
 class AddKeyValueDialog:
     """Dialog for adding new key-value pairs."""
 
+    # Matches field references like {{{FIELD-name}}} in the value template
+    FIELD_REF_PATTERN = re.compile(r"\{\{\{(.+?)\}\}\}")
+
     def __init__(self, parent, parser: MGFParser, selected_spectrum_ids: List[int]):
         self.parent = parent
         self.parser = parser
@@ -1919,7 +1999,7 @@ class AddKeyValueDialog:
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Add New Key-Value Pair")
-        self.dialog.geometry("400x200")
+        self.dialog.geometry("480x330")
         self.dialog.resizable(False, False)
         self.dialog.transient(parent)
         self.dialog.grab_set()
@@ -1942,23 +2022,66 @@ class AddKeyValueDialog:
             row=0, column=0, sticky="w", pady=5
         )
         self.key_var = tk.StringVar()
-        key_entry = ttk.Entry(main_frame, textvariable=self.key_var, width=30)
-        key_entry.grid(row=0, column=1, padx=(10, 0), pady=5)
+        key_entry = ttk.Entry(main_frame, textvariable=self.key_var, width=35)
+        key_entry.grid(row=0, column=1, columnspan=2, padx=(10, 0), pady=5, sticky="w")
         key_entry.focus()
 
         # Value input
         ttk.Label(main_frame, text="Value:").grid(row=1, column=0, sticky="w", pady=5)
         self.value_var = tk.StringVar()
-        value_entry = ttk.Entry(main_frame, textvariable=self.value_var, width=30)
-        value_entry.grid(row=1, column=1, padx=(10, 0), pady=5)
+        self.value_entry = ttk.Entry(main_frame, textvariable=self.value_var, width=35)
+        self.value_entry.grid(
+            row=1, column=1, columnspan=2, padx=(10, 0), pady=5, sticky="w"
+        )
+
+        ttk.Label(
+            main_frame,
+            text="Tip: reference an existing key's value with {{{key_name}}}",
+            font=("TkDefaultFont", 8),
+            foreground="gray30",
+        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0))
+
+        # Existing field insertion helper
+        ttk.Label(main_frame, text="Insert Field:").grid(
+            row=3, column=0, sticky="w", pady=5
+        )
+        self.field_var = tk.StringVar()
+        existing_keys = self.parser.get_all_metadata_keys() if self.parser else []
+        self.field_combo = ttk.Combobox(
+            main_frame,
+            textvariable=self.field_var,
+            values=existing_keys,
+            width=25,
+            state="readonly",
+        )
+        self.field_combo.grid(row=3, column=1, padx=(10, 0), pady=5, sticky="w")
+        ttk.Button(
+            main_frame, text="Insert", command=self._insert_field_reference
+        ).grid(row=3, column=2, padx=(5, 0), pady=5, sticky="w")
+
+        # Data type selection
+        ttk.Label(main_frame, text="Data Type:").grid(
+            row=4, column=0, sticky="w", pady=5
+        )
+        self.datatype_var = tk.StringVar(value="text")
+        datatype_combo = ttk.Combobox(
+            main_frame,
+            textvariable=self.datatype_var,
+            values=["text", "integer", "float"],
+            width=15,
+            state="readonly",
+        )
+        datatype_combo.grid(row=4, column=1, padx=(10, 0), pady=5, sticky="w")
 
         # Scope selection
         ttk.Label(main_frame, text="Apply to:").grid(
-            row=2, column=0, sticky="w", pady=5
+            row=5, column=0, sticky="w", pady=5
         )
         self.scope_var = tk.StringVar(value="selected")
         scope_frame = ttk.Frame(main_frame)
-        scope_frame.grid(row=2, column=1, padx=(10, 0), pady=5, sticky="w")
+        scope_frame.grid(
+            row=5, column=1, columnspan=2, padx=(10, 0), pady=5, sticky="w"
+        )
 
         selected_text = (
             f"Selected spectra ({len(self.selected_spectrum_ids)})"
@@ -1977,7 +2100,7 @@ class AddKeyValueDialog:
 
         # Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=20)
+        button_frame.grid(row=6, column=0, columnspan=3, pady=20)
 
         ttk.Button(button_frame, text="Add", command=self._add_key_value).pack(
             side="left", padx=5
@@ -1990,10 +2113,38 @@ class AddKeyValueDialog:
         self.dialog.bind("<Return>", lambda e: self._add_key_value())
         self.dialog.bind("<Escape>", lambda e: self._cancel())
 
+    def _insert_field_reference(self):
+        """Insert a {{{field_name}}} reference at the cursor position in the value field."""
+        field_name = self.field_var.get()
+        if not field_name:
+            return
+
+        reference = "{{{" + field_name + "}}}"
+        self.value_entry.insert(tk.INSERT, reference)
+        self.value_entry.focus()
+
+    def _resolve_value_template(self, template: str, spectrum: Spectrum) -> str:
+        """Replace {{{field_name}}} references with the spectrum's metadata values."""
+
+        def repl(match):
+            field_name = match.group(1).strip()
+            return spectrum.get_metadata_value(field_name) or ""
+
+        return self.FIELD_REF_PATTERN.sub(repl, template)
+
+    def _convert_value(self, value: str, data_type: str) -> str:
+        """Convert a resolved value to the requested data type, raising ValueError on failure."""
+        if data_type == "integer":
+            return str(int(value.strip()))
+        if data_type == "float":
+            return str(float(value.strip()))
+        return value
+
     def _add_key_value(self):
         """Add the new key-value pair."""
         key = self.key_var.get().strip()
-        value = self.value_var.get().strip()
+        value_template = self.value_var.get()
+        data_type = self.datatype_var.get()
         scope = self.scope_var.get()
 
         if not key:
@@ -2018,10 +2169,31 @@ class AddKeyValueDialog:
         else:
             target_ids = [s.spectrum_id for s in self.parser.spectra]
 
+        target_spectra = [
+            spectrum
+            for spectrum in self.parser.spectra
+            if spectrum.spectrum_id in target_ids
+        ]
+
+        # Resolve field references and convert data types before applying any
+        # changes, so a single invalid value aborts the whole operation.
+        resolved_values: Dict[Any, str] = {}
+        for spectrum in target_spectra:
+            resolved = self._resolve_value_template(value_template, spectrum)
+            try:
+                resolved = self._convert_value(resolved, data_type)
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid Value",
+                    f"Value '{resolved}' for spectrum {spectrum.spectrum_id} could "
+                    f"not be converted to {data_type}.",
+                )
+                return
+            resolved_values[spectrum.spectrum_id] = resolved
+
         # Add/update the key-value pair
-        for spectrum in self.parser.spectra:
-            if spectrum.spectrum_id in target_ids:
-                spectrum.metadata[key] = value
+        for spectrum in target_spectra:
+            spectrum.metadata[key] = resolved_values[spectrum.spectrum_id]
 
         self.result = True
         self.dialog.destroy()
@@ -3723,7 +3895,7 @@ class CosineSimilarityVisualization(ttk.Frame):
                 # Schedule UI update on main thread
                 self.after_idle(self._display_similarity_results)
 
-        except Exception as e:
+        except Exception:
             # Handle errors
             self.after_idle(lambda: self._show_calculation_error(str(e)))
 

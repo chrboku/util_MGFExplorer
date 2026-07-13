@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any, Dict, List
 
-CONFIG_DIR_NAME = ".mgfexplorer"
+CONFIG_DIR_NAME = ".msmsexplorer"
 CONFIG_FILE_NAME = "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {

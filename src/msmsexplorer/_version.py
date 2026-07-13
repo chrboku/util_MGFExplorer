@@ -1,4 +1,4 @@
-"""Package version, resolved without importing any other mgfexplorer modules."""
+"""Package version, resolved without importing any other msmsexplorer modules."""
 
 
 def _get_version() -> str:
@@ -6,7 +6,7 @@ def _get_version() -> str:
         from importlib.metadata import version, PackageNotFoundError
 
         try:
-            return version("util-mgfexplorer")
+            return version("msmsexplorer")
         except PackageNotFoundError:
             pass
     except ImportError:

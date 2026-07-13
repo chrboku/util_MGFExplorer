@@ -2,9 +2,97 @@
 MGF (Mascot Generic Format) file parser for mass spectrometry data.
 """
 
+import json
 import numpy as np
 from typing import Dict, List, Any, Optional, Union
 import re
+
+# Level-0 key in JSON spectra that holds the peak list. Each peak entry is a
+# list/tuple of 3 string values: [mz, absolute_intensity, relative_intensity].
+JSON_PEAK_KEY = "PK$PEAK"
+
+
+def flatten_json_entry(obj: Any, prefix: str = "") -> Dict[str, str]:
+    """
+    Recursively flatten a nested JSON structure (dicts/lists) into a flat
+    dict of string key/value pairs, joining nested levels with '///'.
+
+    Dict keys are used as-is, list entries use their numeric index, e.g.
+    "key_level_0///key_level_1///0".
+    """
+    flat: Dict[str, str] = {}
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            new_prefix = f"{prefix}///{key}" if prefix else str(key)
+            flat.update(flatten_json_entry(value, new_prefix))
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            new_prefix = f"{prefix}///{index}" if prefix else str(index)
+            flat.update(flatten_json_entry(value, new_prefix))
+    else:
+        if obj is None:
+            flat[prefix] = ""
+        elif isinstance(obj, bool):
+            flat[prefix] = "true" if obj else "false"
+        else:
+            flat[prefix] = str(obj)
+
+    return flat
+
+
+def _parse_json_scalar(value: str) -> Any:
+    """Try to convert a stored string value back to its original JSON scalar type."""
+    if value == "":
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if re.fullmatch(r"[+-]?\d+", value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _convert_dicts_to_lists(node: Any) -> Any:
+    """Recursively convert dicts with consecutive integer-like keys ("0", "1", ...) into lists."""
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            node[key] = _convert_dicts_to_lists(node[key])
+
+        keys = list(node.keys())
+        if keys and all(key.isdigit() for key in keys):
+            sorted_keys = sorted(keys, key=int)
+            if [int(key) for key in sorted_keys] == list(range(len(sorted_keys))):
+                return [node[key] for key in sorted_keys]
+
+        return node
+
+    return node
+
+
+def unflatten_metadata(flat: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Reconstruct a nested JSON structure (dicts/lists) from a flat dict whose
+    keys use '///' to separate nesting levels. Levels made up entirely of
+    consecutive numeric keys starting at 0 are converted back into lists.
+    """
+    root: Dict[str, Any] = {}
+
+    for compound_key, value in flat.items():
+        parts = compound_key.split("///")
+        node = root
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = _parse_json_scalar(value)
+
+    return _convert_dicts_to_lists(root)
 
 
 class Spectrum:
@@ -122,6 +210,74 @@ class MGFParser:
                     self.spectra.append(spectrum)
 
         return new_spectra
+
+    def parse_json_file(self, file_path: str) -> List[Spectrum]:
+        """Parse a JSON file (a list of MSMS spectrum dictionaries) and return Spectrum objects."""
+        self.spectra = []
+
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of spectrum entries.")
+
+        for i, entry in enumerate(data, 1):
+            if isinstance(entry, dict):
+                spectrum = self._parse_json_spectrum(entry, i)
+                self.spectra.append(spectrum)
+
+        return self.spectra
+
+    def parse_and_append_json_file(
+        self, file_path: str, id_offset: int = 0
+    ) -> List[Spectrum]:
+        """Parse a JSON file and append spectra to existing list with ID offset."""
+        new_spectra = []
+
+        with open(file_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of spectrum entries.")
+
+        for i, entry in enumerate(data, 1):
+            if isinstance(entry, dict):
+                spectrum = self._parse_json_spectrum(entry, i + id_offset)
+                new_spectra.append(spectrum)
+                self.spectra.append(spectrum)
+
+        return new_spectra
+
+    def _parse_json_spectrum(
+        self, entry: Dict[str, Any], spectrum_id: Union[int, str]
+    ) -> Spectrum:
+        """Parse a single JSON spectrum dictionary into a Spectrum object."""
+        spectrum = Spectrum(spectrum_id)
+
+        entry = dict(entry)
+        peaks = entry.pop(JSON_PEAK_KEY, None)
+
+        mz_values = []
+        intensity_values = []
+
+        if isinstance(peaks, list):
+            for peak in peaks:
+                if isinstance(peak, (list, tuple)) and len(peak) >= 3:
+                    try:
+                        mz = float(peak[0])
+                        relative_intensity = float(peak[2])
+                    except (TypeError, ValueError):
+                        continue
+                    mz_values.append(mz)
+                    intensity_values.append(relative_intensity)
+
+        if mz_values and intensity_values:
+            spectrum.set_ions(mz_values, intensity_values)
+
+        for key, value in flatten_json_entry(entry).items():
+            spectrum.add_metadata(key, value)
+
+        return spectrum
 
     def _parse_spectrum_block(self, block: str, spectrum_id: int) -> Optional[Spectrum]:
         """Parse a single spectrum block."""
@@ -436,6 +592,43 @@ class MGFParser:
                         f.write(f"{mz:.6f} {intensity:.6f}\n")
 
                 f.write("END IONS\n\n")
+
+    def export_to_json(
+        self, file_path: str, spectrum_ids: Optional[List[Union[int, str]]] = None
+    ):
+        """
+        Export spectra to a JSON file (a list of spectrum dictionaries).
+
+        Metadata keys containing '///' are expanded back into nested
+        dictionaries/lists recursively. Ion data is written back to the
+        level-0 "PK$PEAK" list, with both intensity columns set to the
+        (relative) intensity stored internally.
+
+        Args:
+            file_path: Path to the output JSON file
+            spectrum_ids: Optional list of spectrum IDs to export. If None, exports all spectra.
+        """
+        if spectrum_ids is None:
+            spectra_to_export = self.spectra
+        else:
+            spectra_to_export = [
+                s for s in self.spectra if s.spectrum_id in spectrum_ids
+            ]
+
+        entries = []
+        for spectrum in spectra_to_export:
+            entry = unflatten_metadata(spectrum.metadata)
+
+            if spectrum.ions.size > 0:
+                entry[JSON_PEAK_KEY] = [
+                    [f"{mz:.6f}", f"{intensity:.6f}", f"{intensity:.6f}"]
+                    for mz, intensity in spectrum.ions
+                ]
+
+            entries.append(entry)
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
 
     def normalize_intensities(
         self,

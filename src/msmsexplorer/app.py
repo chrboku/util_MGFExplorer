@@ -3,7 +3,7 @@ Main application window for the MGF Explorer.
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 import os
 import pathlib
 import re
@@ -26,13 +26,11 @@ from .gui_components import (
     CanonicalSmilesDialog,
     ProgressDialog,
     PPMDeviationPlotDialog,
-    SpectrumPopupWindow,
     FragmentDistributionDialog,
 )
 from .options_dialog import OptionsDialog
 from .molecular_formula import (
     FragmentAnnotator,
-    MolecularFormula,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -54,7 +52,7 @@ except ImportError:
     RDKIT_AVAILABLE = False
 
 
-class MGFExplorerApp:
+class MSMSExplorerApp:
     """Main application class for the MGF Explorer."""
 
     def __init__(self):
@@ -93,7 +91,9 @@ class MGFExplorerApp:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(
-            label="Load MGF File(s)...", command=self.open_files, accelerator="Ctrl+O"
+            label="Load MGF/JSON File(s)...",
+            command=self.open_files,
+            accelerator="Ctrl+O",
         )
         file_menu.add_separator()
         file_menu.add_command(
@@ -340,10 +340,11 @@ class MGFExplorerApp:
     def _process_dropped_file(self, file_path):
         """Process a file that was dropped onto the window."""
         try:
-            # Check if it's an MGF file
-            if not file_path.lower().endswith(".mgf"):
+            # Check if it's a supported spectra file
+            if not file_path.lower().endswith((".mgf", ".json")):
                 messagebox.showwarning(
-                    "Invalid File Type", "Please drop an MGF file (.mgf extension)."
+                    "Invalid File Type",
+                    "Please drop an MGF (.mgf) or JSON (.json) file.",
                 )
                 return
 
@@ -386,15 +387,24 @@ class MGFExplorerApp:
 
             # Check if we have existing data to append to
             is_first_file = len(self.parser.spectra) == 0
+            is_json = file_path.lower().endswith(".json")
 
             if is_first_file:
-                # First file - use parse_file which clears existing data
-                spectra = self.parser.parse_file(file_path)
+                # First file - use parse_file/parse_json_file which clears existing data
+                if is_json:
+                    spectra = self.parser.parse_json_file(file_path)
+                else:
+                    spectra = self.parser.parse_file(file_path)
             else:
-                # Additional file - use parse_and_append_file to add to existing data
+                # Additional file - use parse_and_append_* to add to existing data
                 # Calculate ID offset to avoid conflicts
                 id_offset = self._calculate_id_offset()
-                spectra = self.parser.parse_and_append_file(file_path, id_offset)
+                if is_json:
+                    spectra = self.parser.parse_and_append_json_file(
+                        file_path, id_offset
+                    )
+                else:
+                    spectra = self.parser.parse_and_append_file(file_path, id_offset)
 
             if not spectra:
                 messagebox.showwarning("Warning", "No spectra found in the file.")
@@ -564,10 +574,15 @@ class MGFExplorerApp:
         pass
 
     def open_files(self):
-        """Open and parse one or more MGF files."""
+        """Open and parse one or more MGF or JSON files."""
         file_paths = filedialog.askopenfilenames(
-            title="Load MGF File(s)",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+            title="Load MGF/JSON File(s)",
+            filetypes=[
+                ("MGF and JSON files", "*.mgf *.json"),
+                ("MGF files", "*.mgf"),
+                ("JSON files", "*.json"),
+                ("All files", "*.*"),
+            ],
         )
 
         if not file_paths:
@@ -1546,8 +1561,21 @@ class MGFExplorerApp:
         spectrum_ids = [str(s.spectrum_id) for s in spectra_list]
         average_spectrum.add_metadata("AVERAGED_FROM_IDS", ",".join(spectrum_ids))
 
+    def _prompt_export_format(self):
+        """Ask the user whether to export as MGF or JSON. Returns 'mgf', 'json', or None if cancelled."""
+        choice = messagebox.askyesnocancel(
+            "Export Format",
+            "Choose the export file format.\n\n"
+            "Yes = MGF format\n"
+            "No = JSON format\n"
+            "Cancel = abort export",
+        )
+        if choice is None:
+            return None
+        return "mgf" if choice else "json"
+
     def export_grouped_spectra(self):
-        """Export spectra into separate MGF files for each active group."""
+        """Export spectra into separate MGF or JSON files for each active group."""
         if not self.parser.spectra:
             messagebox.showwarning("Warning", "No spectra loaded to export.")
             return
@@ -1566,11 +1594,23 @@ class MGFExplorerApp:
             )
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export Grouped Spectra",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
-        )
+        export_format = self._prompt_export_format()
+        if export_format is None:
+            return
+        export_as_json = export_format == "json"
+
+        if export_as_json:
+            file_path = filedialog.asksaveasfilename(
+                title="Export Grouped Spectra",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+        else:
+            file_path = filedialog.asksaveasfilename(
+                title="Export Grouped Spectra",
+                defaultextension=".mgf",
+                filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+            )
 
         if not file_path:
             return
@@ -1584,7 +1624,7 @@ class MGFExplorerApp:
         if not name_root:
             name_root = "grouped_export"
         if not ext:
-            ext = ".mgf"
+            ext = ".json" if export_as_json else ".mgf"
 
         groups = []
 
@@ -1655,7 +1695,10 @@ class MGFExplorerApp:
 
                 output_path = os.path.join(base_dir, output_name)
                 spectrum_ids = [s.spectrum_id for s in spectra]
-                self.parser.export_to_mgf(output_path, spectrum_ids)
+                if export_as_json:
+                    self.parser.export_to_json(output_path, spectrum_ids)
+                else:
+                    self.parser.export_to_mgf(output_path, spectrum_ids)
 
                 total_files += 1
                 total_spectra += len(spectra)
@@ -1684,16 +1727,27 @@ class MGFExplorerApp:
             self.status_var.set("Export failed")
 
     def export_all_spectra(self):
-        """Export all spectra to a new MGF file."""
+        """Export all spectra to a new MGF or JSON file."""
         if not self.parser.spectra:
             messagebox.showwarning("Warning", "No spectra loaded to export.")
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export All Spectra to MGF File",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
-        )
+        export_format = self._prompt_export_format()
+        if export_format is None:
+            return
+
+        if export_format == "json":
+            file_path = filedialog.asksaveasfilename(
+                title="Export All Spectra",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+        else:
+            file_path = filedialog.asksaveasfilename(
+                title="Export All Spectra",
+                defaultextension=".mgf",
+                filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+            )
 
         if not file_path:
             return
@@ -1703,7 +1757,10 @@ class MGFExplorerApp:
             self.root.update()
 
             # Export all spectra
-            self.parser.export_to_mgf(file_path)
+            if export_format == "json":
+                self.parser.export_to_json(file_path)
+            else:
+                self.parser.export_to_mgf(file_path)
 
             # Update status
             self.status_var.set(
@@ -1720,7 +1777,7 @@ class MGFExplorerApp:
             self.status_var.set("Export failed")
 
     def export_filtered_spectra(self):
-        """Export only spectra matching the current filter to a new MGF file."""
+        """Export only spectra matching the current filter to a new MGF or JSON file."""
         if not self.parser.spectra:
             messagebox.showwarning("Warning", "No spectra loaded to export.")
             return
@@ -1739,11 +1796,22 @@ class MGFExplorerApp:
             )
             return
 
-        file_path = filedialog.asksaveasfilename(
-            title="Export Filtered Spectra to MGF File",
-            defaultextension=".mgf",
-            filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
-        )
+        export_format = self._prompt_export_format()
+        if export_format is None:
+            return
+
+        if export_format == "json":
+            file_path = filedialog.asksaveasfilename(
+                title="Export Filtered Spectra",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+        else:
+            file_path = filedialog.asksaveasfilename(
+                title="Export Filtered Spectra",
+                defaultextension=".mgf",
+                filetypes=[("MGF files", "*.mgf"), ("All files", "*.*")],
+            )
 
         if not file_path:
             return
@@ -1753,7 +1821,10 @@ class MGFExplorerApp:
             self.root.update()
 
             # Export filtered spectra
-            self.parser.export_to_mgf(file_path, filtered_spectrum_ids)
+            if export_format == "json":
+                self.parser.export_to_json(file_path, filtered_spectrum_ids)
+            else:
+                self.parser.export_to_mgf(file_path, filtered_spectrum_ids)
 
             # Update status
             self.status_var.set(
@@ -2274,7 +2345,7 @@ class MGFExplorerApp:
 
 def main():
     """Main entry point for the application."""
-    app = MGFExplorerApp()
+    app = MSMSExplorerApp()
     app.run()
 
 

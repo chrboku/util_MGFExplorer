@@ -38,7 +38,7 @@ uv sync
 ### Running the Application
 
 ```bash
-uv run mgfexplorer
+uv run msmsexplorer
 ```
 
 ### Using the GUI
@@ -129,7 +129,7 @@ The parser handles:
 
 ```
 src/
-├── mgfexplorer/
+├── msmsexplorer/
 │   ├── __init__.py
 │   ├── main.py           # Entry point
 │   ├── app.py            # Main application window

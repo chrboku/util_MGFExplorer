@@ -1,2 +1,2 @@
-uv run mgfexplorer
+uv run msmsexplorer
 pause
